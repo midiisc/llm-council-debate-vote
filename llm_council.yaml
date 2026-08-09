@@ -8,8 +8,20 @@
 # Verified 2026-08-09 by direct execution against load_config() - see
 # docs/upstream-deltas.md. Fix: wrap council-level fields in one EXTRA
 # "council:" layer so they land correctly after the buggy unwrap. `gateways:`
-# does NOT need the extra wrapper - it's a real top-level UnifiedConfig field
-# and gets hoisted correctly as-is (that's what made this bug easy to miss).
+# and `tiers:` do NOT need the extra wrapper - they're real top-level
+# UnifiedConfig fields and get hoisted correctly as-is (that's what made this
+# bug easy to miss).
+#
+# SECOND bug, also confirmed by direct execution: council_health_check reads
+# the flat council.models list (correct above), but a real consult_council()
+# call resolves its model list via TierContract.allowed_models instead - see
+# council.py's run_council_with_fallback: "explicit models arg > tier_contract
+# > default". Since consult_council always passes a tier_contract, the flat
+# council.models list is NEVER consulted for an actual query. TierContract's
+# allowed_models comes from tiers.pools.<confidence>.models, which pydantic's
+# TierConfig.ensure_default_pools() auto-fills with the SAME wrong package
+# defaults if left unset here - silently, no error. Every tier actually used
+# by this project's confidence levels must be populated explicitly below.
 council:
   council:
     models:
@@ -30,3 +42,27 @@ council:
                             # explicitly so a failure surfaces clearly instead
                             # of silently falling through to requesty/direct,
                             # which would error anyway with no stored keys.
+  tiers:
+    default: high
+    pools:
+      high:
+        models:
+          - anthropic/claude-opus-4.8
+          - openai/gpt-5.5
+          - google/gemini-3.6-flash
+          - z-ai/glm-5.2-20260616
+      quick:
+        models:
+          - anthropic/claude-opus-4.8
+          - openai/gpt-5.5
+      balanced:
+        models:
+          - anthropic/claude-opus-4.8
+          - openai/gpt-5.5
+          - google/gemini-3.6-flash
+      reasoning:
+        models:
+          - anthropic/claude-opus-4.8
+          - openai/gpt-5.5
+          - google/gemini-3.6-flash
+          - z-ai/glm-5.2-20260616

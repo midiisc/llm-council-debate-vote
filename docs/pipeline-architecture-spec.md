@@ -253,12 +253,17 @@ converged on the same two structural gaps, which is itself a useful signal.
 - The 3-core + 1-gated ceiling and its O(N²)/interpretability rationale.
 - Deferring `grounding_pass.py`/`revision_round.py`/scorecard until specced.
 
-### 8.2 Gap — GLM-5.2's role restriction isn't actually enforced (both models flagged this independently)
-Flat `council.models` membership doesn't encode "draft/review only, never
-debate/judge/chairman." `chairman:` pins synthesis, but nothing in the shown
-config stops GLM-5.2 from being pulled into a debate or tie-breaker round if
-Stage 2.5 triggers one. **Action:** the stage-eligibility question folds into
-whatever wrapper §8.3 requires anyway — decide together, don't build twice.
+### 8.2 Gap — RESOLVED, was a false alarm (2026-08-09 follow-up)
+Both external models flagged this and it was a reasonable thing to check, but
+direct source verification closes it: `council.py` routes every synthesis/
+tie-breaker call through `_get_chairman_model()` exclusively (grep confirms
+no alternate model-selection path for debate/tie-breaking exists anywhere in
+the module). Since `chairman: anthropic/claude-opus-4.8` is pinned in config,
+GLM-5.2 is **structurally incapable** of becoming chairman or tie-breaker
+regardless of `synthesis_mode`/`council.models` membership — there was never
+anything to enforce beyond the `chairman:` field already set. No wrapper
+logic needed for this specific concern; §8.3's orchestration gap (grounding
++ revision stages) is the only real remaining gap.
 
 ### 8.3 Gap — no orchestration wrapper for the custom stages (Gemini's sharpest point)
 `llm-council-core`'s standard run doesn't know about Stage 0.5 (grounding) or
