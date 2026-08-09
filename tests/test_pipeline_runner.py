@@ -74,7 +74,7 @@ def _council_result_fixture(css=0.8, cost_x=0.01, cost_y=0.02):
         {"model": "model-x", "borda_score": 1.0, "rank": 1},
         {"model": "model-y", "borda_score": 0.0, "rank": 2},
     ]
-    stage3_result = {"synthesis": "Final synthesis text"}
+    stage3_result = {"model": "model-x", "response": "Final synthesis text"}
     metadata = {
         "status": "complete",
         "quality_metrics": {"core": {"consensus_strength": css}},

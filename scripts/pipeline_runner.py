@@ -166,7 +166,7 @@ async def run_pipeline(
     revision_triggered = False
     revision_skipped_for_cost = False
     revision_cost = 0.0
-    synthesis = stage3_result["synthesis"]
+    synthesis = stage3_result["response"]
 
     if should_trigger_revision(css):
         if config.max_cost_usd is not None and stage1to3_cost >= config.max_cost_usd:
