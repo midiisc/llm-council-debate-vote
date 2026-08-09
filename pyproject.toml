@@ -5,8 +5,12 @@ description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = []
 
+[project.scripts]
+scorecard = "scripts.scorecard:main"
+
 [dependency-groups]
 dev = [
+    "hypothesis>=6.165.2",
     "mutmut>=3.7.0",
     "pytest>=9.1.1",
 ]

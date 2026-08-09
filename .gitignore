@@ -5,3 +5,6 @@
 .venv/
 __pycache__/
 *.pyc
+.mutmut-cache
+mutants/
+.pytest_cache/
