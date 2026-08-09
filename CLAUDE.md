@@ -27,6 +27,19 @@ OpenRouter `/api/v1/models` catalog, etc.). A claim inherited from memory, a
 prior doc, or "how it usually works" is not sufficient once it's version-,
 schema-, or pricing-sensitive — re-verify before it drives a real action.
 
+**Local-docs-first (2026-08-09):** `docs/upstream-deltas.md` and
+`docs/pipeline-architecture-spec.md` are a version-pinned local mirror of
+everything already grounded against `llm-council-core==0.40.1` — real CLI
+commands, the actual config schema (including the confirmed `load_config()`
+nesting bug and its workaround), the real MCP stdio entrypoint, and known
+model slugs. **Read these first, before any fresh WebFetch/GitHub read/
+context7 lookup on llm-council-core specifics.** Only retrieve what's
+actually missing from them. Re-verify against live sources only when: the
+installed version changes (check `llm-council --version` against the
+`version` stamped in these docs), or the specific fact you need genuinely
+isn't recorded there yet — then add what you find back into the ledger so
+the next session doesn't re-pay the retrieval cost.
+
 This is not hypothetical caution — it already caught real errors. The
 2026-08-09 grounding pass found that the original setup doc (and even upstream's
 own README) carried two env vars that were never shipped
@@ -40,6 +53,27 @@ rule, applied here as a hard repo gate rather than a soft default.
   this repo assumes and what's actually live upstream, dated and sourced.
   Never edit a config/script based on a claim that isn't in this ledger or
   freshly re-verified.
+- **Standing instruction (2026-08-09):** grounding means actually retrieving,
+  not recalling. Use whatever retrieval surface fits the claim: WebFetch/
+  WebSearch for live pages/APIs (PyPI, GitHub, OpenRouter's model catalog),
+  connected MCP servers (`deepwiki` for repo-level questions, `graphify` for
+  this codebase once it has one, any other MCP already wired into the
+  session) over guessing, and the `feynman` skill specifically for
+  research-heavy grounding — verifying an academic claim (e.g. anything
+  attributed to the Choi/Zhu/Li NeurIPS paper this pipeline is built around)
+  across arXiv/Semantic Scholar/multiple sources rather than trusting one
+  paraphrase. Read the source directly when a package's installed code is
+  more authoritative than its README (this already caught a real bug — see
+  §5 in `docs/pipeline-architecture-spec.md`, the `council.models` vs.
+  `tiers.pools` discovery came from reading `unified_config.py`, not docs).
+  `context7` (added 2026-08-09, user scope, keyless base tier) is available
+  for fast library/API-doc grounding specifically — use it for
+  `llm-council-core` API questions before falling back to a raw GitHub read.
+  Considered and deliberately skipped: firecrawl/exa/tavily — all require
+  paid accounts/API keys and nothing so far has shown a gap WebFetch/WebSearch/
+  deepwiki don't already cover (every grounding check in this project's
+  history — PyPI, GitHub source, live OpenRouter catalog, pricing pages — used
+  only those). Revisit if a real gap shows up, don't add speculatively.
 - Before any PR/commit that touches `llm_council.yaml`, `.env`, or a model
   slug: the specific value must have a citation (URL + retrieval date) in the
   commit message or an adjacent comment-free note in `upstream-deltas.md`.

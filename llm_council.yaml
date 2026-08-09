@@ -1,0 +1,32 @@
+# WORKAROUND for a confirmed bug in llm-council-core==0.40.1's load_config()
+# (unified_config.py ~line 1095): it extracts the *inner* contents of the
+# top-level "council:" key and passes them directly as UnifiedConfig(**...)
+# kwargs, instead of re-nesting under `.council`. UnifiedConfig has no
+# top-level `models`/`chairman`/etc. fields, so anything placed at the normal
+# nesting level silently falls back to the package's hardcoded defaults
+# (including deepseek/deepseek-v4-pro, never requested here) with NO error.
+# Verified 2026-08-09 by direct execution against load_config() - see
+# docs/upstream-deltas.md. Fix: wrap council-level fields in one EXTRA
+# "council:" layer so they land correctly after the buggy unwrap. `gateways:`
+# does NOT need the extra wrapper - it's a real top-level UnifiedConfig field
+# and gets hoisted correctly as-is (that's what made this bug easy to miss).
+council:
+  council:
+    models:
+      - anthropic/claude-opus-4.8
+      - openai/gpt-5.5
+      - google/gemini-3.6-flash
+      - z-ai/glm-5.2-20260616
+    chairman: anthropic/claude-opus-4.8
+    chairman_disabled: false
+    synthesis_mode: debate
+    exclude_self_votes: true
+    style_normalization: true
+  gateways:
+    default: openrouter
+    fallback:
+      enabled: true
+      chain: [openrouter]  # only openrouter key exists (2026-08-09) - pinned
+                            # explicitly so a failure surfaces clearly instead
+                            # of silently falling through to requesty/direct,
+                            # which would error anyway with no stored keys.
