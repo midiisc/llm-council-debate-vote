@@ -3,7 +3,9 @@ name = "llm-council-debate-vote"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "llm-council-core[mcp,secure]>=0.39.0",
+]
 
 [project.scripts]
 scorecard = "scripts.scorecard:main"
