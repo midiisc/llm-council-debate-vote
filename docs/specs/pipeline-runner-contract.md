@@ -166,3 +166,47 @@ equivalent (identical output for every possible input, not merely untested):
 
 None of these represent a real behavioral gap; re-verify this list only if
 the corresponding functions change.
+
+## Real end-to-end validation (2026-08-09)
+
+First real run of the fully-wired pipeline (grounding → council → conditional
+revision → scorecard), from a throwaway directory, decision: "Markdown-in-git
+vs. Confluence wiki for a 5-person team." Caught one more real bug in the
+process: `stage3_result`'s actual key is `"response"`, not `"synthesis"` —
+my own test fixture had baked in the same wrong assumption as the
+implementation, which is exactly why 27 passing unit tests didn't catch it.
+Fixed both, mutation gate re-confirmed clean afterward (same 266/277, same
+11 confirmed-equivalent survivors).
+
+Result: **CSS 0.672** (above the 0.50 threshold — revision round correctly
+not triggered; that branch remains verified via unit tests with injected
+low-CSS fixtures rather than a live controversial-topic run, which would
+cost more without adding meaningfully to confidence given the thorough
+mutation-tested coverage on that path). Total cost **$0.313**. Folder-scoping
+confirmed clean end to end — nothing written to `~/.llm-council/` at any
+point.
+
+Grounding pass caught something real, not just plumbing: claim 2
+("Git-based Markdown wikis require every contributor to know git") came back
+**CONTRADICTED**, citing GitHub/GitLab's own wiki docs (both major git hosts
+ship a web UI wiki editor that needs no git knowledge) — a genuine catch, not
+a null result. Claim 1 ("Confluence is the most widely used enterprise wiki
+software") came back UNVERIFIABLE and was correctly demoted to ASSUMPTION
+rather than asserted.
+
+Real per-model rubric scores, delivered for the first time — the original
+point of adding GLM-5.2:
+
+| Model | Accuracy | Relevance | Completeness | Conciseness | Clarity | Rank | Cost |
+|---|---|---|---|---|---|---|---|
+| Claude Opus 4.8 | 9.5 | 10 | 9.25 | 9.0 | 9.5 | 1 | $0.2047 |
+| GPT-5.5 | 9.25 | 9.75 | 9.5 | 7.5 | 9.0 | 2 | $0.0700 |
+| Gemini 3.6 Flash | 9.25 | 10 | 8.75 | 8.25 | 8.75 | 3 | $0.0364 |
+| GLM-5.2 | 9.25 | 10 | 8.25 | 8.0 | 9.0 | 4 | $0.0019 |
+
+GLM-5.2 ranked last but wasn't flagged as a statistical outlier
+(`is_outlier: false` for all 4 models this session) — its scores track
+closely with the core three rather than diverging sharply, at roughly 1% of
+Claude Opus's cost share. One session is far below the 10-session
+"insufficient" confidence floor — this is a first data point for
+`scorecard.py`'s tracking, not a verdict.
