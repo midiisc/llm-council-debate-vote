@@ -66,3 +66,9 @@ council:
           - openai/gpt-5.5
           - google/gemini-3.6-flash
           - z-ai/glm-5.2-20260616
+  evaluation:
+    rubric:
+      enabled: true  # 5-dimension scoring (accuracy/relevance/completeness/
+                      # conciseness/clarity) - was off by default, never set
+                      # before the 2026-08-09 dry run; accuracy_ceiling_enabled
+                      # already defaults to true, no change needed there.
