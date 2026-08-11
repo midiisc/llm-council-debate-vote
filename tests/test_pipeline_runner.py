@@ -8,6 +8,7 @@ import asyncio
 import re
 
 import pytest
+from hypothesis import given, settings, strategies as st
 
 from scripts.pipeline_runner import (
     PipelineConfig,
@@ -92,13 +93,14 @@ def _council_result_fixture(css=0.8, cost_x=0.01, cost_y=0.02):
 
 
 class FakeQueryModel:
-    def __init__(self, response_by_model=None):
+    def __init__(self, response_by_model=None, cost_per_call=0.0):
         self.calls = []
         self.response_by_model = response_by_model or {}
+        self.cost_per_call = cost_per_call
 
-    async def __call__(self, model: str, prompt: str) -> str:
+    async def __call__(self, model: str, prompt: str) -> tuple[str, float]:
         self.calls.append((model, prompt))
-        return self.response_by_model.get(model, "no revision")
+        return self.response_by_model.get(model, "no revision"), self.cost_per_call
 
 
 def _make_council_fn(result):
@@ -222,6 +224,100 @@ def test_ac4_low_css_triggers_revision(tmp_path):
     # RIGHT model, not None or the wrong model
     assert "accuracy: 8.0/10" in prompt_for_x
     assert "accuracy: 4.0/10" in prompt_for_y
+
+
+def test_revision_cost_is_real_not_hardcoded_zero(tmp_path):
+    # Regression test for the panel-confirmed bug: revision_cost was
+    # hardcoded to 0.0 regardless of what query_model actually reported.
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.revision_triggered is True
+    # stage1-3 cost (0.03) + 2 revision calls at 0.05 each = 0.13
+    assert result.total_cost_usd == pytest.approx(0.13)
+
+
+@given(
+    cost_x=st.floats(min_value=0.0, max_value=5.0, allow_nan=False),
+    cost_y=st.floats(min_value=0.0, max_value=5.0, allow_nan=False),
+    revision_cost_per_call=st.floats(min_value=0.0, max_value=5.0, allow_nan=False),
+)
+@settings(deadline=None)
+def test_property_total_cost_always_equals_sum_of_all_stage_costs(
+    tmp_path_factory, cost_x, cost_y, revision_cost_per_call
+):
+    tmp_path = tmp_path_factory.mktemp("cost_prop")
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=cost_x, cost_y=cost_y))
+    query_model = FakeQueryModel(cost_per_call=revision_cost_per_call)
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    expected = cost_x + cost_y + 2 * revision_cost_per_call
+    assert result.total_cost_usd == pytest.approx(expected)
+
+
+# --- cost_ceiling_exceeded: post-revision ceiling re-check (panel finding) ---
+
+
+def test_cost_ceiling_exceeded_false_when_no_ceiling_set(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=None)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.cost_ceiling_exceeded is False
+
+
+def test_cost_ceiling_exceeded_true_when_revision_pushes_past_ceiling(tmp_path):
+    # The pre-revision check only compares stage1-3 cost (0.03) to the
+    # ceiling and lets revision proceed since 0.03 < 0.10. But two revision
+    # calls at 0.05 each push the real total to 0.13, past the ceiling -
+    # this must be visible in the result even though it can't be prevented
+    # after the fact (the pre-check already let revision start).
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=0.10)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.revision_triggered is True
+    assert result.total_cost_usd == pytest.approx(0.13)
+    assert result.cost_ceiling_exceeded is True
+
+
+def test_cost_ceiling_not_exceeded_when_total_exactly_equals_ceiling(tmp_path):
+    # Boundary: being exactly AT the ceiling is not "exceeded" (strict >,
+    # matching should_trigger_revision's own strict < semantics elsewhere
+    # in this pipeline).
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=0.03)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.total_cost_usd == pytest.approx(0.03)
+    assert result.cost_ceiling_exceeded is False
+
+
+def test_cost_ceiling_not_exceeded_when_total_is_under_ceiling(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.01)
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=10.0)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.cost_ceiling_exceeded is False
 
 
 # --- AC5: CSS < 0.50 but cost ceiling already met -> revision skipped for cost ---

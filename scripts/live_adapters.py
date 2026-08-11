@@ -54,10 +54,18 @@ def _post_chat_completion(model: str, prompt: str, max_tokens: int = 2000) -> di
         return json.loads(resp.read())
 
 
-async def real_query_model(model: str, prompt: str) -> str:
-    """query_model for revision_round.run_revision_round."""
+async def real_query_model(model: str, prompt: str) -> tuple[str, float]:
+    """query_model for revision_round.run_revision_round.
+
+    Returns (response_text, cost_usd). cost_usd comes from OpenRouter's own
+    usage.cost field; treated as 0.0 if the provider didn't report it rather
+    than raising, since a missing cost figure shouldn't crash a revision
+    round that otherwise succeeded.
+    """
     data = _post_chat_completion(model, prompt)
-    return data["choices"][0]["message"]["content"]
+    text = data["choices"][0]["message"]["content"]
+    cost_usd = data.get("usage", {}).get("cost") or 0.0
+    return text, cost_usd
 
 
 def build_evidence_prompt(claim: Claim) -> str:

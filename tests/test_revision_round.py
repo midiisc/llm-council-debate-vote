@@ -86,7 +86,7 @@ def test_ac1_css_at_or_above_threshold_is_a_cost_safe_noop():
 
     async def query_fn(model, prompt):
         calls.append((model, prompt))
-        return "should never be reached"
+        return "should never be reached", 0.0
 
     answers = [
         ModelAnswer(model="alpha", original_text="A's answer", critique="A's critique"),
@@ -108,7 +108,7 @@ def test_ac1_property_no_query_calls_for_any_css_at_or_above_threshold(css):
 
     async def query_fn(model, prompt):
         calls.append(model)
-        return "unused"
+        return "unused", 0.0
 
     answers = [ModelAnswer(model="m1", original_text="t", critique="c")]
 
@@ -131,7 +131,7 @@ def test_ac2_css_below_threshold_calls_query_fn_once_per_model_with_own_material
 
     async def query_fn(model, prompt):
         seen.append((model, prompt))
-        return "no citation here"
+        return "no citation here", 0.02
 
     answers = [
         ModelAnswer(model="alpha", original_text="ALPHA_ANSWER", critique="ALPHA_CRITIQUE"),
@@ -177,7 +177,7 @@ def test_ac3_end_to_end_rejected_response_keeps_original_answer_unchanged():
     verified = [_fact("42", "The sky is blue.")]
 
     async def query_fn(model, prompt):
-        return "No citation, just restating my view."
+        return "No citation, just restating my view.", 0.02
 
     answers = [ModelAnswer(model="alpha", original_text="ORIGINAL", critique="crit")]
 
@@ -246,7 +246,7 @@ def test_ac6_accepted_revision_keeps_both_original_and_revised_text():
     verified = [_fact("7", "verified fact seven")]
 
     async def query_fn(model, prompt):
-        return "[[cite:7]] The corrected answer text."
+        return "[[cite:7]] The corrected answer text.", 0.0347
 
     answers = [ModelAnswer(model="alpha", original_text="ORIGINAL_TEXT", critique="my critique")]
 
@@ -260,6 +260,7 @@ def test_ac6_accepted_revision_keeps_both_original_and_revised_text():
     assert outcome.revised_text is not None
     assert outcome.revised_text != outcome.original_text
     assert outcome.cited_fact_id == "7"
+    assert outcome.cost_usd == 0.0347
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +282,7 @@ def test_noop_branch_preserves_each_answers_model_and_original_text():
 
     assert [o.model for o in outcomes] == ["alpha", "beta"]
     assert [o.original_text for o in outcomes] == ["ALPHA_ORIG", "BETA_ORIG"]
+    assert [o.cost_usd for o in outcomes] == [0.0, 0.0]
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +334,7 @@ def test_triggered_branch_prompt_sent_to_query_fn_includes_verified_facts():
 
     async def query_fn(model, prompt):
         seen_prompts.append(prompt)
-        return "no citation"
+        return "no citation", 0.01
 
     answers = [ModelAnswer(model="alpha", original_text="orig", critique="crit")]
     verified = [_fact("99", "UNIQUE_FACT_TEXT_MARKER")]
@@ -346,7 +348,7 @@ def test_triggered_branch_prompt_sent_to_query_fn_includes_verified_facts():
 
 def test_accepted_outcome_records_the_correct_model_not_none():
     async def query_fn(model, prompt):
-        return "[[cite:7]] revised"
+        return "[[cite:7]] revised", 0.0
 
     answers = [ModelAnswer(model="gamma", original_text="o", critique="c")]
     verified = [_fact("7", "fact seven")]
@@ -397,7 +399,7 @@ def test_accepted_requires_both_revised_text_and_cited_fact_id_not_either(monkey
     monkeypatch.setattr(rr_module, "parse_revision_response", lambda text, facts: ("some text", None))
 
     async def query_fn(model, prompt):
-        return "irrelevant, parse_revision_response is patched"
+        return "irrelevant, parse_revision_response is patched", 0.0
 
     answers = [ModelAnswer(model="alpha", original_text="orig", critique="crit")]
     outcomes = asyncio.run(run_revision_round(0.10, answers, [], query_fn))

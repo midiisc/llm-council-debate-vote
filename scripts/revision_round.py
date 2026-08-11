@@ -36,6 +36,7 @@ class RevisionOutcome:
     revised_text: Optional[str]  # None if revision rejected/not offered
     cited_fact_id: Optional[str]  # the verified_facts id it cited, if any
     accepted: bool  # True only if a valid citation was found
+    cost_usd: float = 0.0  # real cost of the query_fn call that produced this outcome
 
 
 def should_trigger_revision(css: float, threshold: float = 0.50) -> bool:
@@ -93,7 +94,11 @@ async def run_revision_round(
     css: float,
     answers: list[ModelAnswer],
     verified_facts: list[TaggedClaim],
-    query_fn: Callable[[str, str], Awaitable[str]],  # (model, prompt) -> response
+    # (model, prompt) -> (response_text, cost_usd). cost_usd must be a real,
+    # non-negative figure from the caller (e.g. OpenRouter's reported spend) -
+    # never a placeholder, since pipeline_runner.py sums this into
+    # total_cost_usd and the cost ceiling re-checks against it.
+    query_fn: Callable[[str, str], Awaitable[tuple[str, float]]],
 ) -> list[RevisionOutcome]:
     if not should_trigger_revision(css):
         return [
@@ -103,6 +108,7 @@ async def run_revision_round(
                 revised_text=None,
                 cited_fact_id=None,
                 accepted=False,
+                cost_usd=0.0,
             )
             for answer in answers
         ]
@@ -110,7 +116,7 @@ async def run_revision_round(
     outcomes: list[RevisionOutcome] = []
     for answer in answers:
         prompt = build_revision_prompt(answer, verified_facts)
-        response = await query_fn(answer.model, prompt)
+        response, cost_usd = await query_fn(answer.model, prompt)
         revised_text, cited_fact_id = parse_revision_response(response, verified_facts)
         outcomes.append(
             RevisionOutcome(
@@ -119,6 +125,7 @@ async def run_revision_round(
                 revised_text=revised_text,
                 cited_fact_id=cited_fact_id,
                 accepted=revised_text is not None and cited_fact_id is not None,
+                cost_usd=cost_usd,
             )
         )
     return outcomes

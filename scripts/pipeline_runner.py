@@ -25,7 +25,7 @@ RUBRIC_DIMENSIONS = ("accuracy", "relevance", "completeness", "conciseness", "cl
 
 FetchEvidenceFn = Callable[[list[Claim]], Awaitable[dict[str, list[Evidence]]]]
 CouncilFn = Callable[[str], Awaitable[tuple[list, list, dict, dict]]]
-QueryModelFn = Callable[[str, str], Awaitable[str]]
+QueryModelFn = Callable[[str, str], Awaitable[tuple[str, float]]]
 
 
 @dataclass
@@ -46,6 +46,12 @@ class PipelineResult:
     total_cost_usd: float
     scorecard_appended: bool
     synthesis: str
+    # True if total_cost_usd (including any real revision spend) ended up
+    # over max_cost_usd. The pre-revision check (revision_skipped_for_cost)
+    # can still prevent a revision round from starting; this field exists
+    # because that check is structurally blind to the revision round's own
+    # cost, known only after it runs - always False when max_cost_usd is None.
+    cost_ceiling_exceeded: bool = False
 
 
 def slugify(topic_label: str) -> str:
@@ -182,7 +188,8 @@ async def run_pipeline(
                 )
                 for s1 in stage1_results
             ]
-            await run_revision_round(css, answers, verified_facts, query_model)
+            outcomes = await run_revision_round(css, answers, verified_facts, query_model)
+            revision_cost = sum(o.cost_usd for o in outcomes)
             revision_triggered = True
 
     rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
@@ -206,12 +213,18 @@ async def run_pipeline(
     )
     append_record(record, scorecard_path)
 
+    total_cost_usd = stage1to3_cost + revision_cost
+    cost_ceiling_exceeded = (
+        config.max_cost_usd is not None and total_cost_usd > config.max_cost_usd
+    )
+
     return PipelineResult(
         output_dir=output_dir,
         css=css,
         revision_triggered=revision_triggered,
         revision_skipped_for_cost=revision_skipped_for_cost,
-        total_cost_usd=stage1to3_cost + revision_cost,
+        total_cost_usd=total_cost_usd,
         scorecard_appended=True,
         synthesis=synthesis,
+        cost_ceiling_exceeded=cost_ceiling_exceeded,
     )

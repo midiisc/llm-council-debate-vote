@@ -37,6 +37,18 @@ live OpenRouter `/api/v1/models` catalog.
 | `council.models` alone (no `tiers.pools`) | Assumed sufficient after fixing the first `load_config()` bug | **Confirmed live bug #2, more severe**: `council_health_check` reads the flat `council.models` list (correct), but a real `consult_council()` call resolves its model list via `TierContract.allowed_models` instead - `run_council_with_fallback` priority is "explicit models arg > tier_contract > default", and `consult_council` always passes a `tier_contract`. `TierContract.allowed_models` comes from `tiers.pools.<confidence>.models`, which pydantic's `TierConfig.ensure_default_pools()` silently auto-fills with the package's wrong defaults if left unset - no error, `council_health_check` still reports `ready:true` because it checks a completely different code path. A real query would have silently run the wrong 4 models (including `deepseek-v4-pro`) despite `council_health_check` looking correct. Fixed by populating `tiers.pools.high/quick/balanced/reasoning.models` explicitly (see comment block in `llm_council.yaml`). Verified via direct execution of `create_tier_contract('high')` from the project directory - `allowed_models` now matches our 4 configured models. | Direct execution tracing `run_council_with_fallback` -> `create_tier_contract` -> `_get_allowed_models` -> `_get_tier_model_pools`, 2026-08-09 | **Fixed in `llm_council.yaml`. Reported upstream alongside Bug 1: [amiable-dev/llm-council#591](https://github.com/amiable-dev/llm-council/issues/591)** |
 | `TierContract.aggregator_model` | Looked like a second, unconfigured chairman-selection path (hardcoded `TIER_AGGREGATORS["high"] = "openai/gpt-5.4"`) | **Verified harmless / dead code** for our purposes: grepped every call site and the actual Stage 3 synthesis LLM call in `council_stages.py` uses `_get_chairman_model()` exclusively (reads `council.chairman`, correctly configured). `aggregator_model` is set on the `TierContract` dataclass but never read by the synthesis path - vestigial. No fix needed, but worth knowing it's there and wrong-looking if anyone greps for "gpt-5.4" in this codebase later. | Grepped all `aggregator_model` and `_get_chairman_model()` call sites in `council.py`/`council_stages.py`, 2026-08-09 | **No action needed - confirmed unused** |
 
+## Security status (not an upstream delta — tracked here per Pillar 6)
+
+**2026-08-11: OpenRouter key rotation — deferred, not done.** The key pasted
+in plaintext into the Claude Code chat session on 2026-08-09 has **not**
+been rotated as of this date; the user explicitly chose to defer it
+("let me do it later"). Per the 8-persona expert panel review on
+2026-08-11 (unanimous, independently flagged by all 8), this is treated as
+an open, acknowledged risk: **no further real-money pipeline run should
+happen until rotation is confirmed.** Code changes and unit/mutation
+testing continue normally — only live OpenRouter spend is paused.
+Update this entry the moment rotation is confirmed.
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.

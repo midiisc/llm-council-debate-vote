@@ -210,3 +210,39 @@ closely with the core three rather than diverging sharply, at roughly 1% of
 Claude Opus's cost share. One session is far below the 10-session
 "insufficient" confidence floor — this is a first data point for
 `scorecard.py`'s tracking, not a verdict.
+
+## Amendment (2026-08-11): real revision cost accounting + post-revision cost ceiling
+
+An 8-persona expert panel review (unanimous, with direct code verification)
+confirmed two real bugs sitting in the revision path that had never fired
+live: `revision_cost` was hardcoded to `0.0` regardless of what a real
+revision round actually spent, and the `max_cost_usd` ceiling only ever
+checked pre-revision cost — structurally blind to the exact cost source
+most likely to blow a budget. Fixed as one unit, per the panel's own
+recommendation (both share the same root cause: "the ledger can silently
+lag reality"):
+
+- `QueryModelFn`'s contract changed from `Callable[[str, str],
+  Awaitable[str]]` to `Callable[[str, str], Awaitable[tuple[str, float]]]`
+  — every query_fn (real and fake) now returns `(response_text, cost_usd)`.
+  `revision_round.RevisionOutcome` gained a `cost_usd: float = 0.0` field.
+  `live_adapters.real_query_model` now reads OpenRouter's own
+  `usage.cost` field (falling back to `0.0`, never raising, if a provider
+  doesn't report it).
+- `pipeline_runner.run_pipeline` sums `RevisionOutcome.cost_usd` across all
+  outcomes into a real `revision_cost` instead of the old constant.
+- `PipelineResult` gained `cost_ceiling_exceeded: bool` — computed once,
+  after revision cost is known, as `total_cost_usd > max_cost_usd`. This
+  can't retroactively prevent an already-started revision round from
+  overspending (the pre-revision check already decided whether to start
+  it), but it closes the reporting gap: before this, a revision round that
+  pushed the real total past the ceiling was invisible in the result.
+- Property-based test (`test_property_total_cost_always_equals_sum_of_all_stage_costs`)
+  asserts `total_cost_usd` always equals `stage1to3_cost + revision_cost`
+  across randomized cost inputs, so this class of bug can't silently
+  regress again.
+
+Mutation-tested clean afterward: `revision_round.py` 93/94 (1 confirmed-
+equivalent: an explicit `cost_usd=0.0` kwarg matching the dataclass's own
+default is unobservable either way), `pipeline_runner.py` 277/287 (same 10
+previously-documented equivalent survivors, no new gaps).
