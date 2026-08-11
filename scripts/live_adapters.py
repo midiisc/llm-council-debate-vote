@@ -9,6 +9,8 @@ docs/specs/pipeline-runner-contract.md's design note.
 from __future__ import annotations
 
 import json
+import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -23,6 +25,9 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # capable via the :online suffix, not because it's a council member.
 EVIDENCE_MODEL = "google/gemini-3.6-flash:online"
 
+MAX_RETRIES = 3
+BACKOFF_BASE_SECONDS = 1.0
+
 
 def _get_openrouter_key() -> str:
     key = keyring.get_password("llm-council", "openrouter_api_key")
@@ -33,7 +38,25 @@ def _get_openrouter_key() -> str:
     return key
 
 
-def _post_chat_completion(model: str, prompt: str, max_tokens: int = 2000) -> dict[str, Any]:
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Server/network errors are worth retrying; client errors (4xx, e.g.
+    bad request or auth failure) will just fail identically again."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return False
+
+
+def _post_chat_completion(
+    model: str,
+    prompt: str,
+    max_tokens: int = 2000,
+    max_retries: int = MAX_RETRIES,
+    sleep_fn=time.sleep,
+) -> dict[str, Any]:
     body = json.dumps(
         {
             "model": model,
@@ -50,8 +73,15 @@ def _post_chat_completion(model: str, prompt: str, max_tokens: int = 2000) -> di
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        return json.loads(resp.read())
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            if not _is_retryable_error(e) or attempt == max_retries:
+                raise
+            sleep_fn(BACKOFF_BASE_SECONDS * (2**attempt))
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def real_query_model(model: str, prompt: str) -> tuple[str, float]:

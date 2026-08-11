@@ -274,3 +274,70 @@ New: `run_status.json`, written into `output_dir` via temp-write-then-rename
 New acceptance criteria (11-15), covering: running-status-written-first,
 complete-status-on-success, failed-status-with-cost-on-exception,
 atomic-write-via-tempfile-rename, and exception-not-swallowed.
+
+## Amendment (2026-08-11): retry/backoff for live network calls
+
+Same panel review (ws-redteam + ws-os finding): `live_adapters.py`'s single
+`urllib.request.urlopen()` call had zero resilience — any transient
+network blip or OpenRouter 5xx would kill an entire pipeline run (real
+spend already committed for stage1-3) rather than retrying. Added:
+
+- `_is_retryable_error(exc)` — pure classifier. `HTTPError` retries only on
+  `code >= 500` (a 4xx like 401/400 will just fail identically again, so
+  retrying wastes an attempt and, for auth errors, another round of a
+  useless request); `URLError`, `TimeoutError`, `ConnectionError` always
+  retry; anything else (e.g. a `JSONDecodeError` from a malformed
+  response) does not.
+- `_post_chat_completion` gained `max_retries` (default `MAX_RETRIES = 3`)
+  and an injectable `sleep_fn` (default `time.sleep`, overridden in tests
+  to avoid real waiting) parameter. Exponential backoff:
+  `BACKOFF_BASE_SECONDS * (2 ** attempt)` → 1s, 2s, 4s before attempts 2,
+  3, 4. A non-retryable error or exhausting `max_retries` re-raises the
+  original exception unchanged — never swallowed, never wrapped.
+
+New tests added to close two real coverage gaps mutation testing found
+(not equivalent mutants — genuine assertion weaknesses):
+
+1. `test_get_openrouter_key_raises_exact_message_when_missing` was using
+   `pytest.raises(match=...)`, which does a substring `re.search` — a
+   mutant that wrapped the whole error string in extra characters
+   (`"XX...XX"`) still contained the original text as a substring and
+   survived. Fixed by asserting `str(exc_info.value) ==` the exact string.
+2. `parse_evidence_response`'s `stripped.strip("`")` call had no test
+   distinguishing "strip only backtick characters" from "strip any
+   character in a wider set" — a mutant widening the strip charset to
+   `"XX`XX"` (which strips backticks *and* literal `X` characters) went
+   undetected. Fixed with
+   `test_parse_evidence_response_strips_only_backticks_not_other_chars`,
+   feeding input where a mutant's over-eager strip turns malformed JSON
+   into valid JSON (and the two implementations diverge on the result).
+
+Mutation-tested clean: `live_adapters.py` 119/129, 10 confirmed-equivalent
+survivors, all in `_post_chat_completion`, each individually verified via
+`mutmut show` before being accepted (no gap left un-investigated):
+
+- **Mutants 20, 24** (`method="POST"` → `method=None` / omitted):
+  `urllib.request.Request.get_method()` infers `"POST"` whenever `data` is
+  present and `method` is `None` — this call always passes `data=body`, so
+  the two are behaviorally identical.
+- **Mutants 26, 27, 29, 30** (header key case: `"Authorization"` →
+  `"authorization"`/`"AUTHORIZATION"`, `"Content-Type"` →
+  `"content-type"`/`"CONTENT-TYPE"`): `urllib.request.Request` normalizes
+  every header key via `.capitalize()` internally, erasing case
+  distinctions before the request is ever sent — unobservable at any
+  layer this test suite can inspect (confirmed by reading
+  `http.client`/`urllib.request` source, not assumed).
+- **Mutant 37** (`range(max_retries + 1)` → `range(max_retries + 2)`): the
+  loop body always re-raises once `attempt == max_retries` inside the
+  `except` block, before the loop's own upper bound is ever consulted
+  again — widening the range's ceiling by one can never be observed since
+  the raise fires first on every retryable-exhausted path.
+- **Mutants 52, 53, 54** (the trailing `raise AssertionError("unreachable")`
+  → different message / `None`): this line is provably dead code —
+  every path through the preceding `for` loop either `return`s on success
+  or `raise`s inside the `except` block before the loop can exhaust
+  naturally, so this line can never execute. Already marked
+  `# pragma: no cover` for exactly this reason.
+
+Full suite (`uv run pytest tests/ -q`) confirmed green post-fix: 151
+passed, no regressions.
