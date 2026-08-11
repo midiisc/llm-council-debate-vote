@@ -568,7 +568,7 @@ secure = [
 [[package]]
 name = "llm-council-debate-vote"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "llm-council-core", extra = ["mcp", "secure"] },
 ]

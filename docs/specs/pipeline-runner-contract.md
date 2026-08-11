@@ -341,3 +341,114 @@ survivors, all in `_post_chat_completion`, each individually verified via
 
 Full suite (`uv run pytest tests/ -q`) confirmed green post-fix: 151
 passed, no regressions.
+
+## Amendment (2026-08-11): CLI entrypoint (spec, ahead of code — Pillar 2)
+
+Panel finding (ws-os): everything built so far (`run_pipeline`,
+`live_adapters`) is only reachable from Python — there is no way to
+actually run a real decision from a shell, which is the whole point of
+the pipeline. `scorecard`'s existing `[project.scripts]` entry is the
+established pattern to mirror (`docs/specs/custom-scripts-contracts.md`
+Contract 3).
+
+**Objective:** a `llm-council-pipeline` console script that wires the real
+dependencies (`llm_council.council.run_full_council` for `council_fn`,
+`live_adapters.real_fetch_evidence`/`real_query_model` for the other two)
+into `run_pipeline`, exposes `PipelineConfig`'s fields as CLI flags, and
+reports outcome via both stdout and a **distinct process exit code per
+outcome class** — the ws-os finding was specifically that a single
+success/failure boolean can't distinguish "ran fine" from "ran but
+degraded (revision skipped / ceiling blown)", which matters for anyone
+scripting around this (e.g. a cron wrapper that should alert differently
+on each).
+
+**Non-goals:** no interactive prompts, no config file support (flags
+only), no change to `run_pipeline`'s own signature or behavior — this is
+a thin wiring layer only.
+
+**CLI surface:**
+```
+llm-council-pipeline --topic-label TEXT --query TEXT
+                      [--claims-file PATH] [--max-cost-usd FLOAT]
+                      [--output-root PATH]
+```
+- `--topic-label`, `--query`: required, map directly to `PipelineConfig`.
+- `--claims-file`: optional path; if given, its full contents become
+  `raw_claims_text` (triggers Stage 0.5 grounding). Omitted → empty
+  string → grounding skipped, matching `run_pipeline`'s existing
+  `if config.raw_claims_text.strip():` gate.
+- `--max-cost-usd`: optional float → `PipelineConfig.max_cost_usd`.
+- `--output-root`: optional path → `PipelineConfig.output_root`; omitted
+  → `run_pipeline`'s own default (`Path.cwd() / "council-runs"`).
+
+**Exit code contract (Given/When/Then ACs):**
+
+- AC16: Given a run that completes with revision not triggered or
+  triggered-and-within-ceiling, when `main()` returns, then exit code is
+  `0` and the synthesis text + output_dir are printed to stdout.
+- AC17: Given `should_trigger_revision(css)` is true but
+  `revision_skipped_for_cost` ends up `True`, when `main()` returns, then
+  exit code is `2` (success, but degraded — revision that should have run
+  didn't, because it would have exceeded `max_cost_usd`) and a stderr
+  warning names the skipped revision explicitly.
+- AC18: Given the run completes but `cost_ceiling_exceeded` is `True`
+  (revision ran and pushed total cost past `max_cost_usd`), when `main()`
+  returns, then exit code is `3` and a stderr warning states the overage
+  amount.
+- AC19: Given `run_pipeline` raises any exception, when `main()` catches
+  it, then exit code is `1`, the exception message is printed to stderr
+  (not swallowed silently), and no traceback dump (matches
+  `run_status.json`'s existing "failed" record — the CLI layer doesn't
+  need to duplicate that detail, just surface it tersely).
+- AC20: Given both AC17 and AC18 conditions hold in the same run
+  (revision was skipped for cost on one check, yet total still exceeded
+  ceiling — structurally shouldn't happen since a skipped revision can't
+  add cost, but the contract must still resolve deterministically), when
+  both flags are true, then exit code is `3` (ceiling-exceeded takes
+  priority as the more severe condition).
+
+Testable in isolation via a fake `run_pipeline`-shaped result object and
+monkeypatching `pipeline_runner.run_pipeline` itself — the CLI parsing/
+exit-code logic doesn't need real network calls to verify.
+
+### Implementation notes + verification (2026-08-11)
+
+`exit_code_for_result()` (AC16/17/18/20) and `_build_arg_parser()` (CLI
+surface) are pure and mutation-tested. `main()` itself wires
+`llm_council.council.run_full_council` + `live_adapters.real_fetch_evidence`/
+`real_query_model` and is deliberately excluded from the mutation-tested
+suite — same rationale already established for `live_adapters.real_query_model`/
+`real_fetch_evidence`: it's a thin network-touching wiring layer, not
+testable without either mocking three real dependencies at once (low
+signal) or spending real API cost. AC19's error path (`except Exception`
+→ stderr message → exit 1, no traceback) is a direct, obviously-correct
+4-line block; verified by code inspection rather than a live failing run,
+consistent with the standing "real-money gate" (no further live API spend
+until the user confirms OpenRouter key rotation — `docs/upstream-deltas.md`).
+
+Mutation-tested clean: `pipeline_runner.py` 421/436, 15 survivors — 12 are
+the same previously-documented equivalent categories (string-literal
+scratch-filename/internal-key mutations, the `len(scores)<2` boundary
+proof, `label_for_model` None-vs-empty-string convergence, the unreachable
+`max(..., default=)` branch), now re-verified unchanged after the file
+grew; 3 new (`_build_arg_parser`'s `default=None` kwarg removed for
+`--claims-file`/`--max-cost-usd`/`--output-root`) are equivalent by
+construction — `argparse.add_argument`'s own built-in default for its
+`default=` parameter is already `None`, so omitting the explicit kwarg is
+unobservable. Two real gaps mutation testing found and closed before this
+count: `required=True→None/False` on `--topic-label`/`--query` (only
+tested together, not each independently) and cosmetic `prog`/`description`
+string mutations (untested until now) — both closed with new tests.
+
+**Verified live** (Pillar 1 — verify by execution, not just source
+reading): `uv sync` initially failed to install either console script
+(`scorecard` — pre-existing, never actually worked — or the new
+`llm-council-pipeline`) with "Skipping installation of entry points
+(`project.scripts`) ... project is not packaged." Real pre-existing gap,
+fixed on sight (CLAUDE.md's Boy-Scout rule) by adding
+`[build-system]`/`[tool.hatch.build.targets.wheel] packages = ["scripts"]`
+to `pyproject.toml`. Re-ran `uv sync` → both `uv run llm-council-pipeline
+--help` and `uv run scorecard --help` now print correct usage; running
+with no args exits 2 with argparse's own "required: --topic-label,
+--query" message, confirming AC16-20's exit codes sit on top of a
+genuinely installed entrypoint, not just importable Python.

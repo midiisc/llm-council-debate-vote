@@ -7,14 +7,18 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings, strategies as st
 
 from scripts.pipeline_runner import (
     PipelineConfig,
+    PipelineResult,
+    _build_arg_parser,
     _compute_outliers,
     build_critique_from_rubric,
+    exit_code_for_result,
     extract_rubric_scores_for_scorecard,
     make_output_dir,
     run_pipeline,
@@ -720,3 +724,99 @@ def test_ac15_original_exception_type_and_message_preserved_not_swallowed(tmp_pa
     config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
     with pytest.raises(CustomError, match="very specific message"):
         _run(config, fetch_evidence, failing_council_fn, query_model)
+
+
+# --- exit_code_for_result: AC16-20 exit-code contract ---
+
+
+def _result(cost_ceiling_exceeded=False, revision_skipped_for_cost=False):
+    return PipelineResult(
+        output_dir=Path("/tmp/x"),
+        css=0.5,
+        revision_triggered=False,
+        revision_skipped_for_cost=revision_skipped_for_cost,
+        total_cost_usd=1.0,
+        scorecard_appended=True,
+        synthesis="s",
+        cost_ceiling_exceeded=cost_ceiling_exceeded,
+    )
+
+
+def test_ac16_plain_success_exits_zero():
+    assert exit_code_for_result(_result()) == 0
+
+
+def test_ac17_revision_skipped_for_cost_exits_two():
+    assert exit_code_for_result(_result(revision_skipped_for_cost=True)) == 2
+
+
+def test_ac18_cost_ceiling_exceeded_exits_three():
+    assert exit_code_for_result(_result(cost_ceiling_exceeded=True)) == 3
+
+
+def test_ac20_ceiling_exceeded_outranks_revision_skipped():
+    assert (
+        exit_code_for_result(
+            _result(cost_ceiling_exceeded=True, revision_skipped_for_cost=True)
+        )
+        == 3
+    )
+
+
+# --- _build_arg_parser: CLI surface ---
+
+
+def test_arg_parser_requires_topic_label_and_query():
+    parser = _build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+
+
+def test_arg_parser_requires_topic_label_when_only_query_given():
+    parser = _build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--query", "q"])
+
+
+def test_arg_parser_requires_query_when_only_topic_label_given():
+    parser = _build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--topic-label", "t"])
+
+
+def test_arg_parser_prog_and_description_are_set():
+    parser = _build_arg_parser()
+    assert parser.prog == "llm-council-pipeline"
+    assert parser.description == (
+        "Run the full grounded council pipeline: "
+        "Stage 0.5 -> 1-3.5 -> [2.75] -> scorecard."
+    )
+
+
+def test_arg_parser_defaults_optional_flags_to_none():
+    parser = _build_arg_parser()
+    args = parser.parse_args(["--topic-label", "t", "--query", "q"])
+    assert args.claims_file is None
+    assert args.max_cost_usd is None
+    assert args.output_root is None
+
+
+def test_arg_parser_parses_all_flags():
+    parser = _build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--topic-label",
+            "t",
+            "--query",
+            "q",
+            "--claims-file",
+            "/tmp/claims.txt",
+            "--max-cost-usd",
+            "1.5",
+            "--output-root",
+            "/tmp/out",
+        ]
+    )
+    assert args.claims_file == Path("/tmp/claims.txt")
+    assert args.max_cost_usd == 1.5
+    assert args.output_root == Path("/tmp/out")

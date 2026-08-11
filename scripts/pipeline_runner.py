@@ -251,3 +251,84 @@ async def run_pipeline(
         synthesis=synthesis,
         cost_ceiling_exceeded=cost_ceiling_exceeded,
     )
+
+
+def exit_code_for_result(result: PipelineResult) -> int:
+    """Maps a PipelineResult to the CLI's exit-code contract (AC16-20 in
+    docs/specs/pipeline-runner-contract.md). Ceiling-exceeded (3) outranks
+    revision-skipped-for-cost (2), which outranks plain success (0)."""
+    if result.cost_ceiling_exceeded:
+        return 3
+    if result.revision_skipped_for_cost:
+        return 2
+    return 0
+
+
+def _build_arg_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="llm-council-pipeline",
+        description="Run the full grounded council pipeline: Stage 0.5 -> 1-3.5 -> [2.75] -> scorecard.",
+    )
+    parser.add_argument("--topic-label", required=True)
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--claims-file", type=Path, default=None)
+    parser.add_argument("--max-cost-usd", type=float, default=None)
+    parser.add_argument("--output-root", type=Path, default=None)
+    return parser
+
+
+def main() -> None:
+    import asyncio
+    import sys
+
+    from llm_council.council import run_full_council
+
+    from scripts.live_adapters import real_fetch_evidence, real_query_model
+
+    args = _build_arg_parser().parse_args()
+
+    async def council_fn(query: str):
+        return await run_full_council(query, models=None)
+
+    config = PipelineConfig(
+        topic_label=args.topic_label,
+        query=args.query,
+        raw_claims_text=args.claims_file.read_text() if args.claims_file else "",
+        max_cost_usd=args.max_cost_usd,
+        output_root=args.output_root,
+    )
+
+    try:
+        result = asyncio.run(
+            run_pipeline(config, real_fetch_evidence, council_fn, real_query_model)
+        )
+    except Exception as e:
+        print(f"Pipeline run failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Output: {result.output_dir}")
+    print(f"CSS: {result.css:.3f}")
+    print(f"Total cost: ${result.total_cost_usd:.4f}")
+    print(result.synthesis)
+
+    if result.cost_ceiling_exceeded:
+        print(
+            f"WARNING: total cost ${result.total_cost_usd:.4f} exceeded "
+            f"--max-cost-usd {config.max_cost_usd}",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    if result.revision_skipped_for_cost:
+        print(
+            "WARNING: revision round was skipped because starting it would "
+            f"have exceeded --max-cost-usd {config.max_cost_usd}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
