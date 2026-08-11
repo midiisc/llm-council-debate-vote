@@ -71,6 +71,52 @@ verification, source-reputation filtering, or fetched-content
 sanitization remain open, not-yet-scheduled follow-up work if this
 pipeline is used for higher-stakes decisions.
 
+**2026-08-11: Stage 2's response order and rubric-dimension order are not
+independently randomized per reviewer.** Confirmed by direct source read
+of `llm_council/council_stages.py::stage2_collect_rankings`:
+`random.shuffle(shuffled_results)` runs once per council call, so every
+reviewer in that run sees the same anonymized response ordering; the 5
+rubric dimensions (accuracy/relevance/completeness/conciseness/clarity)
+are always rendered in that exact fixed order in the prompt, for every
+reviewer, every run. Two independent 2025-2026 papers
+(arXiv:2406.07791 "Judging the Judges"; arXiv:2602.02219 "Am I More
+Pointwise or Pairwise?") show rubric/position-based LLM-judge bias is
+real and independent of anonymization — the mitigation they recommend
+(per-call randomized ordering) isn't exposed via `unified_config`/
+`eval_config` (confirmed by `grep`) and lives entirely inside
+`run_full_council`, which this project deliberately uses as-is rather
+than patching installed vendor code. Not implemented; a candidate for an
+upstream feature request if this pipeline's real-decision use grows
+enough to justify raising it (ask before filing, per the established
+`amiable-dev/llm-council#591` precedent).
+
+## Research-driven refinements (2026-08-11)
+
+Feynman-methodology literature pass (arXiv/Semantic Scholar/web,
+citations spot-verified live against arXiv abstracts before acting — see
+`docs/specs/custom-scripts-contracts.md`'s Contract 4 for the full
+citation list) on: (1) query decomposition for Stage 0.5 grounding, (2)
+non-persona diversity techniques for Stage 1, (3) bias mitigation beyond
+anonymization, (4) other MAD-pipeline architecture refinements.
+
+**Implemented:** Stage 4 completeness check (`scripts/completeness_check.py`)
+— guards against arXiv:2606.03032's "Deliberative Illusion" finding
+(multi-agent consensus can mask up to 72% factual attrition) by checking
+post-synthesis whether Stage 0.5's verified facts are actually reflected
+in the chairman's final answer. See Contract 4 for full details. This
+work also surfaced and fixed a real pre-existing bug: `verified_facts`
+was never populated from grounding output, so Stage 2.75 revision could
+never receive a real citable fact in any prior run — see Contract 4's
+"Real bug found and fixed" note.
+
+**Not implemented** (see Contract 4 for reasoning on each): per-reviewer
+response/rubric-order randomization (not exposed by upstream, see the
+known-limitation entry above), non-persona diversity prompting for Stage
+1 (evidence too thin — re-confirms the existing no-persona decision), a
+conditional second Stage 0.5 query for UNVERIFIABLE/CONTRADICTED claims
+(evidence narrowly inferred, adds live cost, deferred under the
+real-money gate).
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.

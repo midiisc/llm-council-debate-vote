@@ -1,5 +1,6 @@
 """Orchestrates Stage 0.5 (grounding) -> Stage 1-3.5 (council) -> Stage 2.75
-(conditional revision) -> scorecard logging, folder-scoped.
+(conditional revision) -> Stage 4 (completeness check) -> scorecard logging,
+folder-scoped.
 
 Contract: docs/specs/pipeline-runner-contract.md.
 """
@@ -7,16 +8,18 @@ from __future__ import annotations
 
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from scripts.completeness_check import check_fact_completeness
 from scripts.grounding_pass import (
     Claim,
     Evidence,
     TaggedClaim,
     parse_claims,
     run_grounding_pass,
+    tag_claim,
 )
 from scripts.revision_round import ModelAnswer, run_revision_round, should_trigger_revision
 from scripts.scorecard import ScorecardRecord, append_record, default_scorecard_path
@@ -35,6 +38,12 @@ class PipelineConfig:
     raw_claims_text: str = ""
     max_cost_usd: Optional[float] = None
     output_root: Optional[Path] = None
+    # Duplicates live_adapters.COMPLETENESS_CHECK_MODEL's value as a plain
+    # string literal (dataclass defaults must be literals) - kept separate
+    # so this module never imports live_adapters, the same testability
+    # boundary the module docstring already describes for fetch_evidence/
+    # council_fn/query_model.
+    completeness_check_model: str = "google/gemini-3.6-flash"
 
 
 @dataclass
@@ -52,6 +61,11 @@ class PipelineResult:
     # because that check is structurally blind to the revision round's own
     # cost, known only after it runs - always False when max_cost_usd is None.
     cost_ceiling_exceeded: bool = False
+    # Stage 4: ids of VERIFIED/CONTRADICTED facts the completeness check
+    # judged NOT reflected in `synthesis`. Empty if no grounding happened,
+    # the check was skipped for cost, or nothing was dropped.
+    dropped_facts: list[str] = field(default_factory=list)
+    completeness_check_skipped_for_cost: bool = False
 
 
 def slugify(topic_label: str) -> str:
@@ -176,6 +190,8 @@ async def run_pipeline(
             input_path.write_text(config.raw_claims_text)
             run_grounding_pass(input_path, evidence_map, output_dir)
             input_path.unlink()
+            tagged = [tag_claim(c, evidence_map.get(c.id, [])) for c in claims]
+            verified_facts = [tc for tc in tagged if tc.tag in ("VERIFIED", "CONTRADICTED")]
 
         stage1_results, stage2_results, stage3_result, metadata = await council_fn(config.query)
 
@@ -210,6 +226,18 @@ async def run_pipeline(
                 cost_so_far += revision_cost
                 revision_triggered = True
 
+        dropped_facts: list[str] = []
+        completeness_check_skipped_for_cost = False
+        completeness_check_cost = 0.0
+        if verified_facts:
+            if config.max_cost_usd is not None and cost_so_far >= config.max_cost_usd:
+                completeness_check_skipped_for_cost = True
+            else:
+                dropped_facts, completeness_check_cost = await check_fact_completeness(
+                    verified_facts, synthesis, config.completeness_check_model, query_model
+                )
+                cost_so_far += completeness_check_cost
+
         rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
         ranks = _compute_ranks(aggregate_rankings)
         is_outlier = _compute_outliers(aggregate_rankings)
@@ -231,7 +259,7 @@ async def run_pipeline(
         )
         append_record(record, scorecard_path)
 
-        total_cost_usd = stage1to3_cost + revision_cost
+        total_cost_usd = stage1to3_cost + revision_cost + completeness_check_cost
         cost_ceiling_exceeded = (
             config.max_cost_usd is not None and total_cost_usd > config.max_cost_usd
         )
@@ -250,6 +278,8 @@ async def run_pipeline(
         scorecard_appended=True,
         synthesis=synthesis,
         cost_ceiling_exceeded=cost_ceiling_exceeded,
+        dropped_facts=dropped_facts,
+        completeness_check_skipped_for_cost=completeness_check_skipped_for_cost,
     )
 
 
@@ -269,7 +299,7 @@ def _build_arg_parser():
 
     parser = argparse.ArgumentParser(
         prog="llm-council-pipeline",
-        description="Run the full grounded council pipeline: Stage 0.5 -> 1-3.5 -> [2.75] -> scorecard.",
+        description="Run the full grounded council pipeline: Stage 0.5 -> 1-3.5 -> [2.75] -> 4 -> scorecard.",
     )
     parser.add_argument("--topic-label", required=True)
     parser.add_argument("--query", required=True)
@@ -312,6 +342,19 @@ def main() -> None:
     print(f"CSS: {result.css:.3f}")
     print(f"Total cost: ${result.total_cost_usd:.4f}")
     print(result.synthesis)
+
+    if result.dropped_facts:
+        print(
+            "WARNING: the final synthesis does not appear to address these "
+            f"verified facts: {', '.join(result.dropped_facts)}",
+            file=sys.stderr,
+        )
+    if result.completeness_check_skipped_for_cost:
+        print(
+            "WARNING: the Stage 4 completeness check was skipped because "
+            f"running it would have exceeded --max-cost-usd {config.max_cost_usd}",
+            file=sys.stderr,
+        )
 
     if result.cost_ceiling_exceeded:
         print(

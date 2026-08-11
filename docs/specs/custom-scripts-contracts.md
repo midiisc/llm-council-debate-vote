@@ -248,3 +248,182 @@ def render_report(report: ScorecardReport, target_model: str) -> str: ...  # pla
 8. Given zero records exist, When `render_report` runs, Then it returns a
    clear "no sessions recorded yet" message — not a crash, not a fabricated
    N=0 average line.
+
+## Contract 4 — `completeness_check.py` (Stage 4, added 2026-08-11)
+
+Named Stage 4, not 3.5 — `run_full_council` already uses "3.5" internally
+for its own aggregate-rankings (Borda count) computation
+(`llm_council/council.py`, `calculate_aggregate_rankings`), confirmed by
+direct source read. This check runs strictly after everything upstream
+does (grounding → 1 → 2 → 2.5 → [2.75] → 3 → 3.5), so Stage 4 is the
+non-colliding, chronologically accurate label.
+
+**Grounded research driving this** (Feynman-methodology literature pass,
+2026-08-11 — see `docs/upstream-deltas.md`'s "Research-driven refinements"
+entry for the full ranked findings and citations, all verified live
+against arXiv abstracts before acting): Wan et al., "The Deliberative
+Illusion: Diagnosing Factual Attrition and Stance Homogenization in
+Multi-Agent LLM Deliberation" (arXiv:2606.03032) — multi-agent discussion
+can erase up to 72% of issue-critical facts while apparent consensus
+strengthens ("agree more while knowing less"). This is a direct structural
+risk to this pipeline's own CSS gate: a high Consensus Strength Score
+could reflect factual attrition rather than correctness, and nothing in
+the current pipeline would ever surface that.
+
+**Objective:** after the chairman's Stage 3 synthesis is produced, check
+whether Stage 0.5's VERIFIED/CONTRADICTED facts are actually reflected in
+the final answer, and surface (never silently drop) any that aren't. This
+is diagnostic-only — it never blocks, edits, or re-triggers synthesis; it
+just makes factual attrition visible where it would otherwise be
+invisible.
+
+**Non-goals:** this does not re-run or edit the chairman synthesis, does
+not feed dropped facts back into another revision round (that would be a
+much bigger structural change — conflating this diagnostic with Stage
+2.75's correction-biased revision loop, which has its own separate,
+already-validated trigger condition), and does not change
+`should_trigger_revision`'s CSS-based gate. A no-op (zero cost) when no
+grounding happened, matching every other conditional stage in this
+pipeline.
+
+**Signature:**
+```python
+QueryFn = Callable[[str, str], Awaitable[tuple[str, float]]]  # (model, prompt) -> (response, cost_usd)
+
+def build_completeness_prompt(verified_facts: list[TaggedClaim], synthesis: str) -> str: ...
+def parse_completeness_response(raw_content: str, verified_facts: list[TaggedClaim]) -> list[str]:
+    # returns the subset of verified_facts' ids judged NOT addressed in the synthesis
+    ...
+async def check_fact_completeness(
+    verified_facts: list[TaggedClaim],
+    synthesis: str,
+    model: str,
+    query_fn: QueryFn,
+) -> tuple[list[str], float]:
+    # returns (dropped_fact_ids, cost_usd)
+    ...
+```
+
+**Acceptance criteria:**
+1. Given `verified_facts` is empty, When `check_fact_completeness` is
+   called, Then it returns `([], 0.0)` immediately with no call to
+   `query_fn` — cost-safe no-op, same pattern as
+   `run_revision_round`'s CSS≥threshold no-op.
+2. Given `verified_facts` is non-empty, When `check_fact_completeness`
+   runs, Then `query_fn` is called exactly once (a single batched check
+   covering every fact, not one call per fact — cost discipline; the
+   research finding is about aggregate attrition, not per-fact drift, so
+   one call is the right granularity).
+3. Given the model's response is a JSON array of ids not addressed, When
+   `parse_completeness_response` runs, Then it returns exactly those ids,
+   filtered to only ids that actually exist in `verified_facts` (defensive
+   against a hallucinated id).
+4. Given the model's response is malformed JSON, not a JSON array, or
+   otherwise unparseable, When `parse_completeness_response` runs, Then it
+   returns `[]` (assume nothing dropped) rather than raising — a
+   diagnostic check must never crash the pipeline over its own parse
+   failure; degrading to "couldn't determine, assume fine" is the correct
+   failure mode here (mirrors `live_adapters.parse_evidence_response`'s
+   same never-raise contract).
+5. Given `build_completeness_prompt` is called, When rendered, Then it
+   contains every fact's id, tag, and text, and the full `synthesis` text
+   verbatim — the check has no basis to judge completeness without both.
+
+**Integration into `pipeline_runner.run_pipeline`:** runs once, after
+`synthesis` is computed, gated the same way Stage 2.75 revision is gated
+against `config.max_cost_usd` (skipped, not silently over-spent, if
+`cost_so_far` already meets the ceiling — new field
+`completeness_check_skipped_for_cost: bool` on `PipelineResult`, mirroring
+`revision_skipped_for_cost`). New `PipelineResult.dropped_facts: list[str]`
+field (empty list = nothing dropped or check didn't run). The CLI
+(`main()`) prints a stderr warning naming any dropped fact ids but does
+**not** get a new exit code for this — dropped facts are a quality signal,
+not a cost-outcome signal, and the existing exit-code contract (AC16-20)
+is scoped to cost outcomes specifically; conflating the two without a
+fresh panel review would be scope creep on an already-settled contract.
+
+### Real bug found and fixed while wiring this in (2026-08-11)
+
+Implementing Stage 4 required reading `verified_facts` — and found
+`run_pipeline` had been hardcoding it to `[]` and **never populating it**
+from `run_grounding_pass`'s output, even when grounding ran and produced
+real VERIFIED/CONTRADICTED tags. `run_grounding_pass`'s own contract
+(Contract 1, AC1) correctly writes `grounding.md` to disk with real tags —
+that part worked — but its return type is `Path` (the written file), not
+the tagged claims, and nothing in `run_pipeline` ever independently
+computed them. The result: **Stage 2.75's correction-biased revision has
+never, in any real run, been able to receive an actual citable fact** —
+`run_revision_round`'s `verified_facts` parameter was always an empty
+list, so a model could never satisfy "cite a specific verified fact id"
+even when Stage 0.5 had genuinely verified one. Zero existing tests caught
+this because every `test_pipeline_runner.py` test exercising revision used
+`raw_claims_text=""` (grounding skipped) or never inspected revision
+prompt content for grounded-fact text — a second instance of the same
+"mocks matching a wrong mental model prove nothing" pattern already
+recorded in this doc's 2026-08-09 real-run validation entry (the
+`stage3_result["synthesis"]` bug).
+
+**Fix:** `run_pipeline` now also imports `tag_claim` and, immediately
+after `run_grounding_pass` writes the file, independently computes
+`tagged = [tag_claim(c, evidence_map.get(c.id, [])) for c in claims]` and
+filters to `verified_facts = [tc for tc in tagged if tc.tag in
+("VERIFIED", "CONTRADICTED")]` — mirroring exactly what `run_grounding_pass`
+does internally, without changing that function's own tested return-type
+contract. Regression tests added:
+`test_verified_facts_from_grounding_reach_revision_prompt`,
+`test_contradicted_claims_from_grounding_reach_revision_prompt`,
+`test_unverifiable_claims_from_grounding_do_not_reach_revision_prompt` —
+all assert on actual grounded-fact text appearing (or not) in the real
+prompt sent to `query_model`, not just that grounding.md got written.
+
+**Blast radius:** every real pipeline run to date that triggered Stage
+2.75 revision did so with zero real facts available to cite — revision
+outcomes were always rejected (`accepted=False`) unless a model
+hallucinated a citation matching nothing. This did not corrupt any
+recorded scorecard data (rubric scores/rankings are independent of
+revision), but it means the "correction-biased revision" feature has been
+silently inert since its introduction. No further action needed beyond
+this fix — there is no stored state to migrate or backfill.
+
+**Mutation testing (2026-08-11):** `completeness_check.py` 62/62, zero
+survivors. `pipeline_runner.py` 475/493, same 18 previously-documented
+equivalent survivors as before this change (the file grew — mutant IDs
+shifted — but the underlying equivalent categories are unchanged), zero
+new gaps from either the Stage 4 wiring or the `verified_facts` bug fix.
+Full project suite: 189 passed.
+
+### Research findings not implemented (2026-08-11)
+
+From the same Feynman-methodology literature pass that produced Stage 4
+(all citations verified live against arXiv abstracts before being acted
+on, per Pillar 1 — see `docs/upstream-deltas.md`'s "Research-driven
+refinements" entry for the full ranked list):
+
+- **Per-reviewer response-order + rubric-dimension-order randomization**
+  (arXiv:2406.07791, arXiv:2602.02219 — position bias in LLM-as-judge is
+  independent of anonymization). Confirmed by direct source read of
+  `llm_council/council_stages.py::stage2_collect_rankings`: response order
+  IS already shuffled, but only **once per run** (same order shown to
+  every reviewer, not re-randomized per reviewer call), and the 5 rubric
+  dimensions (accuracy/relevance/completeness/conciseness/clarity) are
+  rendered in a **hardcoded fixed order** every time, for every reviewer,
+  every run. Neither is exposed via `unified_config`/`eval_config`
+  (confirmed by `grep`). **Not implemented** — this is entirely inside
+  `run_full_council`, which this project deliberately uses as-is rather
+  than patching installed vendor code (the whole reason it was selected —
+  see `docs/tool-selection.md`). Tracked here as a known limitation, not
+  silently dropped; worth an upstream feature request if this pipeline's
+  use grows to justify it.
+- **Non-persona diversity/lateral-thinking prompting for Stage 1
+  drafting** (Q2 in the research pass): evidence too thin to act on —
+  the closest relevant study (arXiv:2511.07784) attributes debate success
+  to model heterogeneity (already satisfied by using 4 distinct frontier
+  models), not prompt-level framing tricks, and doesn't test the
+  no-persona-framing variant directly. Re-confirms the existing
+  no-persona decision; nothing changed.
+- **Conditional second query at Stage 0.5** for claims tagged UNVERIFIABLE
+  or CONTRADICTED on the first pass (Q1): evidence is narrowly inferred
+  from a decomposition-specific finding (arXiv:2602.10380), not directly
+  tested for this single-claim, single-query setup, and adds a real extra
+  API call per affected claim. Deferred — real-money gate (Pillar 6)
+  argues against adding live spend on inferred-not-tested evidence.

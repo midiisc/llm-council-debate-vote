@@ -25,6 +25,11 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # capable via the :online suffix, not because it's a council member.
 EVIDENCE_MODEL = "google/gemini-3.6-flash:online"
 
+# Same base model as EVIDENCE_MODEL, minus the :online search plugin - the
+# Stage 3.5 completeness check (scripts/completeness_check.py) reasons over
+# text already provided in the prompt, no web search needed.
+COMPLETENESS_CHECK_MODEL = "google/gemini-3.6-flash"
+
 MAX_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1.0
 

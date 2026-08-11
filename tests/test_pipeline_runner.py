@@ -531,6 +531,203 @@ def test_ac10_total_cost_includes_stage1to3_cost_when_no_revision(tmp_path):
     assert result.total_cost_usd == pytest.approx(0.03)
 
 
+# --- Regression: verified_facts from grounding must actually reach the
+# revision round and the Stage 4 completeness check, not be silently
+# discarded. pipeline_runner used to hardcode verified_facts=[] and never
+# populate it from run_grounding_pass's tagged claims - grounding.md would
+# be written correctly to disk, but neither revision_round nor (once added)
+# completeness_check ever received a real citable fact even when grounding
+# ran and produced a VERIFIED/CONTRADICTED tag. ---
+
+
+def test_verified_facts_from_grounding_reach_revision_prompt(tmp_path):
+    evidence = {"1": [Evidence(source="http://example.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. UNIQUE_GROUNDED_CLAIM_TEXT.",
+        output_root=tmp_path,
+    )
+    _run(config, fetch_evidence, council_fn, query_model)
+
+    revision_prompts = [p for m, p in query_model.calls if m in ("model-x", "model-y")]
+    assert len(revision_prompts) == 2
+    for prompt in revision_prompts:
+        assert "UNIQUE_GROUNDED_CLAIM_TEXT" in prompt
+        assert "VERIFIED" in prompt
+
+
+def test_contradicted_claims_from_grounding_reach_revision_prompt(tmp_path):
+    evidence = {
+        "1": [Evidence(source="http://example.com", date="2026-01-01", supports=False)]
+    }
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. UNIQUE_CONTRADICTED_CLAIM_TEXT.",
+        output_root=tmp_path,
+    )
+    _run(config, fetch_evidence, council_fn, query_model)
+
+    revision_prompts = [p for m, p in query_model.calls if m in ("model-x", "model-y")]
+    assert len(revision_prompts) == 2
+    for prompt in revision_prompts:
+        assert "UNIQUE_CONTRADICTED_CLAIM_TEXT" in prompt
+        assert "CONTRADICTED" in prompt
+
+
+def test_unverifiable_claims_from_grounding_do_not_reach_revision_prompt(tmp_path):
+    # No evidence supplied -> tag_claim yields UNVERIFIABLE, which must be
+    # filtered OUT of verified_facts (only VERIFIED/CONTRADICTED qualify).
+    fetch_evidence = _make_fetch_evidence({})
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. UNGROUNDED_CLAIM_TEXT.",
+        output_root=tmp_path,
+    )
+    _run(config, fetch_evidence, council_fn, query_model)
+
+    revision_prompts = [p for m, p in query_model.calls if m in ("model-x", "model-y")]
+    for prompt in revision_prompts:
+        assert "UNGROUNDED_CLAIM_TEXT" not in prompt
+
+
+# --- Stage 4 completeness check wiring ---
+
+
+def test_completeness_check_not_called_when_no_grounding(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.dropped_facts == []
+    assert result.completeness_check_skipped_for_cost is False
+    assert query_model.calls == []
+
+
+def test_completeness_check_called_once_when_grounding_ran(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))  # no revision
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '["1"]'})
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. UNIQUE_COMPLETENESS_CLAIM_TEXT.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    completeness_calls = [c for c in query_model.calls if c[0] == "google/gemini-3.6-flash"]
+    assert len(completeness_calls) == 1
+    # the actual synthesis text must reach the completeness prompt, not be
+    # swapped for a placeholder
+    assert "Final synthesis text" in completeness_calls[0][1]
+    assert "UNIQUE_COMPLETENESS_CLAIM_TEXT" in completeness_calls[0][1]
+    assert result.dropped_facts == ["1"]
+
+
+def test_completeness_check_cost_included_in_total_cost(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.total_cost_usd == pytest.approx(0.03 + 0.05)
+
+
+def test_total_cost_accumulates_revision_and_completeness_cost_additively(tmp_path):
+    # Distinguishes cost_so_far += completeness_check_cost from = or -=:
+    # with both revision (css<0.50) and completeness check running, total
+    # must equal stage1to3 + revision + completeness, not just the last
+    # cost written or a subtraction.
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    # stage1to3 (0.03) + revision (2 calls x 0.05) + completeness (1 call x 0.05)
+    assert result.total_cost_usd == pytest.approx(0.03 + 0.10 + 0.05)
+
+
+def test_cost_so_far_includes_completeness_check_cost_not_overwritten(tmp_path, monkeypatch):
+    # Distinguishes cost_so_far += completeness_check_cost from = or -=:
+    # total_cost_usd is computed independently (stage1to3 + revision +
+    # completeness), so it can't catch this - only cost_so_far, surfaced
+    # via run_status.json on a failure after the completeness check ran.
+    import scripts.pipeline_runner as pr_module
+
+    def exploding_append_record(record, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pr_module, "append_record", exploding_append_record)
+
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    with pytest.raises(OSError):
+        _run(config, fetch_evidence, council_fn, query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    status = _read_run_status(run_dirs[0])
+    # stage1-3 (0.03) + 2 revision calls (0.10) + 1 completeness call (0.05)
+    assert status["cost_so_far_usd"] == pytest.approx(0.18)
+
+
+def test_completeness_check_skipped_when_cost_ceiling_already_met(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=0.05, cost_y=0.05))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+        max_cost_usd=0.10,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.completeness_check_skipped_for_cost is True
+    assert result.dropped_facts == []
+    assert query_model.calls == []
+
+
 # --- _compute_outliers ---
 
 
@@ -789,7 +986,7 @@ def test_arg_parser_prog_and_description_are_set():
     assert parser.prog == "llm-council-pipeline"
     assert parser.description == (
         "Run the full grounded council pipeline: "
-        "Stage 0.5 -> 1-3.5 -> [2.75] -> scorecard."
+        "Stage 0.5 -> 1-3.5 -> [2.75] -> 4 -> scorecard."
     )
 
 
