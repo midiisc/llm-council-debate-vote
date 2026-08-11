@@ -307,10 +307,13 @@ def test_build_revision_prompt_exact_content_with_verified_facts():
         "MY ANSWER\n\n"
         "Your own critique from the previous round:\n"
         "MY CRITIQUE\n\n"
-        "Verified facts (id, tag, text):\n"
-        "[1] (VERIFIED) fact one\n[2] (CONTRADICTED) fact two\n\n"
-        "You may revise your answer ONLY by citing a specific verified fact "
-        "id above that directly contradicts your own claim. "
+        "Single-source research findings (id, tag, source, text) — each "
+        "comes from one automated web search, not multi-source "
+        "verification. Weigh accordingly, do not treat as infallible:\n"
+        "[1] (VERIFIED, source: src) fact one\n"
+        "[2] (CONTRADICTED, source: src) fact two\n\n"
+        "You may revise your answer ONLY by citing a specific finding id "
+        "above that directly contradicts your own claim. "
         f"{REQUIRED_SENTENCE}\n\n"
         "If you revise, start your response with a citation marker naming the "
         "fact id, e.g. `[[cite:<id>]]`, followed by your revised answer text. "
@@ -324,7 +327,60 @@ def test_build_revision_prompt_exact_content_with_no_verified_facts():
 
     prompt = build_revision_prompt(answer, [])
 
-    assert "Verified facts (id, tag, text):\n(no verified facts available)\n\n" in prompt
+    assert "not multi-source verification" in prompt
+    assert "(no verified facts available)\n\n" in prompt
+
+
+# --- AC7-9 (docs/specs/custom-scripts-contracts.md, Contract 2 amendment):
+# evidence-poisoning / injection mitigation - source transparency + softened
+# authority framing ---
+
+
+def test_ac7_fact_source_url_appears_in_rendered_prompt():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    fact = TaggedClaim(
+        claim=Claim(id="5", text="claim text"),
+        tag="VERIFIED",
+        evidence=[Evidence(source="http://example.com/page", date="2026-01-01", supports=True)],
+    )
+
+    prompt = build_revision_prompt(answer, [fact])
+
+    assert "http://example.com/page" in prompt
+
+
+def test_ac7_multiple_evidence_sources_joined():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    fact = TaggedClaim(
+        claim=Claim(id="5", text="claim text"),
+        tag="VERIFIED",
+        evidence=[
+            Evidence(source="http://a.com", date="2026-01-01", supports=True),
+            Evidence(source="http://b.com", date="2026-01-01", supports=True),
+        ],
+    )
+
+    prompt = build_revision_prompt(answer, [fact])
+
+    assert "http://a.com; http://b.com" in prompt
+
+
+def test_ac8_empty_evidence_renders_no_source_without_crashing():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    fact = TaggedClaim(claim=Claim(id="5", text="claim text"), tag="VERIFIED", evidence=[])
+
+    prompt = build_revision_prompt(answer, [fact])
+
+    assert "source: no source" in prompt
+
+
+def test_ac9_softened_authority_framing_present():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    verified = [_fact("1", "fact one")]
+
+    prompt = build_revision_prompt(answer, verified)
+
+    assert "not multi-source verification" in prompt
 
 
 def test_triggered_branch_prompt_sent_to_query_fn_includes_verified_facts():

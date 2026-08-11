@@ -43,13 +43,20 @@ def should_trigger_revision(css: float, threshold: float = 0.50) -> bool:
     return css < threshold
 
 
+def _fact_source(tc: TaggedClaim) -> str:
+    if not tc.evidence:
+        return "no source"
+    return "; ".join(e.source for e in tc.evidence)
+
+
 def build_revision_prompt(
     answer: ModelAnswer,
     verified_facts: list[TaggedClaim],  # only VERIFIED/CONTRADICTED tagged claims
 ) -> str:
     if verified_facts:
         facts_block = "\n".join(
-            f"[{tc.claim.id}] ({tc.tag}) {tc.claim.text}" for tc in verified_facts
+            f"[{tc.claim.id}] ({tc.tag}, source: {_fact_source(tc)}) {tc.claim.text}"
+            for tc in verified_facts
         )
     else:
         facts_block = "(no verified facts available)"
@@ -59,10 +66,12 @@ def build_revision_prompt(
         f"{answer.original_text}\n\n"
         "Your own critique from the previous round:\n"
         f"{answer.critique}\n\n"
-        "Verified facts (id, tag, text):\n"
+        "Single-source research findings (id, tag, source, text) — each "
+        "comes from one automated web search, not multi-source "
+        "verification. Weigh accordingly, do not treat as infallible:\n"
         f"{facts_block}\n\n"
-        "You may revise your answer ONLY by citing a specific verified fact "
-        "id above that directly contradicts your own claim. "
+        "You may revise your answer ONLY by citing a specific finding id "
+        "above that directly contradicts your own claim. "
         f"{_NO_SWITCH_SENTENCE}\n\n"
         "If you revise, start your response with a citation marker naming the "
         "fact id, e.g. `[[cite:<id>]]`, followed by your revised answer text. "

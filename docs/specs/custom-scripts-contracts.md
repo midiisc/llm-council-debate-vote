@@ -127,6 +127,57 @@ async def run_revision_round(
    synthesis uses `revised_text` when present, but nothing overwrites
    `original_text`.
 
+### Amendment (2026-08-11): evidence-poisoning / injection risk mitigation
+
+Panel finding (ws-redteam #10): `build_revision_prompt` renders `[id]
+(TAG) text` only — the reviewing model never sees *where* a "VERIFIED"
+claim came from. Stage 0.5's `real_fetch_evidence` (`live_adapters.py`)
+makes exactly **one** web-search call per claim via a single model
+(`google/gemini-3.6-flash:online`); `tag_claim` marks a claim VERIFIED off
+that one source. Two real risks follow:
+1. **Injection surface** — a single adversarial or compromised page could
+   get scraped as "supporting" evidence, and the revision prompt's
+   "verified fact" framing tells the reviewing model to trust it
+   unconditionally (the prompt explicitly *instructs* revision on citing
+   a verified fact — an attacker's goal would be exactly to get a false
+   claim tagged VERIFIED so a model cites it and revises toward the
+   attacker's content).
+2. **Overclaiming** — "VERIFIED" from one automated search call reads as
+   stronger than it is; a human skimming a run's output could reasonably
+   assume multi-source corroboration that never happened.
+
+**Non-goals:** this amendment does not add multi-source corroboration,
+source-reputation scoring, or content sanitization of fetched evidence —
+those are real mitigations but out of scope for a prompt/labeling fix;
+tracked as a known limitation instead (see `docs/upstream-deltas.md`).
+
+**Change:** `build_revision_prompt` now renders each fact as
+`[id] (TAG, source: <url or "no source">) text` instead of `[id] (TAG)
+text`, and the section header changes from "Verified facts (id, tag,
+text)" to "Single-source research findings (id, tag, source, text) — each
+comes from one automated web search, not multi-source verification. Weigh
+accordingly, do not treat as infallible." The citation mechanism itself
+(`[[cite:<id>]]`, `parse_revision_response`'s `valid_ids` matching) is
+unchanged — this is a framing/transparency fix, not a structural one.
+
+**New acceptance criteria:**
+7. Given a `TaggedClaim` with non-empty `evidence`, When
+   `build_revision_prompt` renders it, Then the fact's source URL(s)
+   appear in the rendered line (joined with `"; "` if more than one).
+8. Given a `TaggedClaim` with empty `evidence` (defensive — shouldn't
+   normally reach this function per the existing VERIFIED/CONTRADICTED-only
+   filter, but must not crash if it does), When rendered, Then the source
+   field reads `"no source"` rather than raising or rendering an empty gap.
+9. Given any revision prompt is built with at least one fact, When
+   rendered, Then it contains the phrase "not multi-source verification"
+   — the softened-authority framing is present, not just the old
+   "Verified facts" header.
+
+**Mutation testing (2026-08-11):** `revision_round.py` 104/105 after the
+change, same 1 previously-documented equivalent survivor as before this
+amendment (`RevisionOutcome`'s explicit `cost_usd=0.0` kwarg matching the
+dataclass's own default field value — unobservable either way). No new
+gaps from the prompt-template change. Full project suite: 165 passed.
 ## Contract 3 — scorecard wrapper (`scorecard.py` + `scorecard` CLI)
 
 **Objective:** append one record per session to a folder-scoped log; report

@@ -49,6 +49,28 @@ happen until rotation is confirmed.** Code changes and unit/mutation
 testing continue normally — only live OpenRouter spend is paused.
 Update this entry the moment rotation is confirmed.
 
+## Known limitations (not upstream deltas — this repo's own design tradeoffs)
+
+**2026-08-11: Stage 0.5 grounding is single-source, not corroborated.**
+`live_adapters.real_fetch_evidence` makes exactly one automated web-search
+call per claim (via `google/gemini-3.6-flash:online`), and `tag_claim`
+marks a claim VERIFIED/CONTRADICTED off that single source — there is no
+multi-source corroboration, source-reputation scoring, or content
+sanitization of what comes back. This is a real injection/poisoning
+surface (a compromised or adversarial page could get scraped as
+"supporting" evidence and, before this date, would have been handed to a
+revising model under unqualified "verified fact" framing with no visible
+source). Partially mitigated 2026-08-11 (panel finding ws-redteam #10,
+`docs/specs/custom-scripts-contracts.md` Contract 2 amendment):
+`build_revision_prompt` now surfaces each finding's source URL and labels
+the whole section "single-source research findings ... not multi-source
+verification, weigh accordingly" instead of "verified facts." This makes
+the limitation visible to the reviewing model and any human reading a
+run's transcript — it does **not** add actual corroboration. Multi-source
+verification, source-reputation filtering, or fetched-content
+sanitization remain open, not-yet-scheduled follow-up work if this
+pipeline is used for higher-stakes decisions.
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.
