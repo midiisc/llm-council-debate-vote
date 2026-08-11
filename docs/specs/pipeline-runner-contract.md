@@ -246,3 +246,31 @@ Mutation-tested clean afterward: `revision_round.py` 93/94 (1 confirmed-
 equivalent: an explicit `cost_usd=0.0` kwarg matching the dataclass's own
 default is unobservable either way), `pipeline_runner.py` 277/287 (same 10
 previously-documented equivalent survivors, no new gaps).
+
+## Amendment (2026-08-11): crash/interrupt safety + run-completion marker
+
+Same panel review: `scorecard.append_record()` only ever fired at the very
+end of a successful run, so a crash, network drop, or Ctrl-C mid-run left
+real OpenRouter spend (stage1-3 always, sometimes plus a revision round)
+completely invisible to any on-disk record — the output directory looked
+identical whether the run finished or died halfway through. This session's
+own first (buggy) smoke test produced exactly this: a `grounding.md`
+directory with no matching scorecard entry, sitting unexplained.
+
+New: `run_status.json`, written into `output_dir` via temp-write-then-rename
+(atomic — a crash mid-write can never leave a half-written status file):
+
+1. Immediately after `output_dir` is created, before any expensive work,
+   `status: "running"` is written.
+2. If `run_pipeline` completes successfully, it's overwritten to
+   `status: "complete"` with the final `total_cost_usd`.
+3. If any exception propagates after the output directory exists,
+   it's overwritten to `status: "failed"` with the exception message and
+   `cost_so_far_usd` — `0.0` if the council call itself never returned,
+   `stage1to3_cost` if the failure happened during or after revision. The
+   original exception still propagates to the caller unchanged; this is a
+   side-effect on the way out, never a swallow.
+
+New acceptance criteria (11-15), covering: running-status-written-first,
+complete-status-on-success, failed-status-with-cost-on-exception,
+atomic-write-via-tempfile-rename, and exception-not-swallowed.

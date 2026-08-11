@@ -5,6 +5,7 @@ Uses fake fetch_evidence/council_fn/query_model - never real network calls.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 
 import pytest
@@ -472,7 +473,10 @@ def test_grounding_leaves_no_stray_intermediate_file(tmp_path):
     )
     result = _run(config, fetch_evidence, council_fn, query_model)
 
-    assert sorted(p.name for p in result.output_dir.iterdir()) == ["grounding.md"]
+    assert sorted(p.name for p in result.output_dir.iterdir()) == [
+        "grounding.md",
+        "run_status.json",
+    ]
 
 
 def test_ac8_make_output_dir_creates_full_path(tmp_path):
@@ -561,3 +565,158 @@ def test_extract_rubric_scores_for_scorecard_shape():
     scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
     assert scores["model-x"]["accuracy"] == 8
     assert scores["model-y"]["accuracy"] == 4
+
+
+# --- AC11-15: run_status.json crash/interrupt-safety lifecycle ---
+
+
+def _read_run_status(output_dir):
+    return json.loads((output_dir / "run_status.json").read_text())
+
+
+def test_ac11_running_status_written_before_expensive_work(tmp_path):
+    # A council_fn that raises immediately still leaves a "running" marker,
+    # proving the status is written BEFORE council_fn is even called, not
+    # only recorded retroactively on success.
+    async def failing_council_fn(query):
+        raise RuntimeError("network down")
+
+    fetch_evidence = _make_fetch_evidence()
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="crash test", query="q", output_root=tmp_path)
+    with pytest.raises(RuntimeError):
+        _run(config, fetch_evidence, failing_council_fn, query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    assert len(run_dirs) == 1
+    status = _read_run_status(run_dirs[0])
+    assert status["status"] == "failed"
+
+
+def test_ac11_running_status_literal_string_correct(tmp_path):
+    # council_fn peeks at run_status.json WHILE it's still "running" (before
+    # this function overwrites it to "complete"), to verify the literal
+    # status string content independently of the final complete/failed state.
+    seen_status = {}
+
+    async def peeking_council_fn(query):
+        result = _council_result_fixture(css=0.9)
+        # output_dir isn't available here directly; reconstruct via closure
+        # over the known tmp_path root (single run in this test).
+        run_dirs = list(tmp_path.iterdir())
+        assert len(run_dirs) == 1
+        seen_status.update(_read_run_status(run_dirs[0]))
+        return result
+
+    fetch_evidence = _make_fetch_evidence()
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    _run(config, fetch_evidence, peeking_council_fn, query_model)
+
+    assert seen_status["status"] == "running"
+
+
+def test_ac12_complete_status_written_on_success(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    status = _read_run_status(result.output_dir)
+    assert status["status"] == "complete"
+    assert status["total_cost_usd"] == pytest.approx(0.03)
+
+
+def test_ac13_failed_status_includes_error_and_cost_so_far_after_council_succeeds(tmp_path):
+    # Council succeeds (stage1-3 cost known: 0.03), but revision's query_fn
+    # blows up - the run fails AFTER real money was already spent, and that
+    # spend must be visible in the failure record, not silently lost.
+    async def exploding_query_model(model, prompt):
+        raise ConnectionError("revision call failed")
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=0.01, cost_y=0.02))
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    with pytest.raises(ConnectionError):
+        _run(config, fetch_evidence, council_fn, exploding_query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    assert len(run_dirs) == 1
+    status = _read_run_status(run_dirs[0])
+    assert status["status"] == "failed"
+    assert "revision call failed" in status["error"]
+    assert status["cost_so_far_usd"] == pytest.approx(0.03)
+
+
+def test_ac13_failed_status_cost_so_far_is_zero_when_council_never_returns(tmp_path):
+    async def failing_council_fn(query):
+        raise RuntimeError("boom")
+
+    fetch_evidence = _make_fetch_evidence()
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    with pytest.raises(RuntimeError):
+        _run(config, fetch_evidence, failing_council_fn, query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    status = _read_run_status(run_dirs[0])
+    assert status["cost_so_far_usd"] == 0.0
+
+
+def test_cost_so_far_accumulates_stage1to3_plus_revision_not_overwritten(tmp_path, monkeypatch):
+    # Force a failure AFTER a successful revision round but before
+    # run_pipeline returns (during scorecard append), to prove cost_so_far
+    # is stage1to3_cost + revision_cost at that point, not just
+    # revision_cost alone (which would happen if += were = or -=).
+    import scripts.pipeline_runner as pr_module
+
+    def exploding_append_record(record, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pr_module, "append_record", exploding_append_record)
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=0.01, cost_y=0.02))
+    query_model = FakeQueryModel(cost_per_call=0.05)
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    with pytest.raises(OSError):
+        _run(config, fetch_evidence, council_fn, query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    status = _read_run_status(run_dirs[0])
+    # stage1-3 (0.03) + 2 revision calls at 0.05 each (0.10) = 0.13
+    assert status["cost_so_far_usd"] == pytest.approx(0.13)
+
+
+def test_ac14_run_status_written_atomically_no_tmp_file_left_behind(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert (result.output_dir / "run_status.json").exists()
+    assert not (result.output_dir / "run_status.json.tmp").exists()
+
+
+def test_ac15_original_exception_type_and_message_preserved_not_swallowed(tmp_path):
+    class CustomError(ValueError):
+        pass
+
+    async def failing_council_fn(query):
+        raise CustomError("very specific message")
+
+    fetch_evidence = _make_fetch_evidence()
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    with pytest.raises(CustomError, match="very specific message"):
+        _run(config, fetch_evidence, failing_council_fn, query_model)

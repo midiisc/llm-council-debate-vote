@@ -8,3 +8,6 @@ __pycache__/
 .mutmut-cache
 mutants/
 .pytest_cache/
+# real decision run output - transcripts, grounding results, cost data.
+# Never committed: these are the user's own decision content, not source.
+council-runs/

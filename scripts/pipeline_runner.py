@@ -67,6 +67,19 @@ def make_output_dir(output_root: Path, topic_label: str, timestamp: str) -> Path
     return out
 
 
+def _write_run_status(output_dir: Path, status: str, **extra) -> None:
+    """Atomic write (temp file + rename) so a crash mid-write never leaves a
+    half-written run_status.json - a reader always sees either the previous
+    complete status or the new one, never a torn file."""
+    import json
+
+    payload = {"status": status, **extra}
+    tmp_path = output_dir / "run_status.json.tmp"
+    final_path = output_dir / "run_status.json"
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    tmp_path.rename(final_path)
+
+
 def _rubric_scores_for_model(
     model: str, stage2_results: list[dict], label_to_model: dict
 ) -> dict[str, list[float]]:
@@ -151,72 +164,82 @@ async def run_pipeline(
     output_root = config.output_root if config.output_root is not None else Path.cwd() / "council-runs"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
     output_dir = make_output_dir(output_root, config.topic_label, timestamp)
+    _write_run_status(output_dir, "running")
 
-    verified_facts: list[TaggedClaim] = []
-    if config.raw_claims_text.strip():
-        claims = parse_claims(config.raw_claims_text)
-        evidence_map = await fetch_evidence(claims)
-        input_path = output_dir / "_raw_claims.txt"
-        input_path.write_text(config.raw_claims_text)
-        run_grounding_pass(input_path, evidence_map, output_dir)
-        input_path.unlink()
+    cost_so_far = 0.0
+    try:
+        verified_facts: list[TaggedClaim] = []
+        if config.raw_claims_text.strip():
+            claims = parse_claims(config.raw_claims_text)
+            evidence_map = await fetch_evidence(claims)
+            input_path = output_dir / "_raw_claims.txt"
+            input_path.write_text(config.raw_claims_text)
+            run_grounding_pass(input_path, evidence_map, output_dir)
+            input_path.unlink()
 
-    stage1_results, stage2_results, stage3_result, metadata = await council_fn(config.query)
+        stage1_results, stage2_results, stage3_result, metadata = await council_fn(config.query)
 
-    css = metadata["quality_metrics"]["core"]["consensus_strength"]
-    aggregate_rankings = metadata["aggregate_rankings"]
-    label_to_model = metadata["label_to_model"]
-    usage = metadata["usage"]
-    stage1to3_cost = usage["total"]["cost_usd"]
+        css = metadata["quality_metrics"]["core"]["consensus_strength"]
+        aggregate_rankings = metadata["aggregate_rankings"]
+        label_to_model = metadata["label_to_model"]
+        usage = metadata["usage"]
+        stage1to3_cost = usage["total"]["cost_usd"]
+        cost_so_far = stage1to3_cost
 
-    revision_triggered = False
-    revision_skipped_for_cost = False
-    revision_cost = 0.0
-    synthesis = stage3_result["response"]
+        revision_triggered = False
+        revision_skipped_for_cost = False
+        revision_cost = 0.0
+        synthesis = stage3_result["response"]
 
-    if should_trigger_revision(css):
-        if config.max_cost_usd is not None and stage1to3_cost >= config.max_cost_usd:
-            revision_skipped_for_cost = True
-        else:
-            answers = [
-                ModelAnswer(
-                    model=s1["model"],
-                    original_text=s1["response"],
-                    critique=build_critique_from_rubric(
-                        s1["model"], stage2_results, label_to_model
-                    ),
-                )
-                for s1 in stage1_results
-            ]
-            outcomes = await run_revision_round(css, answers, verified_facts, query_model)
-            revision_cost = sum(o.cost_usd for o in outcomes)
-            revision_triggered = True
+        if should_trigger_revision(css):
+            if config.max_cost_usd is not None and stage1to3_cost >= config.max_cost_usd:
+                revision_skipped_for_cost = True
+            else:
+                answers = [
+                    ModelAnswer(
+                        model=s1["model"],
+                        original_text=s1["response"],
+                        critique=build_critique_from_rubric(
+                            s1["model"], stage2_results, label_to_model
+                        ),
+                    )
+                    for s1 in stage1_results
+                ]
+                outcomes = await run_revision_round(css, answers, verified_facts, query_model)
+                revision_cost = sum(o.cost_usd for o in outcomes)
+                cost_so_far += revision_cost
+                revision_triggered = True
 
-    rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
-    ranks = _compute_ranks(aggregate_rankings)
-    is_outlier = _compute_outliers(aggregate_rankings)
-    cost_usd = {model: bucket["cost_usd"] for model, bucket in usage["by_model"].items()}
+        rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
+        ranks = _compute_ranks(aggregate_rankings)
+        is_outlier = _compute_outliers(aggregate_rankings)
+        cost_usd = {model: bucket["cost_usd"] for model, bucket in usage["by_model"].items()}
 
-    record = ScorecardRecord(
-        timestamp=timestamp,
-        topic_label=config.topic_label,
-        css=css,
-        rubric_scores=rubric_scores,
-        ranks=ranks,
-        is_outlier=is_outlier,
-        cost_usd=cost_usd,
-    )
-    scorecard_path = (
-        (config.output_root / "scorecard.jsonl")
-        if config.output_root is not None
-        else default_scorecard_path(Path.cwd())
-    )
-    append_record(record, scorecard_path)
+        record = ScorecardRecord(
+            timestamp=timestamp,
+            topic_label=config.topic_label,
+            css=css,
+            rubric_scores=rubric_scores,
+            ranks=ranks,
+            is_outlier=is_outlier,
+            cost_usd=cost_usd,
+        )
+        scorecard_path = (
+            (config.output_root / "scorecard.jsonl")
+            if config.output_root is not None
+            else default_scorecard_path(Path.cwd())
+        )
+        append_record(record, scorecard_path)
 
-    total_cost_usd = stage1to3_cost + revision_cost
-    cost_ceiling_exceeded = (
-        config.max_cost_usd is not None and total_cost_usd > config.max_cost_usd
-    )
+        total_cost_usd = stage1to3_cost + revision_cost
+        cost_ceiling_exceeded = (
+            config.max_cost_usd is not None and total_cost_usd > config.max_cost_usd
+        )
+    except Exception as e:
+        _write_run_status(output_dir, "failed", error=str(e), cost_so_far_usd=cost_so_far)
+        raise
+
+    _write_run_status(output_dir, "complete", total_cost_usd=total_cost_usd)
 
     return PipelineResult(
         output_dir=output_dir,
