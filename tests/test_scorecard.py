@@ -794,7 +794,7 @@ def test_main_help_text_exact_prog_description_and_flag_help(monkeypatch, capsys
     # the derived-from-argv[0] "usage: not-scorecard-at-all ...".
     assert lines[0] == (
         "usage: scorecard [-h] --target-model TARGET_MODEL [--path PATH] "
-        "[--cross-folder] [--search-root SEARCH_ROOT]"
+        "[--cross-folder] [--search-root SEARCH_ROOT] [--show-audition]"
     )
     assert "not-scorecard-at-all" not in out
 

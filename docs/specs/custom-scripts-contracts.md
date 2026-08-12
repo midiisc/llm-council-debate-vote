@@ -178,6 +178,122 @@ change, same 1 previously-documented equivalent survivor as before this
 amendment (`RevisionOutcome`'s explicit `cost_usd=0.0` kwarg matching the
 dataclass's own default field value — unobservable either way). No new
 gaps from the prompt-template change. Full project suite: 165 passed.
+
+### Amendment (2026-08-12): thread the source document into Stage 2.75
+
+**Problem, confirmed by direct source read:** `build_revision_prompt`
+includes the model's own Stage-1 answer, its own critique, and the
+verified-facts block — never the original `user_query`/source document.
+Native Stage 1/2/3 (`council_stages.py`, confirmed by grepping every
+`user_query` reference) all correctly re-include the full document at
+every stage; this gap is specific to this project's own Stage 2.75
+addition. For a large document, a model revising in Stage 2.75 works from
+its own prior summary, not the text itself. Resolved via an 8-persona
+expert panel round (`docs/upstream-deltas.md`, "Second Expert Panel
+round"): threshold-gated inclusion, not always-verbatim (data-minimization
+concern — re-exposing the full document N-models × M-revisions times with
+no visibility) and not smart passage-selection (unproven complexity,
+unjustified at this project's 2-4 decisions/month scale).
+
+**Decision:** `revision.max_document_tokens = 32000` (user-set,
+2026-08-12), token-based via a deliberately simple approximation — this
+repo has no tokenizer dependency today (`tiktoken` not installed, checked
+directly) and the threshold is a soft cost/egress control, not a
+context-fit requirement (all 4 configured models have ~1M-token context,
+confirmed live against OpenRouter). Approximation:
+`estimate_tokens(text) = len(text) // 4` (documented, conservative
+English-text heuristic — never exact, never claimed to be). Below
+threshold: the document is threaded into the prompt, kept **structurally
+distinct** from `facts_block` (own labeled section, own delimiter) so a
+crafted/adversarial document can never forge text matching the
+`[[cite:<id>]]` citation-guardrail pattern (unanimous, uncountered
+ws-redteam finding — this is a real injection-surface gap the fix itself
+would open if the document and facts were rendered adjacently in a way a
+document could imitate). Above threshold: a visible, structured omission
+marker is rendered in the document's place, and the same marker is
+surfaced in the pipeline's Cost & Tokens summary output (not just a debug
+log line) — matches the existing `completeness_check_parse_failed`
+no-silent-degradation precedent from Contract 4.
+
+**Signature changes:**
+```python
+def estimate_tokens(text: str) -> int:
+    # len(text) // 4 - documented approximation, not exact
+    ...
+
+def build_revision_prompt(
+    answer: ModelAnswer,
+    verified_facts: list[TaggedClaim],
+    source_document: str,               # NEW - the original user_query/document
+    max_document_tokens: int = 32000,   # NEW
+) -> str: ...
+```
+`run_revision_round` gains a `source_document: str` parameter, threaded
+straight through to every `build_revision_prompt` call (same document for
+every model in a given round — no per-model variation).
+
+**New acceptance criteria:**
+10. Given `source_document` is non-empty and `estimate_tokens(source_document)
+    <= max_document_tokens`, When `build_revision_prompt` renders, Then the
+    full `source_document` text appears verbatim in its own labeled
+    section, textually separated from `facts_block` by a distinct header
+    (not concatenated or interleaved).
+11. Given `estimate_tokens(source_document) > max_document_tokens`, When
+    rendered, Then the document section contains a structured omission
+    marker naming the threshold (e.g. `"[document omitted from revision
+    prompt - exceeds 32000-token threshold]"`) instead of the document
+    text — never a silent, unmarked absence.
+12. Given a `source_document` is crafted to contain a literal
+    `[[cite:<id>]]`-shaped substring for a real `verified_facts` id, When
+    `parse_revision_response` later parses the MODEL's response (not the
+    prompt), Then this is unaffected — AC12 exists to confirm the
+    document's own placement in the prompt cannot itself satisfy or
+    contaminate the citation-parsing contract, since parsing only ever
+    looks at the model's response text, never the prompt. Regression test
+    specifically renders a document containing a fake citation marker and
+    confirms `build_revision_prompt`'s output keeps it inside the
+    document's own delimited section, distinguishable from a real
+    model-authored citation if a human or a future parser change ever
+    looks at raw prompt text.
+13. Given `source_document` is empty string (defensive — Stage 2.75 is
+    only ever triggered with a real query in practice, but must not
+    crash), When rendered, Then no document section is rendered at all
+    (not an empty-but-present section) — mirrors `verified_facts`' own
+    empty-list handling (`"(no verified facts available)"` for facts,
+    the whole section omitted for an empty document is the equivalent
+    stance since "empty document" isn't a meaningful degraded state to
+    label, unlike "no facts found").
+14. Given `estimate_tokens` is called on typical English text, When
+    compared against a real tokenizer's count (spot-check only, not a
+    contract requirement), Then the approximation is documented as
+    conservative-but-approximate in a code comment — no test asserts
+    exact parity with any real tokenizer, since none is a dependency.
+
+**Non-goals:** no real tokenizer dependency added; no per-model document
+variation; no passage-level/smart truncation (option iii from the panel,
+rejected as unproven complexity at this project's scale).
+
+**Mutation testing (2026-08-12, blind-TDV — isolated test author,
+implementer, RED→GREEN watched):** 5 non-equivalent survivors, all in
+`_build_document_section`, all mutating exact header/footer/
+omission-marker text literals (e.g. wrapping `"--- BEGIN SOURCE DOCUMENT
+---"` or the omission-marker prefix in `"XX...XX"`, or case-flipping
+them). Accepted, not fixed — independently re-verified (not just trusting
+the mutation-testing agent's self-report) by reading both
+`_build_document_section`'s actual implementation and
+`tests/test_revision_round_document_amendment.py`'s own documented
+assumptions section: the tests deliberately check for a case-insensitive
+`"document"` keyword in the header and a case-insensitive `"omit"` +
+literal threshold value in the marker, not byte-exact wording — a direct,
+correct reading of this amendment's own contract language above ("exact
+wording is the implementer's choice as long as it names the numeric
+threshold and is unambiguous that omission occurred"; the header
+requirement was "own labeled section... distinct header", never "this
+exact string"). Pinning exact wording would over-specify beyond what was
+asked, not close a real behavioral gap. Full test suite (`uv run pytest
+tests/ -q`) confirmed green (328 passed) with all other contracts'
+tests present in the same run — no cross-contract regression.
+
 ## Contract 3 — scorecard wrapper (`scorecard.py` + `scorecard` CLI)
 
 **Objective:** append one record per session to a folder-scoped log; report
@@ -495,3 +611,223 @@ refinements" entry for the full ranked list):
   tested for this single-claim, single-query setup, and adds a real extra
   API call per affected claim. Deferred — real-money gate (Pillar 6)
   argues against adding live spend on inferred-not-tested evidence.
+
+## Contract 5 — `audition_tracking.py` (ADR-029 adoption, added 2026-08-12)
+
+**Objective:** track each configured council model's audition-style
+lifecycle state (SHADOW/PROBATION/EVALUATION/FULL/QUARANTINE) using
+`llm-council-core`'s own already-shipped ADR-029 primitives instead of
+building a parallel confidence-tier system by hand — pure information
+surfaced in the `scorecard` report, exactly as non-prescriptive as
+Contract 3's existing design. Supersedes
+`pipeline-architecture-spec.md` §3's originally-planned from-scratch
+"scorecard wrapper" state-tracking (that document's `confidence_tier`
+thresholds became Contract 3's `confidence_tier`, already shipped and
+working — this contract does **not** replace Contract 3, it adds a
+second, complementary signal Contract 3 has no equivalent for).
+
+**Revised finding, correcting the panel's initial framing
+(`docs/upstream-deltas.md`, "Second Expert Panel round" — that round
+worked from the ADR-029 module docstring; this spec is written after
+reading `types.py`/`store.py` in full):** the panel's original phrasing
+("adopt the tracking core... instead of building custom from scratch")
+implied Contract 3's scorecard was redundant. On closer read it is not —
+`scorecard.py`'s `confidence_tier` is a pure session-count bucket with no
+concept of consecutive-failure tracking, quarantine, or quality-percentile
+gating; ADR-029's `AuditionStatus`/`evaluate_state_transition` provide
+exactly those signals and nothing Contract 3 already had. The two are
+complementary, not overlapping — this contract adds a **new**
+`audition.jsonl` log alongside the existing `scorecard.jsonl`, and extends
+`scorecard`'s CLI report with one additional section. Contract 3's own
+file, tests, and mutation-gate baseline are untouched.
+
+**Confirmed by direct source read (2026-08-12), not guessed:**
+- `llm_council.audition.types.evaluate_state_transition` and
+  `record_session_result` are pure functions (no I/O, no global state,
+  no side effects) — safe to call directly without going through
+  `AuditionTracker`/`get_audition_tracker` (the package's own
+  higher-level singleton wrapper, which this contract deliberately does
+  NOT use, to avoid any hidden default store path).
+- `llm_council.audition.store.append_audition_record`/
+  `read_audition_records` take a plain `path: str` argument with no
+  hardcoded default — safe to point at a folder-scoped path, same
+  guarantee Contract 3's `default_scorecard_path` already makes (never
+  `~/.llm-council/`).
+- Neither of the above touches `LLM_COUNCIL_MODEL_INTELLIGENCE` or any
+  other model-intelligence-gated code path (grep-confirmed against
+  `types.py`/`store.py`) — using this module does not require enabling
+  the flag this project has already decided must stay off.
+
+**Non-goal, explicit and load-bearing:** this contract never wires
+audition state to actual model selection, exclusion, or council
+composition. `evaluate_state_transition`'s output (a *proposed*
+transition, e.g. "this model would move PROBATION → EVALUATION") is
+surfaced as one more line in the `scorecard` CLI report, in the same
+plain-language, non-prescriptive register Contract 3 already established
+— never auto-applied. Dropping or promoting a model stays a human decision
+per `pipeline-architecture-spec.md` §2's explicit design ("a proven 3
+beats a padded, unproven 4" — the user's call, not code's). This mirrors
+why `llm_council.audition.selection`/`voting.py` (the package's own
+selection-weight/voting-authority integration, which DOES act on state)
+are intentionally never imported here.
+
+**Signature:**
+```python
+# scripts/audition_tracking.py
+from llm_council.audition.types import AuditionState, AuditionStatus, AuditionCriteria, evaluate_state_transition, record_session_result
+
+def default_audition_path(cwd: Path) -> Path:
+    # cwd / "council-runs" / "audition.jsonl" - never ~/.llm-council/
+    ...
+
+def get_or_init_status(model_id: str, path: Path) -> AuditionStatus:
+    # most recent record for model_id per read_audition_records, or a fresh
+    # AuditionStatus(model_id=model_id, state=AuditionState.SHADOW) if none exists
+    ...
+
+def quality_percentile_from_rankings(model_id: str, aggregate_rankings: list[dict]) -> Optional[float]:
+    # model's borda_score's percentile rank among all models in aggregate_rankings
+    # (0.0-1.0), or None if model_id isn't present (e.g. it failed to respond)
+    ...
+
+@dataclass
+class AuditionUpdate:
+    status: AuditionStatus                       # the new, persisted status
+    proposed_transition: Optional[AuditionState]  # what evaluate_state_transition suggested, if anything
+
+def record_session_for_model(
+    model_id: str,
+    participated: bool,               # True if model_id appears in stage1_results
+    aggregate_rankings: list[dict],   # for quality_percentile derivation; [] if participated=False
+    path: Path,
+) -> AuditionUpdate:
+    ...
+
+def record_session_for_all_models(
+    council_models: list[str],
+    stage1_results: list[dict],
+    aggregate_rankings: list[dict],
+    path: Path,
+) -> list[AuditionUpdate]:
+    # calls record_session_for_model once per council_models entry
+    ...
+
+def render_audition_section(updates_or_statuses: list[AuditionStatus]) -> str:
+    # plain-language block for scorecard's CLI report: one line per model,
+    # state + session_count + (if a transition was proposed this session)
+    # "would move to <STATE> next session" - never "should"/"recommend"
+    ...
+```
+
+**Acceptance criteria (Given/When/Then):**
+1. Given a model has no prior record at `path`, When
+   `get_or_init_status` is called, Then it returns a fresh
+   `AuditionStatus(model_id=model_id, state=AuditionState.SHADOW,
+   session_count=0)` — never raises for a first-ever model.
+2. Given a model has prior records at `path` (multiple sessions), When
+   `get_or_init_status` is called, Then it returns the single
+   most-recent-by-append-order record for that `model_id`, matching
+   `read_audition_records`'s own "most recent per model" contract.
+3. Given `model_id` appears in `stage1_results` (participated),
+   When `record_session_for_model` runs, Then the persisted
+   `AuditionStatus.session_count` increments by exactly 1 and
+   `consecutive_failures` resets to `0` (mirrors
+   `record_session_result(success=True)`).
+4. Given `model_id` does NOT appear in `stage1_results` (failed/timed
+   out that session), When `record_session_for_model` runs, Then
+   `session_count` still increments by 1 but `consecutive_failures`
+   increments by 1 too (`record_session_result(success=False)`), and
+   `quality_percentile_from_rankings` is never called for that model
+   (no ranking data exists for a model that didn't respond).
+5. Given a model's updated status satisfies
+   `evaluate_state_transition`'s criteria for a transition (e.g. exactly
+   `shadow_min_sessions` sessions + `shadow_min_days` elapsed), When
+   `record_session_for_model` runs, Then `AuditionUpdate.proposed_transition`
+   is the new state, but the PERSISTED `AuditionStatus.state` written to
+   `path` is unchanged (still the old state) — a proposed transition is
+   surfaced, never auto-applied. (A human re-running a separate
+   "graduate this model" step, out of scope for this contract, would be
+   the only path to actually changing `state` in storage.)
+6. Given `record_session_for_all_models` is called with N configured
+   council models and M of them present in `stage1_results` (M <= N),
+   When it runs, Then it returns exactly N `AuditionUpdate` entries, one
+   per configured model — a model that failed to respond still gets a
+   failure-recorded entry, never silently skipped.
+7. Given `default_audition_path(cwd)` is called, When executed, Then it
+   returns `cwd/council-runs/audition.jsonl` — never any path under
+   `Path.home()` (same guarantee as Contract 3's AC2).
+8. Given `render_audition_section` is called on a list of statuses, When
+   the output is inspected, Then it contains no "should"/"recommend"/
+   "keep"/"drop" language — matches Contract 3 AC7's existing
+   non-prescriptive-language bar, confirmed by the same string-absence
+   test pattern.
+9. Given a model in `AuditionState.QUARANTINE` with `quarantine_until` in
+   the past, When `evaluate_state_transition` is consulted (via
+   `record_session_for_model`'s internal call), Then the proposed
+   transition is `SHADOW` (cooldown expired) — this project surfaces it
+   as information, exactly like any other proposed transition; it does
+   not auto-exclude the model from future `council.models` regardless of
+   `QUARANTINE` state (non-goal above).
+
+**Pipeline integration:** `pipeline_runner.run_pipeline` gains one call to
+`record_session_for_all_models` after `aggregate_rankings` is computed
+(same point Contract 3's `extract_rubric_scores_for_scorecard` is already
+called), using `_get_council_models()`-equivalent (the configured model
+list, threaded in as a new small parameter or read from
+`metadata["config"]` if `council_adapter.py`'s wrapper exposes it —
+resolved during implementation, not a new architectural decision).
+Written to `default_audition_path(output_root or Path.cwd())`, mirroring
+`default_scorecard_path`'s own root-selection logic exactly. Failure to
+write this log must never fail the pipeline run itself — wrap in the same
+best-effort spirit as `debug_log` entries, not a hard dependency.
+
+**`scorecard` CLI integration:** `scorecard.main()` gains an optional
+`--show-audition` flag; when set, after `render_report`'s existing output,
+it also loads `audition.jsonl` (same `--path`-relative directory
+convention) and prints `render_audition_section`'s output for the
+requested `--target-model`. Off by default — this is additive, not a
+change to Contract 3's existing default CLI behavior.
+
+**Environment:** Python 3.13, `llm-council-core==0.40.1`'s
+`llm_council.audition` subpackage (already installed, no new dependency).
+Mutation gate via `mutmut`, same 0-non-equivalent-survivor bar as every
+other contract in this document.
+
+### Implementation + mutation testing (2026-08-12, blind-TDV)
+
+`scripts/audition_tracking.py` implemented via isolated blind test
+authoring → blind implementation → watched RED → GREEN → mutation gate:
+**98/99 mutants killed, 0 real survivors** (1 equivalent, individually
+verified: the `AuditionStatus(..., session_count=0)` explicit-kwarg-vs-
+omitted mutant, confirmed equivalent via `dataclasses.fields()` — the
+field's own default is already `0`). Full test suite green (328 passed)
+alongside the other two concurrently-developed contracts.
+
+**Pipeline/CLI integration (2026-08-12, implemented directly, not a second
+blind-TDV round-trip — thin glue over already-tested building blocks,
+matching `main()`-level wiring precedent above):**
+- `run_pipeline` gained a `council_models: Optional[list[str]] = None`
+  parameter (additive — every existing call site keeps working unchanged).
+  When set, calls `record_session_for_all_models` right after the
+  scorecard append, writing `<output_root>/audition.jsonl`. Wrapped in
+  `try`/`except Exception`, appending a `debug_log` line either way
+  ("recorded" or "failed non-fatally (<e>)") — never fails an otherwise-
+  successful run, per the contract's own non-goal.
+- `main()` now reads `get_config().council.models` and threads it through.
+- `scorecard` gained `--show-audition`: after the existing report, loads
+  `<scorecard-dir>/audition.jsonl` via `get_or_init_status` and prints
+  `render_audition_section`'s output for `--target-model`. Off by default.
+- Verified: live CLI smoke test (`scorecard --show-audition` against an
+  empty path correctly printed "No sessions recorded yet." plus a fresh
+  SHADOW status line) and 3 new regression tests
+  (`test_council_models_none_skips_audition_tracking_entirely`,
+  `test_council_models_given_records_every_configured_model_including_absent_one`
+  — confirms a configured-but-non-responding model still gets a
+  failure-recorded entry, matching audition_tracking.py's own AC6 —
+  `test_audition_tracking_write_failure_is_non_fatal_to_the_run`). Full
+  suite green: 331 passed. Two pre-existing tests needed mechanical
+  updates to match the new additive signature/CLI surface (not weakened —
+  same assertions, updated to the real new shape): `_run_main`'s
+  `fake_run_pipeline` fixture now accepts `council_models=None`;
+  `scorecard`'s exact `--help` usage-line assertion now includes
+  `[--show-audition]`.

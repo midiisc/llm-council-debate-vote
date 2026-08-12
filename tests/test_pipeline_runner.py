@@ -7,19 +7,27 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
 from hypothesis import given, settings, strategies as st
 
+import scripts.council_adapter as _ca_module
+import scripts.live_adapters as _la_module
+import scripts.pipeline_runner as _pr_module
 from scripts.pipeline_runner import (
+    DEFAULT_MAX_WALL_CLOCK_SECONDS,
     PipelineConfig,
     PipelineResult,
     _build_arg_parser,
     _compute_outliers,
+    _rubric_scores_for_model,
+    _write_run_status,
     build_critique_from_rubric,
     exit_code_for_result,
     extract_rubric_scores_for_scorecard,
+    main,
     make_output_dir,
     run_pipeline,
     slugify,
@@ -180,6 +188,72 @@ def test_ac2_nonempty_claims_text_writes_grounding_md(tmp_path):
     assert "VERIFIED" in grounding_path.read_text()
 
 
+def test_raw_claims_temp_input_file_uses_exact_expected_filename(tmp_path, monkeypatch):
+    # The temp file passed to run_grounding_pass is deleted immediately
+    # after (input_path.unlink()), so its exact name is otherwise
+    # unobservable post-hoc - intercept the call to pin it.
+    captured = {}
+
+    def fake_run_grounding_pass(input_path, evidence_map, output_dir):
+        captured["input_path"] = input_path
+        (output_dir / "grounding.md").write_text("VERIFIED\n")
+
+    monkeypatch.setattr(_pr_module, "run_grounding_pass", fake_run_grounding_pass)
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    _run(config, fetch_evidence, council_fn, query_model)
+
+    assert captured["input_path"].name == "_raw_claims.txt"
+
+
+def test_output_dir_timestamp_uses_utc_not_local_wall_clock(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+
+    before = datetime.now(timezone.utc)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+    after = datetime.now(timezone.utc)
+
+    timestamp_str = result.output_dir.name[: len("YYYY-MM-DDTHH-MM-SS")]
+    parsed = datetime.strptime(timestamp_str, "%Y-%m-%dT%H-%M-%S").replace(tzinfo=timezone.utc)
+
+    # A couple of seconds of slack for strftime's 1-second resolution - a
+    # naive-local-time implementation would be off by this sandbox's
+    # Asia/Kolkata UTC+05:30 offset, vastly outside this window.
+    assert before - timedelta(seconds=2) <= parsed <= after + timedelta(seconds=2)
+
+
+def test_revision_prompt_receives_config_query_as_source_document(tmp_path):
+    # docs/specs/pipeline-runner-contract.md, "Amendment (2026-08-12)":
+    # run_revision_round is now called with source_document=config.query -
+    # verify that exact text (not None, not omitted) reaches the actual
+    # revision prompt sent to query_model.
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3))  # triggers revision
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="UNIQUE_SOURCE_DOCUMENT_MARKER_TEXT",
+        output_root=tmp_path,
+    )
+    _run(config, fetch_evidence, council_fn, query_model)
+
+    assert query_model.calls, "revision must have actually run for this to be meaningful"
+    for _model, prompt in query_model.calls:
+        assert "UNIQUE_SOURCE_DOCUMENT_MARKER_TEXT" in prompt
+        assert "--- BEGIN SOURCE DOCUMENT ---" in prompt
+
+
 # --- AC3: CSS >= 0.50 -> no revision, query_model never called ---
 
 
@@ -196,6 +270,77 @@ def test_ac3_high_css_skips_revision(tmp_path):
     assert result.css == 0.6
     assert result.synthesis == "Final synthesis text"
     assert council_fn.calls == ["the actual question"]
+
+
+# --- Contract 5 wiring: council_models=None skips audition tracking; a
+# real list records every configured model, including one that never
+# responded (per audition_tracking.py's own AC6) ---
+
+
+def test_council_models_none_skips_audition_tracking_entirely(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = asyncio.run(
+        run_pipeline(config, fetch_evidence, council_fn, query_model, council_models=None)
+    )
+
+    assert result.css == 0.9
+    assert not (tmp_path / "audition.jsonl").exists()
+    assert "Audition tracking" not in "\n".join(result.debug_log)
+
+
+def test_council_models_given_records_every_configured_model_including_absent_one(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    # _council_result_fixture's stage1_results only has model-x/model-y -
+    # "model-z" is configured but never responds this session.
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = asyncio.run(
+        run_pipeline(
+            config,
+            fetch_evidence,
+            council_fn,
+            query_model,
+            council_models=["model-x", "model-y", "model-z"],
+        )
+    )
+
+    assert "Audition tracking: recorded" in result.debug_log
+    audition_path = tmp_path / "audition.jsonl"
+    assert audition_path.exists()
+    lines = [json.loads(l) for l in audition_path.read_text().splitlines() if l.strip()]
+    recorded_models = {rec["model_id"] for rec in lines}
+    assert recorded_models == {"model-x", "model-y", "model-z"}
+    z_record = next(rec for rec in lines if rec["model_id"] == "model-z")
+    assert z_record["consecutive_failures"] == 1  # did not participate this session
+    x_record = next(rec for rec in lines if rec["model_id"] == "model-x")
+    assert x_record["consecutive_failures"] == 0  # participated
+
+
+def test_audition_tracking_write_failure_is_non_fatal_to_the_run(tmp_path, monkeypatch):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(_pr_module, "record_session_for_all_models", _boom)
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = asyncio.run(
+        run_pipeline(
+            config, fetch_evidence, council_fn, query_model, council_models=["model-x"]
+        )
+    )
+
+    assert result.css == 0.9  # the run itself still succeeded
+    assert any("Audition tracking: failed non-fatally" in line for line in result.debug_log)
 
 
 # --- AC4: CSS < 0.50 and no cost ceiling -> revision triggered ---
@@ -429,6 +574,19 @@ def test_rubric_scores_for_model_missing_evaluations_key_yields_empty_not_crash(
     label_to_model = {"Response A": {"model": "model-x", "display_index": 0}}
     critique = build_critique_from_rubric("model-x", stage2_results, label_to_model)
     assert critique == "No peer scores available for this response."
+
+
+def test_rubric_scores_for_model_returns_empty_dict_not_all_dims_when_model_absent():
+    # The internal `label_for_model = None` sentinel (distinct from "") is
+    # only observable when the model is genuinely absent from
+    # label_to_model - build_critique_from_rubric's own "No peer scores"
+    # early-return masks the difference (both an empty {} and an
+    # all-empty-lists dict yield no truthy `averages`), so this must call
+    # _rubric_scores_for_model directly.
+    result = _rubric_scores_for_model(
+        "absent-model", [], {"Response A": {"model": "other-model", "display_index": 0}}
+    )
+    assert result == {}
 
 
 # --- AC8: output dir created even if parent missing ---
@@ -975,6 +1133,32 @@ def test_compute_outliers_flags_genuine_statistical_outlier():
     assert result == {"leader": False, "middle": False, "laggard": True}
 
 
+def test_compute_outliers_boundary_exactly_two_scores_still_reaches_stats_computation(monkeypatch):
+    # For n==2, computing median/stdev vs. short-circuiting to
+    # {model: False} happen to produce the SAME returned dict (provably:
+    # with exactly 2 points the "< threshold" check is always False either
+    # way) - so the "< 2" vs "<= 2" vs "< 3" boundary can only be
+    # distinguished by whether the real computation was actually reached,
+    # not by the output value.
+    calls = {"median_called_with": None}
+    real_median = _pr_module.statistics.median
+
+    def spy_median(data):
+        calls["median_called_with"] = list(data)
+        return real_median(data)
+
+    monkeypatch.setattr(_pr_module.statistics, "median", spy_median)
+
+    rankings = [
+        {"model": "a", "borda_score": 3.0},
+        {"model": "b", "borda_score": 1.0},
+    ]
+    result = _compute_outliers(rankings)
+
+    assert calls["median_called_with"] == [3.0, 1.0]
+    assert result == {"a": False, "b": False}
+
+
 def test_compute_outliers_zero_variance_never_flags_anyone():
     # all scores identical -> median==every score==threshold; must use
     # strict "<" so nobody is flagged when there's no real spread at all
@@ -1002,6 +1186,47 @@ def test_extract_rubric_scores_for_scorecard_shape():
 
 def _read_run_status(output_dir):
     return json.loads((output_dir / "run_status.json").read_text())
+
+
+def test_write_run_status_exact_pretty_printed_json_content(tmp_path):
+    # The intermediate ".tmp" filename is never observed post-call (it's
+    # always renamed away before this function returns - covered instead by
+    # the AC11-15 lifecycle tests below that just check the FINAL file), but
+    # the exact final content - including 2-space indent - is a real,
+    # directly observable contract this function's own docstring implies
+    # ("never a half-written run_status.json").
+    _write_run_status(tmp_path, "running", foo="bar", n=3)
+
+    final_path = tmp_path / "run_status.json"
+    assert final_path.exists()
+    assert not (tmp_path / "run_status.json.tmp").exists()
+
+    expected_payload = {"status": "running", "foo": "bar", "n": 3}
+
+    assert final_path.read_text() == json.dumps(expected_payload, indent=2)
+
+
+def test_write_run_status_uses_exact_tmp_filename_before_rename(tmp_path, monkeypatch):
+    # The comment above deliberately skips checking the intermediate ".tmp"
+    # name since it's gone by the time the function returns - intercept
+    # Path.rename itself (still letting it actually run) to observe the
+    # exact source/target names the atomic-write pattern uses.
+    from pathlib import Path
+
+    captured = {}
+    real_rename = Path.rename
+
+    def fake_rename(self, target):
+        captured["source_name"] = self.name
+        captured["target_name"] = Path(target).name
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fake_rename)
+
+    _write_run_status(tmp_path, "running")
+
+    assert captured["source_name"] == "run_status.json.tmp"
+    assert captured["target_name"] == "run_status.json"
 
 
 def test_ac11_running_status_written_before_expensive_work(tmp_path):
@@ -1246,3 +1471,304 @@ def test_arg_parser_parses_all_flags():
     assert args.claims_file == Path("/tmp/claims.txt")
     assert args.max_cost_usd == 1.5
     assert args.output_root == Path("/tmp/out")
+
+
+def test_arg_parser_max_wall_clock_seconds_defaults_to_module_constant():
+    parser = _build_arg_parser()
+    args = parser.parse_args(["--topic-label", "t", "--query", "q"])
+    assert args.max_wall_clock_seconds == DEFAULT_MAX_WALL_CLOCK_SECONDS
+
+
+def test_arg_parser_max_wall_clock_seconds_overridable():
+    parser = _build_arg_parser()
+    args = parser.parse_args(
+        ["--topic-label", "t", "--query", "q", "--max-wall-clock-seconds", "42.5"]
+    )
+    assert args.max_wall_clock_seconds == 42.5
+
+
+# ---------------------------------------------------------------------------
+# main(): the CLI entrypoint, end to end. Was entirely untested (0 direct
+# assertions on it) before this mutation-gate hardening pass - every literal
+# print format, exit code, and PipelineConfig-construction argument was
+# unobserved. run_pipeline/run_council_with_timeouts are faked; real_fetch_
+# evidence/real_query_model are only ever passed through by identity here,
+# never called - so this stays hermetic (no network, no credentials).
+# ---------------------------------------------------------------------------
+
+
+def _make_pipeline_result(**overrides):
+    defaults = dict(
+        output_dir=Path("/tmp/out-dir"),
+        css=0.812,
+        revision_triggered=False,
+        revision_skipped_for_cost=False,
+        total_cost_usd=1.2345,
+        scorecard_appended=True,
+        synthesis="THE SYNTHESIS TEXT",
+        cost_ceiling_exceeded=False,
+        dropped_facts=[],
+        completeness_check_skipped_for_cost=False,
+        completeness_check_parse_failed=False,
+        debug_log=["line one", "line two"],
+    )
+    defaults.update(overrides)
+    return PipelineResult(**defaults)
+
+
+def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None):
+    calls = {"run_pipeline_args": None, "council_fn_query": None}
+
+    async def fake_run_pipeline(config, fetch_evidence, council_fn, query_model, council_models=None):
+        calls["run_pipeline_args"] = (config, fetch_evidence, council_fn, query_model)
+        calls["council_models"] = council_models
+        if exc is not None:
+            raise exc
+        return result
+
+    async def fake_run_council_with_timeouts(query):
+        calls["council_fn_query"] = query
+        return ([], [], {}, {})
+
+    monkeypatch.setattr(_pr_module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(_ca_module, "run_council_with_timeouts", fake_run_council_with_timeouts)
+    monkeypatch.setattr(sys, "argv", ["llm-council-pipeline"] + argv_tail)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    out = capsys.readouterr()
+    return exc_info.value.code, calls, out
+
+
+def test_main_happy_path_prints_output_and_exits_0(monkeypatch, capsys, tmp_path):
+    result = _make_pipeline_result(
+        output_dir=tmp_path / "run1",
+        css=0.755,
+        total_cost_usd=0.4321,
+        synthesis="FINAL SYNTHESIS",
+        debug_log=["stage1 ok", "stage2 ok"],
+    )
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    assert code == 0
+    assert f"Output: {result.output_dir}" in out.out
+    assert "CSS: 0.755" in out.out
+    assert "Total cost: $0.4321" in out.out
+    assert "FINAL SYNTHESIS" in out.out
+    # Exact-line match, not substring "in" - a substring check would still
+    # pass against a mutated "XXDebug log:XX" (mutmut's own string-mutation
+    # scheme wraps literals rather than replacing them), since the original
+    # text remains present as a substring either way.
+    err_lines = out.err.splitlines()
+    assert err_lines[0] == "Debug log:"
+    assert "  stage1 ok" in out.err
+    assert "  stage2 ok" in out.err
+
+    config = calls["run_pipeline_args"][0]
+    assert config.topic_label == "T"
+    assert config.query == "Q"
+    assert config.raw_claims_text == ""
+    assert config.max_cost_usd is None
+    assert config.output_root is None
+    assert config.max_wall_clock_seconds == DEFAULT_MAX_WALL_CLOCK_SECONDS
+
+
+def test_main_reads_claims_file_when_given(monkeypatch, capsys, tmp_path):
+    claims_file = tmp_path / "claims.txt"
+    claims_file.write_text("claim text here")
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q", "--claims-file", str(claims_file)],
+        result=result,
+    )
+
+    config = calls["run_pipeline_args"][0]
+    assert config.raw_claims_text == "claim text here"
+
+
+def test_main_threads_max_cost_output_root_and_wall_clock(monkeypatch, capsys, tmp_path):
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        [
+            "--topic-label", "T", "--query", "Q",
+            "--max-cost-usd", "2.5",
+            "--output-root", str(tmp_path),
+            "--max-wall-clock-seconds", "99.0",
+        ],
+        result=result,
+    )
+
+    config = calls["run_pipeline_args"][0]
+    assert config.max_cost_usd == 2.5
+    assert config.output_root == tmp_path
+    assert config.max_wall_clock_seconds == 99.0
+
+
+def test_main_council_fn_wraps_run_council_with_timeouts(monkeypatch, capsys):
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    council_fn = calls["run_pipeline_args"][2]
+    ret = asyncio.run(council_fn("probe-query"))
+    assert calls["council_fn_query"] == "probe-query"
+    assert ret == ([], [], {}, {})
+
+
+def test_main_passes_the_real_fetch_evidence_and_query_model_adapters(monkeypatch, capsys):
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    _, fetch_evidence, _, query_model = calls["run_pipeline_args"]
+    assert fetch_evidence is _la_module.real_fetch_evidence
+    assert query_model is _la_module.real_query_model
+
+
+def test_main_cost_ceiling_exceeded_exits_3_with_exact_warning(monkeypatch, capsys):
+    result = _make_pipeline_result(cost_ceiling_exceeded=True, total_cost_usd=5.6789)
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q", "--max-cost-usd", "5.0"],
+        result=result,
+    )
+
+    assert code == 3
+    assert "WARNING: total cost $5.6789 exceeded --max-cost-usd 5.0" in out.err
+
+
+def test_main_revision_skipped_for_cost_exits_2_with_exact_warning(monkeypatch, capsys):
+    result = _make_pipeline_result(revision_skipped_for_cost=True)
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q", "--max-cost-usd", "1.0"],
+        result=result,
+    )
+
+    assert code == 2
+    assert (
+        "WARNING: revision round was skipped because starting it would "
+        "have exceeded --max-cost-usd 1.0"
+    ) in out.err
+
+
+def test_main_cost_ceiling_exceeded_outranks_revision_skipped_for_cost(monkeypatch, capsys):
+    result = _make_pipeline_result(
+        cost_ceiling_exceeded=True, revision_skipped_for_cost=True, total_cost_usd=9.0
+    )
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q", "--max-cost-usd", "1.0"],
+        result=result,
+    )
+
+    assert code == 3
+
+
+def test_main_success_does_not_exit_with_ceiling_or_revision_codes(monkeypatch, capsys):
+    result = _make_pipeline_result(cost_ceiling_exceeded=False, revision_skipped_for_cost=False)
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    assert code == 0
+
+
+def test_main_dropped_facts_warning_joins_exact_ids(monkeypatch, capsys):
+    result = _make_pipeline_result(dropped_facts=["fact-1", "fact-2"])
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    assert code == 0
+    assert (
+        "WARNING: the final synthesis does not appear to address these "
+        "verified facts: fact-1, fact-2"
+    ) in out.err
+
+
+def test_main_no_dropped_facts_warning_when_list_empty(monkeypatch, capsys):
+    result = _make_pipeline_result(dropped_facts=[])
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    assert "does not appear to address" not in out.err
+
+
+def test_main_completeness_check_parse_failed_exact_warning(monkeypatch, capsys):
+    result = _make_pipeline_result(completeness_check_parse_failed=True)
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    assert code == 0
+    assert (
+        "WARNING: the Stage 4 completeness check ran but its response "
+        "could not be understood - completeness is UNDETERMINED, not "
+        "verified. dropped_facts=[] here does NOT mean nothing is missing."
+    ) in out.err
+
+
+def test_main_completeness_check_skipped_for_cost_exact_warning(monkeypatch, capsys):
+    result = _make_pipeline_result(completeness_check_skipped_for_cost=True)
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q", "--max-cost-usd", "3.0"],
+        result=result,
+    )
+
+    assert code == 0
+    assert (
+        "WARNING: the Stage 4 completeness check was skipped because "
+        "running it would have exceeded --max-cost-usd 3.0"
+    ) in out.err
+
+
+def test_main_timeout_error_exits_4_with_exact_message(monkeypatch, capsys):
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q"],
+        exc=TimeoutError("wall clock exceeded"),
+    )
+
+    assert code == 4
+    assert "Pipeline run failed: wall clock exceeded" in out.err
+
+
+def test_main_generic_exception_exits_1_with_exact_message(monkeypatch, capsys):
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q"],
+        exc=ValueError("boom"),
+    )
+
+    assert code == 1
+    assert "Pipeline run failed: boom" in out.err

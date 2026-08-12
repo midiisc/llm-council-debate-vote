@@ -452,3 +452,199 @@ to `pyproject.toml`. Re-ran `uv sync` → both `uv run llm-council-pipeline
 with no args exits 2 with argparse's own "required: --topic-label,
 --query" message, confirming AC16-20's exit codes sit on top of a
 genuinely installed entrypoint, not just importable Python.
+
+## Amendment (2026-08-12): timeout-aware `council_fn` + wall-clock ceiling
+
+**Problem, confirmed by direct source read of `llm-council-core==0.40.1`
+(no live calls — real-money hold still in effect):** `main()`'s
+`council_fn` wires directly to `llm_council.council.run_full_council(query,
+models=None)`. That function accepts no timeout/tier argument at all.
+Internally, Stage 1 (`stage1_collect_responses` → `query_models_parallel`)
+has no overridable timeout and falls through to a hardcoded 120s default;
+Stage 2 (`stage2_collect_rankings`) and Stage 3
+(`stage3_synthesize_final`) each independently default to 120s and *do*
+accept an explicit `timeout=` kwarg, but `run_full_council` never exposes
+one. Separately, `llm_council.council.run_council_with_fallback` (the
+tier-aware entry point the MCP tool already uses, fixed in the sessions
+above) returns a fundamentally different ADR-012 flat dict with no
+`aggregate_rankings`/`label_to_model`/`parsed_ranking.evaluations`/
+`quality_metrics` fields — adopting it would force rewriting
+`_rubric_scores_for_model`/`build_critique_from_rubric`/`_compute_ranks`/
+`_compute_outliers`, a much bigger change than "add a timeout." Resolved
+via an 8-persona expert panel round (`docs/upstream-deltas.md`, "Second
+Expert Panel round").
+
+**Decision:** a new `scripts/council_adapter.py`, calling the package's
+own granular stage functions directly (not vendoring their logic, not
+going through `run_full_council`), with explicit per-stage timeouts.
+Non-goals, all confirmed unused by this project today: Jury Mode
+(BINARY/TIE_BREAKER `verdict_type`, deadlock detection), dissent
+extraction, webhooks, bias-audit. If any of those are ever turned on
+project-wide, this adapter needs a follow-up amendment — not a silent gap,
+tracked here explicitly.
+
+**Signature:**
+```python
+# scripts/council_adapter.py
+async def run_council_with_timeouts(
+    user_query: str,
+    stage1_timeout: float = 300.0,
+    stage2_timeout: float = 300.0,
+    stage3_timeout: float = 300.0,
+) -> tuple[list, list, dict, dict]:  # same shape as run_full_council's return
+    ...
+```
+Satisfies `pipeline_runner.py`'s existing `CouncilFn` type exactly — no
+change to `run_pipeline`'s own signature or logic. `main()`'s `council_fn`
+wiring changes from `run_full_council(query, models=None)` to
+`run_council_with_timeouts(query)` (defaults only; CLI flags below can
+override).
+
+**Grounded call sequence** (verified via `inspect.signature` against the
+installed package, 2026-08-12 — not guessed):
+1. `query_models_parallel(_get_council_models(), messages, timeout=stage1_timeout)`
+   for Stage 1 (`llm_council.council`) — bypasses `stage1_collect_responses`
+   since it exposes no override.
+2. If `get_config().evaluation.safety.enabled` (now `true`, see
+   `upstream-deltas.md`'s "Second Expert Panel round" feature verdicts):
+   `check_response_safety(response)` per Stage-1 response, attached the
+   same way `run_full_council` does (`result["safety_check"] = ...`).
+3. Degraded-mode branching reproduced from `run_full_council`'s source,
+   scoped to what this project needs: 0 responses → early-return error
+   tuple; 1 or 2 responses → the same `degraded_mode` labeling and
+   single/two-model ranking shortcuts; ≥3 → normal flow. (Real robustness
+   need — a model can fail to respond even with a healthy 4-model
+   config — not speculative.)
+4. `stage1_5_normalize_styles(stage1_results)` (internally respects
+   `council.style_normalization`, already `true`).
+5. `stage2_collect_rankings(user_query, responses_for_review,
+   timeout=stage2_timeout)`.
+6. `calculate_aggregate_rankings(stage2_results, label_to_model)`
+   (`llm_council.council`).
+7. `stage3_synthesize_final(user_query, stage1_results, stage2_results,
+   aggregate_rankings, verdict_type=VerdictType.SYNTHESIS,
+   timeout=stage3_timeout)` — `VerdictType.SYNTHESIS` hardcoded (this
+   project never uses Jury Mode).
+8. Usage assembled via `_build_usage_summary`/`emit_usage_metrics`
+   (`llm_council.council`), matching `run_full_council`'s own shape.
+9. If `should_include_quality_metrics()`: `calculate_quality_metrics(...)`
+   attached to `metadata["quality_metrics"]` — this is where
+   `metadata["quality_metrics"]["core"]["consensus_strength"]` (CSS) comes
+   from; `pipeline_runner.py` reads it unchanged.
+
+**Timeout defaults** (300s/300s/300s = 900s stage budget, chosen against
+the user-set 1200s/20min total wall-clock ceiling below, leaving ~300s
+headroom for Stage 0.5 grounding + Stage 2.75 revision + Stage 4
+completeness, each independently timed): matches the package's own
+`reasoning`-tier per-model budget (300s) already adopted for the MCP-tool
+path, so the two call paths now agree in spirit even though they can't
+share config.
+
+**Wall-clock ceiling (separate but related gap, same amendment):**
+`PipelineConfig` gains `max_wall_clock_seconds: float = 1200.0` (user-set,
+2026-08-12 — an explicit, always-on ceiling, not `None`-by-default like
+`max_cost_usd`, since the entire point is that today nothing bounds
+runtime). `run_pipeline` wraps its Stage-0.5-through-Stage-4 body in
+`asyncio.wait_for(..., timeout=config.max_wall_clock_seconds)`. On
+timeout: `run_status.json` gets `status: "failed"`,
+`error: "exceeded max_wall_clock_seconds (<N>s)"`, `cost_so_far_usd` (best
+effort — whatever was tracked before the timeout fired); a new distinct
+CLI exit code `4` (extends the existing 0/1/2/3 contract, priority above
+3 since a hung run is more severe than a completed-but-over-cost one); new
+`--max-wall-clock-seconds` CLI flag, defaulting to `PipelineConfig`'s own
+default.
+
+**New acceptance criteria:**
+11. Given `run_council_with_timeouts` is called with all 4 configured
+    models healthy, When it completes, Then the returned tuple's shape
+    (keys, nesting) is identical to what `run_full_council` would produce
+    for the same inputs — `pipeline_runner.py`'s existing extraction code
+    (`metadata["quality_metrics"]["core"]["consensus_strength"]`,
+    `aggregate_rankings`, `label_to_model`, `stage2_results[i]
+    ["parsed_ranking"]["evaluations"]`) works unchanged.
+12. Given `stage1_timeout` is set lower than a (simulated slow) model's
+    response time, When `query_models_parallel` is called, Then that
+    model is excluded from `stage1_results` (matches `query_models_parallel`'s
+    own documented behavior: `Optional[Dict]` per model, `None` on
+    timeout/failure) rather than the whole call raising.
+13. Given exactly 0 successful Stage-1 responses, When
+    `run_council_with_timeouts` runs, Then it returns the same
+    all-models-failed error tuple shape `run_full_council` returns
+    (`([], [], {"model": "error", ...}, {"usage": ...})`) — callers don't
+    need to special-case this adapter differently.
+14. Given `evaluation.safety.enabled` is `false` (default before this
+    project's change), When `run_council_with_timeouts` runs, Then
+    `check_response_safety` is never called — config-driven, not
+    hardcoded on.
+15. Given a full `run_pipeline` call exceeds `max_wall_clock_seconds`,
+    When it times out, Then `run_status.json` is written with
+    `status: "failed"` and a message naming the ceiling (not a generic
+    `asyncio.TimeoutError` string), the original spend already committed
+    is still reflected in `cost_so_far_usd`, and the CLI exits `4`.
+16. Given a run completes well within `max_wall_clock_seconds`, When
+    `run_pipeline` finishes normally, Then behavior is byte-identical to
+    before this amendment — the ceiling is a backstop, never a normal-path
+    behavior change.
+
+**Drift-check requirement (unanimous panel finding, must ship with this
+amendment, not deferred):** pin this adapter's assumed call sequence to
+`llm-council-core==0.40.1`'s exact `run_full_council` source (a comment
+citing the function's line range in the installed package, plus this
+spec). Add a check to the Pillar 5 self-update loop: on every
+`llm-council-core` version bump, diff `run_full_council`'s source against
+the pinned assumption and fail loudly (flag in the self-update report, not
+a silent pass) if the stage sequence, branching, or metadata assembly
+changed — this adapter re-implements orchestration glue the package could
+silently restructure in a future release.
+
+**Also required before implementation (uncountered ws-os finding):**
+confirm `query_models_parallel`'s `timeout` parameter produces a genuine
+client-side cancellation of the in-flight HTTP request, not an
+`asyncio.wait_for` that abandons a still-running (and still-billing)
+server-side call. Verify by reading `gateway_adapter.py`'s implementation
+directly before relying on the timeout as a cost control, not just a
+latency control. **Resolved 2026-08-12** (`docs/upstream-deltas.md`):
+confirmed a real `httpx.AsyncClient(timeout=timeout)` cancellation in
+every gateway backend, not an abandoned background task.
+
+### Implementation + mutation testing (2026-08-12, blind-TDV)
+
+`scripts/council_adapter.py` + the `pipeline_runner.py` companion changes
+(`max_wall_clock_seconds`, `asyncio.wait_for` wrap, exit code 4,
+`--max-wall-clock-seconds` CLI flag, `main()`'s `council_fn` rewire)
+implemented via isolated blind test authoring → blind implementation →
+watched RED → GREEN. 8 non-equivalent-survivor-free findings, all
+individually verified equivalent (not asserted):
+- 3 call sites where a `.get("response", <default>)` default is
+  structurally unreachable — every `stage1_results` entry is always
+  constructed with a `"response"` key a few lines earlier in the same
+  function, so no input can ever exercise the default branch.
+- `degraded_mode = None` vs `degraded_mode = ""` at initialization — both
+  are falsy and both `!= "two_models"` at every downstream read site,
+  traced across all branches.
+- `len(stage1_results) > 0` vs `>= 0` — only reached after an earlier
+  `if num_responses == 0: return` already excludes the zero case, so both
+  comparisons are always `True` on the only reachable range.
+- `AuditionStatus(..., session_count=0)`'s explicit kwarg vs omitting it —
+  confirmed via `dataclasses.fields()` that the field's own default is
+  already `0`.
+- `argparse.add_argument(..., default=None)`'s explicit kwarg vs omitting
+  it — argparse's own implicit default is `None`, matching this repo's
+  existing documented precedent for the same pattern (see the CLI
+  amendment above).
+
+Full test suite (`uv run pytest tests/ -q`) confirmed green (328 passed)
+with all three concurrently-developed contracts' tests present in the
+same run (`council_adapter.py`, `revision_round.py`'s document-threading
+amendment, `audition_tracking.py`) — no cross-contract regression despite
+all three touching or depending on `pipeline_runner.py`.
+
+**Process note:** the three contracts ran as separate blind-TDV pipeline
+items but landed in the same working tree (not fully isolated worktrees
+for the mutation-scoping step), which caused `setup.cfg`'s `only_mutate`
+list to be overwritten mid-flight by whichever contract's implementer
+touched it last — `scripts/revision_round.py` was transiently missing
+from that list. Caught and fixed by independently re-running the full
+test suite and re-adding it before treating any contract as final, per
+Pillar 1 ("verify by execution," not by trusting a subagent's self-report
+of its own result).

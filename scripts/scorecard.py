@@ -199,12 +199,33 @@ def main() -> None:
         default=None,
         help="Root directory to walk when --cross-folder is set.",
     )
+    parser.add_argument(
+        "--show-audition",
+        action="store_true",
+        help=(
+            "Also print --target-model's ADR-029 audition state "
+            "(Contract 5, scripts/audition_tracking.py) from "
+            "<scorecard-dir>/audition.jsonl. Informational only - never a "
+            "keep/drop recommendation, same as the rest of this report."
+        ),
+    )
     args = parser.parse_args()
 
     path = args.path or default_scorecard_path(Path.cwd())
     records = load_records(path, cross_folder=args.cross_folder, search_root=args.search_root)
     report = compute_report(records, args.target_model)
     print(render_report(report, args.target_model))
+
+    if args.show_audition:
+        # Deferred import: keeps scorecard.py importable/testable without
+        # llm_council.audition installed, matching this module's existing
+        # network/dependency-light design.
+        from scripts.audition_tracking import get_or_init_status, render_audition_section
+
+        audition_path = path.parent / "audition.jsonl"
+        status = get_or_init_status(args.target_model, audition_path)
+        print()
+        print(render_audition_section([status]))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ Contract: docs/specs/pipeline-runner-contract.md.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -21,10 +22,18 @@ from scripts.grounding_pass import (
     run_grounding_pass,
     tag_claim,
 )
+from scripts.audition_tracking import default_audition_path, record_session_for_all_models
 from scripts.revision_round import ModelAnswer, run_revision_round, should_trigger_revision
 from scripts.scorecard import ScorecardRecord, append_record, default_scorecard_path
 
 RUBRIC_DIMENSIONS = ("accuracy", "relevance", "completeness", "conciseness", "clarity")
+
+# 20min (1200s) default total wall-clock ceiling for a full run (Stage
+# 0.5 -> 4). An explicit, always-on backstop - unlike max_cost_usd there is
+# no None-by-default option, since the entire point is that nothing bounded
+# runtime before this amendment. See docs/specs/pipeline-runner-contract.md,
+# "Amendment (2026-08-12): timeout-aware council_fn + wall-clock ceiling".
+DEFAULT_MAX_WALL_CLOCK_SECONDS = 1200.0
 
 FetchEvidenceFn = Callable[[list[Claim]], Awaitable[dict[str, list[Evidence]]]]
 CouncilFn = Callable[[str], Awaitable[tuple[list, list, dict, dict]]]
@@ -38,6 +47,8 @@ class PipelineConfig:
     raw_claims_text: str = ""
     max_cost_usd: Optional[float] = None
     output_root: Optional[Path] = None
+    # Always-on backstop (never None) - see DEFAULT_MAX_WALL_CLOCK_SECONDS.
+    max_wall_clock_seconds: float = DEFAULT_MAX_WALL_CLOCK_SECONDS
     # Duplicates live_adapters.COMPLETENESS_CHECK_MODEL's value as a plain
     # string literal (dataclass defaults must be literals) - kept separate
     # so this module never imports live_adapters, the same testability
@@ -182,6 +193,12 @@ async def run_pipeline(
     fetch_evidence: FetchEvidenceFn,
     council_fn: CouncilFn,
     query_model: QueryModelFn,
+    # Contract 5 (audition_tracking.py) - the full configured council model
+    # list, so a model that fails to respond still gets a failure recorded
+    # rather than silently vanishing from tracking. None (default) skips
+    # audition tracking entirely - this stays an additive, optional feature
+    # for every existing PipelineConfig/run_pipeline call site.
+    council_models: Optional[list[str]] = None,
 ) -> PipelineResult:
     from datetime import datetime, timezone
 
@@ -192,7 +209,9 @@ async def run_pipeline(
 
     cost_so_far = 0.0
     debug_log: list[str] = []
-    try:
+
+    async def _run_stages():
+        nonlocal cost_so_far
         verified_facts: list[TaggedClaim] = []
         if config.raw_claims_text.strip():
             claims = parse_claims(config.raw_claims_text)
@@ -251,7 +270,9 @@ async def run_pipeline(
                     )
                     for s1 in stage1_results
                 ]
-                outcomes = await run_revision_round(css, answers, verified_facts, query_model)
+                outcomes = await run_revision_round(
+                    css, answers, verified_facts, query_model, source_document=config.query
+                )
                 revision_cost = sum(o.cost_usd for o in outcomes)
                 cost_so_far += revision_cost
                 revision_triggered = True
@@ -308,10 +329,60 @@ async def run_pipeline(
         )
         append_record(record, scorecard_path)
 
+        if council_models is not None:
+            # Best-effort, per Contract 5: audition tracking must never
+            # fail a pipeline run that otherwise succeeded. Informational
+            # only - see audition_tracking.py's module docstring for why
+            # this never touches which models actually get queried.
+            try:
+                audition_path = (
+                    (config.output_root / "audition.jsonl")
+                    if config.output_root is not None
+                    else default_audition_path(Path.cwd())
+                )
+                record_session_for_all_models(
+                    council_models, stage1_results, aggregate_rankings, audition_path
+                )
+                debug_log.append("Audition tracking: recorded")
+            except Exception as e:
+                debug_log.append(f"Audition tracking: failed non-fatally ({e})")
+
         total_cost_usd = stage1to3_cost + revision_cost + completeness_check_cost
         cost_ceiling_exceeded = (
             config.max_cost_usd is not None and total_cost_usd > config.max_cost_usd
         )
+
+        return (
+            css,
+            revision_triggered,
+            revision_skipped_for_cost,
+            total_cost_usd,
+            synthesis,
+            cost_ceiling_exceeded,
+            dropped_facts,
+            completeness_check_skipped_for_cost,
+            completeness_check_parse_failed,
+        )
+
+    try:
+        (
+            css,
+            revision_triggered,
+            revision_skipped_for_cost,
+            total_cost_usd,
+            synthesis,
+            cost_ceiling_exceeded,
+            dropped_facts,
+            completeness_check_skipped_for_cost,
+            completeness_check_parse_failed,
+        ) = await asyncio.wait_for(_run_stages(), timeout=config.max_wall_clock_seconds)
+    except asyncio.TimeoutError:
+        # asyncio.TimeoutError is TimeoutError itself on Python 3.11+ (the
+        # two names are aliased) - main() catches plain TimeoutError to map
+        # this to its own exit code (4), distinct from the generic exit(1).
+        error_msg = f"exceeded max_wall_clock_seconds ({config.max_wall_clock_seconds}s)"
+        _write_run_status(output_dir, "failed", error=error_msg, cost_so_far_usd=cost_so_far)
+        raise TimeoutError(error_msg) from None
     except Exception as e:
         _write_run_status(output_dir, "failed", error=str(e), cost_so_far_usd=cost_so_far)
         raise
@@ -357,21 +428,26 @@ def _build_arg_parser():
     parser.add_argument("--claims-file", type=Path, default=None)
     parser.add_argument("--max-cost-usd", type=float, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument(
+        "--max-wall-clock-seconds", type=float, default=DEFAULT_MAX_WALL_CLOCK_SECONDS
+    )
     return parser
 
 
 def main() -> None:
-    import asyncio
     import sys
 
-    from llm_council.council import run_full_council
-
+    from scripts.council_adapter import run_council_with_timeouts
     from scripts.live_adapters import real_fetch_evidence, real_query_model
+
+    from llm_council.unified_config import get_config
 
     args = _build_arg_parser().parse_args()
 
     async def council_fn(query: str):
-        return await run_full_council(query, models=None)
+        return await run_council_with_timeouts(query)
+
+    council_models = get_config().council.models
 
     config = PipelineConfig(
         topic_label=args.topic_label,
@@ -379,12 +455,28 @@ def main() -> None:
         raw_claims_text=args.claims_file.read_text() if args.claims_file else "",
         max_cost_usd=args.max_cost_usd,
         output_root=args.output_root,
+        max_wall_clock_seconds=args.max_wall_clock_seconds,
     )
 
     try:
         result = asyncio.run(
-            run_pipeline(config, real_fetch_evidence, council_fn, real_query_model)
+            run_pipeline(
+                config,
+                real_fetch_evidence,
+                council_fn,
+                real_query_model,
+                council_models=council_models,
+            )
         )
+    except TimeoutError as e:
+        # run_pipeline raises a plain TimeoutError (asyncio.TimeoutError is
+        # the same class on Python 3.11+) when config.max_wall_clock_seconds
+        # is exceeded - mapped to its own exit code (4), distinct from the
+        # generic exit(1) below, per docs/specs/pipeline-runner-contract.md,
+        # "Amendment (2026-08-12): timeout-aware council_fn + wall-clock
+        # ceiling".
+        print(f"Pipeline run failed: {e}", file=sys.stderr)
+        sys.exit(4)
     except Exception as e:
         print(f"Pipeline run failed: {e}", file=sys.stderr)
         sys.exit(1)

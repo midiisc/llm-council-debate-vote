@@ -28,7 +28,10 @@ council:
       - anthropic/claude-opus-4.8
       - openai/gpt-5.5
       - google/gemini-3.6-flash
-      - z-ai/glm-5.2-20260616
+      - z-ai/glm-5.2  # 2026-08-12: was z-ai/glm-5.2-20260616 - that dated slug
+                        # is DEAD on live OpenRouter (confirmed via direct
+                        # /api/v1/models fetch, only z-ai/glm-5.2 and
+                        # z-ai/glm-5.2:batch exist now). See upstream-deltas.md.
     chairman: anthropic/claude-opus-4.8
     chairman_disabled: false
     synthesis_mode: debate
@@ -43,14 +46,21 @@ council:
                             # of silently falling through to requesty/direct,
                             # which would error anyway with no stored keys.
   tiers:
-    default: high
+    # 2026-08-12: was "high" (deadline_ms=180000, per_model=90000, token_budget=4096,
+    # max_attempts=3). Confirmed by direct execution of load_config()+get_tier_contract()
+    # against llm-council-core==0.40.1 that "high" and "reasoning" resolve the SAME 4
+    # models (allowed_models identical) - "reasoning" just has a bigger budget:
+    # deadline_ms=600000, per_model=300000, token_budget=8192 (2x), max_attempts=2 (-1).
+    # Switched to give the same frontier models more time/tokens to actually finish a
+    # deep debate instead of racing a 180s/4096-token ceiling. See docs/upstream-deltas.md.
+    default: reasoning
     pools:
       high:
         models:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
           - google/gemini-3.6-flash
-          - z-ai/glm-5.2-20260616
+          - z-ai/glm-5.2
       quick:
         models:
           - anthropic/claude-opus-4.8
@@ -65,10 +75,19 @@ council:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
           - google/gemini-3.6-flash
-          - z-ai/glm-5.2-20260616
+          - z-ai/glm-5.2
   evaluation:
     rubric:
       enabled: true  # 5-dimension scoring (accuracy/relevance/completeness/
                       # conciseness/clarity) - was off by default, never set
                       # before the 2026-08-09 dry run; accuracy_ceiling_enabled
                       # already defaults to true, no change needed there.
+    safety:
+      enabled: true  # 2026-08-12: was off by default. check_response_safety
+                      # (safety_gate.py) confirmed by direct source read to be
+                      # a pure local regex scan (SAFETY_PATTERNS) - no external
+                      # classifier call, no new egress, zero marginal cost.
+                      # This pipeline ingests untrusted third-party documents;
+                      # a free local scan on Stage-1 responses is reasonable
+                      # defense-in-depth. See upstream-deltas.md, Second Expert
+                      # Panel round.

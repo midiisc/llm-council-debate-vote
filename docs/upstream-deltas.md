@@ -243,6 +243,375 @@ No paper found that meaningfully contradicts Choi/Zhu/Li or the
 Deliberative Illusion paper's conclusions. Verdict: nothing from this
 scan clears the bar for implementation.
 
+## Timeout architecture fix (2026-08-12)
+
+**Root cause of live "high"/"balanced" tier failures ("exceeded the 60s client
+transport timeout"), confirmed by direct execution against
+`llm-council-core==0.40.1` (`load_config()` + `UnifiedConfig.get_tier_contract()`
+run from this project directory, `unified_config.py`/`tier_contract.py` read
+directly):**
+
+| tier | `deadline_ms` (total) | `per_model_timeout_ms` | `token_budget` | `max_attempts` |
+|---|---|---|---|---|
+| quick | 30000 | 20000 | 2048 | 1 |
+| balanced | 90000 | 45000 | 4096 | 2 |
+| high | 180000 | 90000 | 4096 | 3 |
+| reasoning | 600000 | 300000 | 8192 | 2 |
+
+The client-side MCP transport cap (`MCP_TOOL_TIMEOUT`, a Claude Code env var —
+**not** an `llm-council-core` setting) was `60000`ms globally, set in
+`~/.bashrc`. `balanced`'s own server-side budget (90s) already exceeded that
+60s client cap, and `high`'s (180s) exceeded it 3x — so both died at the
+transport layer before the package's own timeout/retry logic ever ran.
+`quick` (30s budget) was the only tier that fit, which is why the fallback
+to it succeeded.
+
+`get_tier_contract('high').allowed_models` and
+`get_tier_contract('reasoning').allowed_models` were confirmed **identical**
+(same 4 configured frontier models) — `reasoning` is a strictly larger
+budget for the same model set, not a different/weaker pool.
+
+**Fixed:**
+- `llm_council.yaml`: `tiers.default` changed `high` → `reasoning` (same 4
+  models, 3.3x timeout budget, 2x token budget; trade-off: `max_attempts`
+  drops 3→2).
+- `~/.bashrc` (global, all projects): `MCP_TOOL_TIMEOUT` raised `60000` →
+  `900000` (15min) to clear `reasoning`'s 600000ms deadline with margin for
+  gateway fallback/retry overhead. This is a machine-wide setting, not
+  project-scoped — noted here because it's load-bearing for this project's
+  ability to complete a real council call.
+
+Source: direct execution, 2026-08-12 (session date; installed version
+0.40.1 matches the version this ledger's other entries are grounded
+against — no re-verification against a newer release was needed).
+
+## Model Intelligence / reasoning-effort layer (2026-08-12) — confirmed by direct execution
+
+**Correction to the Bug #1 entry above.** That entry's claim that `gateways:`
+and `tiers:` "get hoisted correctly as-is" because they're real top-level
+`UnifiedConfig` fields is imprecise and would mislead anyone adding a new
+top-level block. Reading `load_config()` verbatim: it does exactly
+`UnifiedConfig(**raw_config.get("council", {}))` — **it reads nothing from
+the YAML file except the single top-level `council:` key; every other
+true-top-level key is silently discarded, full stop.** `gateways:`/`tiers:`
+only work today because they're placed *one level inside* that single outer
+`council:` wrapper (sibling to the doubly-nested inner `council:`), not
+because they're exempt from the wrapper. **Any new top-level `UnifiedConfig`
+field (`timeouts:`, `model_intelligence:`, `evaluation:`, etc.) must go in
+that same place** — sibling to `gateways:`/`tiers:` inside the one outer
+`council:` key, never at the file's true top level. Confirmed by direct
+execution: a `model_intelligence:` block placed at the true top level was
+silently ignored (`cfg.model_intelligence.enabled` read back `False` despite
+`True` in the YAML); moving it one level in made it read back `True`.
+
+**New confirmed bug (#3):** the package has a real, cross-vendor "reasoning
+effort by tier + by stage" mechanism (ADR-026 Phase 2,
+`ReasoningOptimizationConfig`) — `effort_by_tier` defaults
+`quick=minimal, balanced=low, high=medium, reasoning=high`, and
+`stages` defaults `stage1=True (draft generation), stage2=False (peer
+review/ranking), stage3=True (chairman synthesis)`. It auto-injects a
+reasoning/effort parameter for whichever configured model supports one
+(package comment: "o1, o3, deepseek-r1, etc." — degrades gracefully for
+models that don't). **But `TierContract.reasoning_config` is gated by
+`_is_model_intelligence_enabled()`, which reads ONLY the
+`LLM_COUNCIL_MODEL_INTELLIGENCE` environment variable — it does NOT check
+`cfg.model_intelligence.enabled` at all.** Setting `model_intelligence:
+enabled: true` in `llm_council.yaml` (even nested correctly per the
+correction above) has **zero effect** on whether reasoning effort actually
+gets injected; only the env var does. Confirmed by 3 direct-execution tests:
+YAML-only (wrong nesting) → `False`/`None`; YAML-only (correct nesting) →
+`model_intelligence.enabled` reads `True` but `reasoning_config` is still
+`None`; env var set → `reasoning_config` populates
+(`ReasoningConfig(effort=HIGH, budget_tokens=25600, enabled=True)` for the
+`reasoning` tier).
+
+**Blast-radius warning, not yet acted on:** `LLM_COUNCIL_MODEL_INTELLIGENCE`
+is the SAME master flag for the whole "Model Intelligence Layer," not just
+reasoning effort. With it on, `_get_allowed_models()` calls
+`select_tier_models()` (dynamic, package-driven model selection) instead of
+reading our static `tiers.pools.<tier>.models` — this directly conflicts
+with this project's deliberate "4-model ceiling, 3 permanent core + 1 gated
+experimental" design (`pipeline-architecture-spec.md` §2) and could
+silently reintroduce undesired models (the same class of risk as the
+original `deepseek-v4-pro` incident this ledger already documents). It also
+enables ADR-030 scoring/circuit-breaker and ADR-029 audition machinery.
+**Not enabled — flagging for a decision, not silently picking one.** If
+reasoning-effort injection is wanted without the dynamic-selection risk,
+the only currently-available lever is the blunt global env var; there is no
+narrower "reasoning-effort-only" flag in this version. Source: direct
+execution + read of `unified_config.py`/`tier_contract.py`, 2026-08-12.
+
+## GLM-5.2 slug drift (2026-08-12) — confirmed dead, fixed
+
+`z-ai/glm-5.2-20260616` (the dated slug pinned in `llm_council.yaml` since
+2026-08-09) is **not live on OpenRouter** — confirmed by a direct fetch of
+`https://openrouter.ai/api/v1/models` today: only `z-ai/glm-5.2` (undated)
+and `z-ai/glm-5.2:batch` exist. Fixed: `llm_council.yaml` now pins
+`z-ai/glm-5.2`. Context window re-confirmed at the same time: 1,048,576
+tokens (unchanged from the 2026-08-09 figure).
+
+**Live-confirmed context windows, all 4 configured models** (direct
+`/api/v1/models` fetch, 2026-08-12 — not from search snippets):
+
+| Model | `context_length` | `max_completion_tokens` |
+|---|---|---|
+| `anthropic/claude-opus-4.8` | 1,000,000 | 128,000 |
+| `openai/gpt-5.5` | 1,050,000 | 128,000 |
+| `google/gemini-3.6-flash` | 1,048,576 | 65,536 |
+| `z-ai/glm-5.2` | 1,048,576 | (not captured this pass) |
+
+All 4 are ~1M-token class — a large input document isn't a context-window
+constraint for any of them individually. The real constraints are (1) each
+stage's own request timeout (see below) and (2) OpenRouter/gateway per-request
+byte limits, which were not checked this session.
+
+## Two separate call paths — the timeout/tier fix only covers one of them (2026-08-12)
+
+**Confirmed by direct source read, corrects an implicit assumption in the
+"Timeout architecture fix" entry above.** There are two independent ways
+this repo's models actually get queried, and they do NOT share config:
+
+1. **MCP tool `mcp__llm-council__consult_council`** (interactive/chat use —
+   this is what hit the reported 60s client-transport timeout).
+   `mcp_server.py:consult_council` → `create_tier_contract()` →
+   `run_council_with_fallback()`. This path DOES read
+   `tiers.default`/`tiers.pools`/`timeouts` from `llm_council.yaml` — the
+   package's own docstring even names the exact failure mode: *"timeouts
+   (Claude Code default ~60s). Set MCP_TIMEOUT (milliseconds)"*. **The
+   `tiers.default: reasoning` + `MCP_TOOL_TIMEOUT=900000` fix above is
+   correct and sufficient for this path.**
+
+2. **`scripts/pipeline_runner.py`'s CLI** (this project's own Stage
+   0.5→1-3.5→2.75→4 orchestrator — `main()` calls
+   `run_full_council(query, models=None)` directly). `run_full_council` has
+   no `tier`/`tier_contract` parameter at all — confirmed by reading its
+   full signature. `stage1_collect_responses` calls
+   `query_models_parallel(_get_council_models(), messages)` with no
+   explicit timeout, so it falls through to `gateway_adapter.py`'s
+   hardcoded default (`timeout: float = 120.0` seconds per model, all 4
+   queried in parallel). Stage 2 (`stage2_collect_rankings`) and Stage 3
+   (chairman synthesis) each have their own independent `timeout: float =
+   120.0` default too. **None of this reads `llm_council.yaml`'s
+   `tiers:`/`timeouts:` block at all — `tiers.default: reasoning` has ZERO
+   effect on `pipeline_runner.py` runs.** Worst-case sequential ceiling
+   across Stage1→2→3 is roughly 360s, but each individual stage still caps
+   at 120s regardless of document size or model reasoning depth, and there
+   is currently no config lever in `llm_council.yaml` to raise it for this
+   path. **Not yet fixed — needs its own decision**: either thread an
+   explicit `timeout=` through `pipeline_runner.py`'s calls (would require
+   a small wrapper since `run_full_council` doesn't expose one uniformly
+   across its 3 stage calls), or switch `pipeline_runner.py` to route
+   through `create_tier_contract`/`run_council_with_fallback` like the MCP
+   tool does, gaining tier-based timeouts at the cost of adopting the
+   verdict-type/webhook machinery that comes with that entry point.
+
+**Practical consequence for "large documents":** if the actual working mode
+is the MCP tool (ad hoc interactive debate), the timeout fix already
+applied is sufficient. If the actual working mode is
+`pipeline_runner.py` (the grounded, folder-scoped, scorecard-logging full
+pipeline — the one this repo's Pillar 5/scorecard design assumes is the
+real usage pattern), a large document pushing any single stage past ~120s
+will fail with **no yaml-level fix available today**.
+
+## Stage 2.75 revision round does not re-show the original document (2026-08-12)
+
+Confirmed by reading `revision_round.py::build_revision_prompt` directly:
+the revision prompt includes the model's own Stage-1 **answer**, its own
+Stage-2 critique, and the verified-facts block — it does **not** include
+the original `user_query` (the source document/question) at all. Stage 1,
+Stage 2, and Stage 3 (native `council_stages.py`, confirmed by grepping
+every `user_query` reference) all correctly re-include the full original
+query verbatim at every native stage — this gap is specific to this
+project's own Stage 2.75 addition, not the package. For a short query this
+is harmless (the model can recall it), but for a large source document a
+model revising in Stage 2.75 is working from its own prior summary of the
+document, not the document itself, and cannot re-check a specific passage
+it may have gotten wrong. **Not yet fixed — flagging for a decision**:
+threading the original document into `build_revision_prompt` would grow
+the revision prompt by the full document size for every model on every
+CSS-gated revision, which is a real cost/context tradeoff, not a free fix.
+
+## Expert Panel convergence (2026-08-12) — model strength/effort per stage, model-intelligence, round count
+
+Ran via the `expert-panel` workflow (8 personas: ws-os, ws-builder,
+ws-agentic, ws-warden, ws-redteam, ws-privacy, ws-scientist, ws-backend),
+briefed with all grounded facts above. Converged, no red/blue split:
+
+- **Reasoning-effort-by-stage shape**: keep the package's own defaults
+  (stage1 draft-generation = high effort, stage2 peer-ranking = off,
+  stage3 chairman-synthesis = high effort) as the correct general MAD
+  allocation — generation and synthesis need depth, comparative
+  peer-ranking is a lighter judgment task. This holds independent of which
+  vendor/model occupies each seat. **Caveat surfaced by ws-warden and
+  confirmed above: this entire effort_by_tier mechanism is only consumed
+  on the MCP-tool call path, not `pipeline_runner.py`'s — so it's
+  currently inert for the actual pipeline runs unless that path is also
+  switched to go through `create_tier_contract`.**
+- **`LLM_COUNCIL_MODEL_INTELLIGENCE`: stays OFF.** Unanimous, including a
+  hard block from ws-redteam citing this repo's own 3-for-3 track record
+  of this exact package reporting `ready:true` while silently doing the
+  wrong thing. The flag couples wanted reasoning-effort injection to
+  unwanted dynamic model selection (breaks the hard-pinned 4-model
+  invariant) with no narrower flag available in v0.40.1, and
+  `mcp_server.py:consult_council` has no `models=` override to re-pin
+  against if it were ever flipped on for a shared session.
+- **Round count: keep CSS-gated Stage 2.75, do not add an unconditional
+  round 2.** This repo's own cited literature (arXiv:2604.01029, 
+  arXiv:2606.03032) plus a fresh 2026 paper found this session
+  (ARMOR-MAD, arXiv:2606.13197 — conditional/agreement-based debate
+  control beats fixed-round debate across MATH/GSM8K/MMLU) all converge on
+  conditional over unconditional. Suggested (not yet specced) next step:
+  extend Stage 2.75 with ARMOR-MAD-style Pre-debate Agreement Routing —
+  skip Stage 2/3 entirely when Round-0 responses already agree — as one
+  small additive function, not a rewrite.
+- **Flagged, higher-leverage than round count per ws-agentic/ws-scientist/
+  ws-redteam**: fixing upstream issue #592 (un-randomized response/rubric
+  ordering — up to 22% outcome swing per arXiv:2511.11040, "Key
+  Decision-Makers in Multi-Agent Debates") is a correctness prerequisite
+  for trusting whether CSS-gating or agreement-routing measurements mean
+  anything at all. Sequencing against other work is an open call.
+
+Full panel transcript retained in this session's workflow journal if the
+individual persona views are needed later.
+
+## Second Expert Panel round (2026-08-12) — timeout-fix architecture, document-threading design, feature audit
+
+Ran via `expert-panel` workflow (7-9 personas), briefed with the call-path
+and feature-surface facts from the sessions above. Converged:
+
+- **(a) Timeout-fix architecture**: thin custom stage-orchestration wrapper
+  in `pipeline_runner.py` (calls the package's own `stage1_5_normalize_styles`
+  / `stage2_collect_rankings(timeout=...)` / `calculate_aggregate_rankings`
+  / `stage3_synthesize_final(timeout=...)` directly, plus a raw
+  `query_models_parallel(..., timeout=X)` for Stage 1) — NOT
+  `run_council_with_fallback` (different ADR-012 return shape, would force
+  rewriting 4 dependent functions). Unanimous requirement: pin the wrapper
+  to `llm-council-core==0.40.1`'s exact `run_full_council` source and add an
+  automated drift check to the Pillar-5 self-update loop so a future
+  package upgrade fails loudly instead of silently diverging. Also
+  required: confirm `query_models_parallel`'s timeout is a real HTTP
+  cancellation, not `asyncio.wait_for` abandoning a still-billing
+  server-side call; add an explicit total wall-clock ceiling for a full run
+  (currently unbounded even though `max_cost_usd` bounds spend).
+- **(b) Stage 2.75 document-threading**: threshold-gated (option ii), a new
+  `revision.max_document_tokens` config key, token-based (not char-based).
+  Below threshold: thread the full document into `build_revision_prompt`,
+  kept textually/structurally distinct from `facts_block` (unanimous,
+  uncountered red-team finding: otherwise a crafted document could forge
+  text matching the `[[cite:<id>]]` guardrail). Above threshold: a visible
+  structured omission marker, surfaced in the Cost & Tokens summary output
+  too, not just a debug line — matches the existing
+  `completeness_check_parse_failed` no-silent-degradation precedent.
+  Rejected: always-verbatim resend (data-minimization failure, re-exposes
+  the most sensitive artifact in the pipeline N-models × M-revisions times
+  with no visibility) and passage-level smart-selection (unproven
+  complexity, not justified at this project's 2-4 decisions/month scale).
+- **(c) Feature verdicts**: bias-audit → build (follow-up spec; pure read
+  of already-computed Stage 2 data, no new egress, answers open upstream
+  issue #592). triage → leave off, no follow-up (dynamic domain-specialist
+  injection contradicts the pinned-4-model design). cache → leave off, no
+  follow-up (2-4 runs/month has no working set to amortize; real risks:
+  stale verdicts on re-run with changed docs, unmanaged on-disk copy of
+  sensitive content). safety-gate and ADR-029 model-audition → resolved by
+  direct grounding reads below.
+- **(d) Scorecard vs ADR-029**: see below — resolved, not left open.
+
+**Grounding reads closing 2 of the panel's 4 open questions (2026-08-12,
+source read, no live calls):**
+
+1. **`check_response_safety` (`safety_gate.py:100`) is a pure local regex
+   scan against a `SAFETY_PATTERNS` dict** (dangerous-instructions/malware/
+   self-harm/PII patterns, with an allow-list of exclude-contexts like "to
+   prevent"/"to defend against") — no external classifier call, no new
+   egress, no added cost/latency. This resolves the panel's split: the
+   guardrail concern was conditional on it being an undisclosed external
+   call. It isn't. **Decision: enable it** (`evaluation.safety.enabled:
+   true`) — this pipeline ingests untrusted third-party documents, and a
+   free local scan on Stage-1 responses is reasonable defense-in-depth at
+   zero marginal cost.
+2. **ADR-029's model-audition tracking core (`llm_council/audition/`:
+   `types.py`, `tracker.py`, `store.py` — `AuditionTracker`,
+   `record_session_result`, `AuditionState`, `AuditionCriteria`,
+   `evaluate_state_transition`) is NOT gated behind
+   `LLM_COUNCIL_MODEL_INTELLIGENCE`** — confirmed by grep, no reference to
+   that flag anywhere in those 3 files. It has its own independent env var
+   (`LLM_COUNCIL_AUDITION_ENABLED`, default `true`) and already implements
+   exactly the state machine `pipeline-architecture-spec.md` §3 was about
+   to build from scratch: `SHADOW → PROBATION → EVALUATION → FULL` with
+   volume-based graduation (session counts + min days) and progressive
+   selection-weight scaling. Only `selection.py`
+   (`select_with_audition`/`is_auditioning_model`, which plug into dynamic
+   model *selection*) is coupled to the model-intelligence-gated path we
+   decided to keep off. **Decision: adopt the tracking core
+   (`AuditionTracker`/`record_session_result`/`AuditionCriteria`) for the
+   GLM-5.2 scorecard need instead of building custom from scratch; do not
+   touch `selection.py`/`voting.py`** — this replaces
+   `pipeline-architecture-spec.md` §3's planned custom scorecard wrapper,
+   not just informs its thresholds. Needs its own Pillar-2 spec update
+   before implementation (unchanged process, different starting point).
+
+**User-decided (2026-08-12), asked directly rather than guessed:**
+`revision.max_document_tokens = 32000` (covers most full reports/specs
+verbatim at this project's 2-4 decisions/month cadence, still a small
+fraction of any council model's ~1M context). Total wall-clock ceiling for
+a full `pipeline_runner.py` run: **20 minutes (1200s)**.
+
+**Logged per ws-redteam (uncountered, negligible cost to record now):**
+ADR-025a (EventBridge webhooks) is an unremarked "off" feature but a real
+egress fence — if ever enabled, needs a destination-allowlist review
+first, same class of concern as any new outbound integration.
+
+**Applied (2026-08-12):** `evaluation.safety.enabled: true` in
+`llm_council.yaml` — trivial config flip, confirmed via `load_config()`
+execution. `council_adapter.py` (in progress, see blind-TDV below) must
+honor this flag conditionally, matching `run_full_council`'s own
+`if eval_config.safety.enabled:` gating (AC14 in the timeout-fix
+amendment) — not hardcode the check on.
+
+**Pre-implementation grounding, closing the panel's last blocking item
+(2026-08-12, source read):** `query_models_parallel`'s `timeout` is a real
+client-side HTTP cancellation, not an abandoned background task —
+confirmed via `gateway/{direct,openrouter,requesty}.py`, each uses
+`httpx.AsyncClient(timeout=timeout)` (raises `httpx.TimeoutException`, tears
+down the connection). Residual caveat outside this package's control: a
+client-side cancel doesn't guarantee the upstream provider stops
+generating/billing for tokens already in flight — a property of provider
+billing, not something `llm-council-core` or this repo can fix locally.
+
+## Three contracts implemented and closed out (2026-08-12)
+
+`council_adapter.py` (pipeline timeout fix + wall-clock ceiling),
+`revision_round.py` (Stage 2.75 document-threading), and
+`audition_tracking.py` (ADR-029 adoption, including the pipeline/CLI
+wiring — see `custom-scripts-contracts.md` Contract 5) all implemented
+via blind-TDV, all mutation-gate clean (0 non-equivalent survivors after
+individual verification of every claimed-equivalent mutant), full test
+suite green (331 passed). Also fixed on sight: `pyproject.toml` had no
+`[tool.pyright]` section, so the IDE's type checker was resolving imports
+against the system Python instead of this project's `.venv` — added
+`venvPath`/`venv`, closing what would otherwise be permanent phantom
+"import could not be resolved" noise on every file in this repo.
+
+**Process learning, worth remembering:** running 3 blind-TDV contracts
+concurrently, where more than one touches the same file
+(`pipeline_runner.py`), doesn't guarantee full worktree isolation through
+to the mutation-scoping step — `setup.cfg`'s `only_mutate` list got
+silently overwritten mid-flight by whichever implementer touched it last,
+transiently dropping `revision_round.py`. Caught only because the final
+verification step ran the real test suite directly and cross-checked
+`git status`/file contents against what each workflow's self-reported
+result claimed, rather than trusting the reported summary alone (Pillar
+1's "verify by execution" applied to subagent output, not just package
+claims). One initial documentation error also happened this way — a first
+draft of Contract 5's integration note claimed the pipeline/CLI wiring
+was done when it wasn't, caught immediately by a direct `grep` before it
+could mislead a future session. Lesson for next time: when several
+blind-TDV chains share a file, verify the ACTUAL merged repo state
+(`git status`, full test suite, targeted greps) before writing any
+"done" claim into a spec — a subagent's own reported summary is a claim,
+not a fact, exactly as true for this session's own tool-orchestrated work
+as it is for `llm-council-core` itself.
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.

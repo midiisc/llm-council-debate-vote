@@ -184,6 +184,14 @@ pip install "llm-council-core[mcp,secure]"
 Use `[mcp,secure]` specifically — without `secure` the OS keychain support is
 silently unavailable and a stored key gets silently ignored.
 
+**Also run once per machine:** `bash scripts/setup_mcp_timeout.sh`, then open
+a new shell. Raises the Claude Code MCP client-transport timeout above
+`llm-council-core`'s own per-tier deadline (up to 600s at the `reasoning`
+tier) — without this, real council calls die at the client's 60s default
+before the package's own timeout logic ever runs. See
+`docs/upstream-deltas.md`, "Timeout architecture fix" for the full
+grounding.
+
 ### 2. Set up OpenRouter as the initial gateway
 Walk me through creating an OpenRouter account and API key if I don't have one, then:
 ```bash
