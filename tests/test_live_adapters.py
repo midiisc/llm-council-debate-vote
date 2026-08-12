@@ -141,6 +141,17 @@ def test_parse_evidence_response_unknown_verdict_yields_empty_list():
     assert result == []
 
 
+@pytest.mark.parametrize("raw", ["0", "[]", "null", "true", '"just a string"'])
+def test_parse_evidence_response_valid_json_non_dict_yields_empty_list_not_crash(raw):
+    # Regression: json.loads succeeds on any valid JSON scalar/array, not
+    # just objects - data.get("verdict") crashed with AttributeError when
+    # data was an int/list/None/bool/str instead of a dict. Found by a
+    # hypothesis stress-fuzz test feeding arbitrary text through this
+    # function (tests/test_stress_adversarial.py).
+    result = parse_evidence_response(raw, retrieval_date="2026-08-01")
+    assert result == []
+
+
 # --- _is_retryable_error: pure classifier, retryable vs not ---
 
 

@@ -641,6 +641,235 @@ def test_completeness_check_called_once_when_grounding_ran(tmp_path):
     assert "Final synthesis text" in completeness_calls[0][1]
     assert "UNIQUE_COMPLETENESS_CLAIM_TEXT" in completeness_calls[0][1]
     assert result.dropped_facts == ["1"]
+    assert result.completeness_check_parse_failed is False
+
+
+def test_completeness_check_parse_failure_is_surfaced_not_hidden(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))  # no revision
+    # A malformed (non-JSON) response for the completeness check.
+    query_model = FakeQueryModel(
+        response_by_model={"google/gemini-3.6-flash": "not json at all"}
+    )
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    # dropped_facts==[] alone would look identical to "verified clean" -
+    # the parse_failed flag is what tells the two apart.
+    assert result.dropped_facts == []
+    assert result.completeness_check_parse_failed is True
+
+
+def test_completeness_check_parse_failed_stays_false_when_check_never_runs(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.completeness_check_parse_failed is False
+
+
+# --- debug_log: per-stage transparency ---
+
+
+def test_debug_log_records_grounding_skipped_and_stage_summaries(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert "Stage 0.5: skipped (no raw_claims_text)" in result.debug_log
+    assert "Stage 1-3.5: council returned 2 model response(s)" in result.debug_log
+    assert "Stage 2.5: CSS=0.900" in result.debug_log
+    assert "Stage 2.75: skipped (CSS 0.900 >= threshold)" in result.debug_log
+    assert "Stage 4: skipped (no verified facts)" in result.debug_log
+
+
+def test_debug_log_records_grounding_and_revision_when_they_run(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.2))  # triggers revision
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "[]"})
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert (
+        "Stage 0.5: grounding ran, 1 claim(s) (1 verified, 0 contradicted, 0 unverifiable)"
+        in result.debug_log
+    )
+    assert "Stage 2.75: revision triggered, 2 model(s) responded, 0 accepted" in result.debug_log
+    assert "Stage 4: ran, parse succeeded, 0 fact(s) dropped" in result.debug_log
+
+
+def test_debug_log_grounding_counts_each_tag_correctly(tmp_path):
+    # Distinguishes each of n_verified/n_contradicted/n_unverifiable's own
+    # count from the others - a single-VERIFIED-only fixture can't tell
+    # "counts CONTRADICTED correctly" from "always reports 0 contradicted".
+    evidence = {
+        "1": [Evidence(source="http://a.com", date="2026-01-01", supports=True)],   # VERIFIED
+        "2": [Evidence(source="http://b.com", date="2026-01-01", supports=False)],  # CONTRADICTED
+        # claim 3: no evidence entry -> UNVERIFIABLE
+    }
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "[]"})
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. Claim one.\n2. Claim two.\n3. Claim three.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert (
+        "Stage 0.5: grounding ran, 3 claim(s) (1 verified, 1 contradicted, 1 unverifiable)"
+        in result.debug_log
+    )
+
+
+def test_debug_log_flags_single_model_as_not_mad(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+
+    async def single_model_council_fn(query):
+        stage1_results = [{"model": "model-x", "response": "Answer from X"}]
+        stage2_results = []
+        aggregate_rankings = [{"model": "model-x", "borda_score": 1.0, "rank": 1}]
+        stage3_result = {"model": "model-x", "response": "Final synthesis text"}
+        metadata = {
+            "quality_metrics": {"core": {"consensus_strength": 0.9}},
+            "aggregate_rankings": aggregate_rankings,
+            "label_to_model": {"Response A": {"model": "model-x", "display_index": 0}},
+            "usage": {
+                "by_model": {"model-x": {"cost_usd": 0.01}},
+                "total": {"cost_usd": 0.01},
+            },
+        }
+        return stage1_results, stage2_results, stage3_result, metadata
+
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, single_model_council_fn, query_model)
+
+    assert (
+        "WARNING: only 1 model(s) participated - this is not multi-agent debate"
+        in result.debug_log
+    )
+
+
+def test_debug_log_no_mad_warning_with_exactly_two_models(tmp_path):
+    # Boundary: 2 is the minimum for "multi-agent" - must NOT warn at
+    # exactly 2 (distinguishes < 2 from <= 2 or < 3).
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))  # 2 models
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert not any("not multi-agent debate" in line for line in result.debug_log)
+
+
+def test_debug_log_revision_skipped_for_cost_exact_message(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=0.05, cost_y=0.05))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=0.05)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert "Stage 2.75: skipped (would exceed max_cost_usd)" in result.debug_log
+
+
+def test_debug_log_revision_accepted_count_is_accurate_not_just_len(tmp_path):
+    # Distinguishes n_accepted's real count from a mutant that counts every
+    # outcome as 2 (or otherwise ignores .accepted) - needs a MIX of
+    # accepted/rejected outcomes to be observable.
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1))  # triggers revision, 2 models
+    query_model = FakeQueryModel(
+        response_by_model={"model-x": "[[cite:1]] revised text", "model-y": "no citation"}
+    )
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert "Stage 2.75: revision triggered, 2 model(s) responded, 1 accepted" in result.debug_log
+
+
+def test_debug_log_stage3_names_the_actual_chairman_model(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    # _council_result_fixture's stage3_result = {"model": "model-x", ...}
+    assert "Stage 3: synthesis produced by model-x" in result.debug_log
+
+
+def test_debug_log_stage3_falls_back_to_unknown_when_model_key_missing(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    stage1_results, stage2_results, stage3_result, metadata = _council_result_fixture(css=0.9)
+    stage3_result = {"response": "text with no model key"}  # 'model' key deliberately absent
+    council_fn = _make_council_fn((stage1_results, stage2_results, stage3_result, metadata))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert "Stage 3: synthesis produced by unknown" in result.debug_log
+
+
+def test_debug_log_completeness_skipped_for_cost_exact_message(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=0.05, cost_y=0.05))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="t",
+        query="q",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+        max_cost_usd=0.10,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert "Stage 4: skipped (would exceed max_cost_usd)" in result.debug_log
+
+
+def test_debug_log_completeness_parse_failed_exact_message(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "not json"})
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert (
+        "Stage 4: ran, parse FAILED - completeness is UNDETERMINED, not verified"
+        in result.debug_log
+    )
 
 
 def test_completeness_check_cost_included_in_total_cost(tmp_path):

@@ -38,10 +38,16 @@ def build_completeness_prompt(verified_facts: list[TaggedClaim], synthesis: str)
 
 def parse_completeness_response(
     raw_content: str, verified_facts: list[TaggedClaim]
-) -> list[str]:
-    """Never raises; degrades to [] (assume nothing dropped) on any parse
-    failure - a diagnostic check must not crash the pipeline over its own
-    parse failure."""
+) -> tuple[list[str], bool]:
+    """Never raises. Returns (dropped_ids, parse_ok).
+
+    parse_ok=False means the response could not be understood at all -
+    dropped_ids is always [] in that case, but that [] means "undetermined,"
+    NOT "verified nothing was dropped." Callers must check parse_ok before
+    treating an empty dropped_ids list as good news - silently equating a
+    parse failure with a clean result would hide a real failure behind an
+    apparently-successful check.
+    """
     valid_ids = {tc.claim.id for tc in verified_facts}
     try:
         stripped = raw_content.strip()
@@ -51,10 +57,10 @@ def parse_completeness_response(
                 stripped = stripped[4:]
         data = json.loads(stripped)
     except (json.JSONDecodeError, AttributeError):
-        return []
+        return [], False
     if not isinstance(data, list):
-        return []
-    return [str(fid) for fid in data if str(fid) in valid_ids]
+        return [], False
+    return [str(fid) for fid in data if str(fid) in valid_ids], True
 
 
 async def check_fact_completeness(
@@ -62,10 +68,13 @@ async def check_fact_completeness(
     synthesis: str,
     model: str,
     query_fn: QueryFn,
-) -> tuple[list[str], float]:
+) -> tuple[list[str], float, bool]:
+    """Returns (dropped_ids, cost_usd, parse_ok). A no-op ([], 0.0, True)
+    when there's nothing to check - parse_ok=True there because there was
+    no response to fail to parse, not because anything was verified."""
     if not verified_facts:
-        return [], 0.0
+        return [], 0.0, True
     prompt = build_completeness_prompt(verified_facts, synthesis)
     response, cost_usd = await query_fn(model, prompt)
-    dropped = parse_completeness_response(response, verified_facts)
-    return dropped, cost_usd
+    dropped, parse_ok = parse_completeness_response(response, verified_facts)
+    return dropped, cost_usd, parse_ok

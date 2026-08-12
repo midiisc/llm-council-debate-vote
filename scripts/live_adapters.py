@@ -131,6 +131,8 @@ def parse_evidence_response(raw_content: str, retrieval_date: str) -> list[Evide
         data = json.loads(stripped)
     except (json.JSONDecodeError, AttributeError):
         return []
+    if not isinstance(data, dict):
+        return []
 
     verdict = data.get("verdict")
     source = data.get("source") or ""

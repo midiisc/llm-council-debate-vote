@@ -85,10 +85,11 @@ real and independent of anonymization — the mitigation they recommend
 (per-call randomized ordering) isn't exposed via `unified_config`/
 `eval_config` (confirmed by `grep`) and lives entirely inside
 `run_full_council`, which this project deliberately uses as-is rather
-than patching installed vendor code. Not implemented; a candidate for an
-upstream feature request if this pipeline's real-decision use grows
-enough to justify raising it (ask before filing, per the established
-`amiable-dev/llm-council#591` precedent).
+than patching installed vendor code. **Not locally implementable; filed
+upstream as `amiable-dev/llm-council#592`** (2026-08-11, user-confirmed
+before filing, per the `#591` precedent) — this repo's own remediation is
+"wait for upstream" rather than a local code change. Revisit this entry
+once #592 is resolved or closed.
 
 ## Research-driven refinements (2026-08-11)
 
@@ -109,13 +110,97 @@ was never populated from grounding output, so Stage 2.75 revision could
 never receive a real citable fact in any prior run — see Contract 4's
 "Real bug found and fixed" note.
 
-**Not implemented** (see Contract 4 for reasoning on each): per-reviewer
-response/rubric-order randomization (not exposed by upstream, see the
-known-limitation entry above), non-persona diversity prompting for Stage
-1 (evidence too thin — re-confirms the existing no-persona decision), a
-conditional second Stage 0.5 query for UNVERIFIABLE/CONTRADICTED claims
-(evidence narrowly inferred, adds live cost, deferred under the
-real-money gate).
+**Not locally implementable, filed upstream instead:** per-reviewer
+response/rubric-order randomization — `amiable-dev/llm-council#592` (see
+the known-limitation entry above).
+
+**Declined (evidence-based, no code change and no upstream action):**
+non-persona diversity prompting for Stage 1 — evidence too thin
+(arXiv:2511.07784 attributes debate success to model heterogeneity, which
+this pipeline already has via 4 distinct models, not to prompt-level
+framing; no study directly tests the no-persona-framing variant) —
+re-confirms the existing no-persona decision, nothing changed.
+
+**Deferred (evidence-based, cost-based — revisit if evidence strengthens):**
+a conditional second Stage 0.5 query for claims tagged UNVERIFIABLE or
+CONTRADICTED on the first pass — evidence is narrowly inferred from a
+decomposition-specific finding (arXiv:2602.10380) rather than directly
+tested for this pipeline's single-claim/single-query shape, and adds a
+real extra live API call per affected claim; the real-money gate (Pillar
+6) argues against spending on inferred-not-tested evidence.
+
+## Adversarial stress testing (2026-08-11)
+
+`tests/test_stress_adversarial.py` added: hypothesis-fuzz tests feeding
+arbitrary text (200 examples each) through every model-response parse
+boundary in the codebase (`parse_completeness_response`,
+`parse_revision_response`, `parse_evidence_response`), a property test
+that `total_cost_usd` always equals the exact sum of all three real cost
+sources (stage1-3 + revision + completeness) under randomized inputs, and
+one combined worst-case end-to-end scenario (mixed VERIFIED/CONTRADICTED/
+UNVERIFIABLE claims, a cost ceiling landing mid-run, malformed responses
+at every call site) run through the real `run_pipeline`.
+
+**Found a real bug on the first run:** `live_adapters.parse_evidence_response`
+crashed with `AttributeError: 'int' object has no attribute 'get'` on any
+input that's valid JSON but not a JSON object — `"0"`, `"[]"`, `"null"`,
+`"true"`, a bare quoted string. `json.loads` happily parses these; the
+code then called `.get("verdict")` on whatever came back, assuming it was
+always a dict. This directly contradicted the function's own documented
+contract ("never raises... malformed model response must degrade to
+'couldn't verify,' not crash"), and could have crashed a real grounding
+pass mid-claim on nothing more exotic than a model replying with a bare
+number. **Fixed** with one `isinstance(data, dict)` guard (mirrors the
+`isinstance(data, list)` guard `parse_completeness_response` already had
+for exactly this reason). Re-verified: `live_adapters.py` mutation-tested
+clean afterward (185 mutants, same 10 previously-documented equivalent
+survivors, zero new gaps). Regression test:
+`test_parse_evidence_response_valid_json_non_dict_yields_empty_list_not_crash`
+in `tests/test_live_adapters.py`.
+
+No other real bugs surfaced — the fuzz/property/combined-scenario tests
+all passed cleanly on `completeness_check.py`, `revision_round.py`, and
+`pipeline_runner.py` once the one fix above landed. Full suite: 200
+passed.
+
+## No-silent-failure hardening (2026-08-11)
+
+Direct follow-up to the stress testing above, per explicit user request:
+"no silent failing of any step" + "add proper debug steps so it's clear
+what failed." Auditing every stage against that bar (not just fixing what
+the fuzz tests happened to hit) surfaced one more real design gap:
+`completeness_check.parse_completeness_response` returned `[]` both when
+the model genuinely reported nothing missing AND when its response
+couldn't be parsed at all — indistinguishable from `PipelineResult`
+alone. Fixed by changing its return type to `(ids, parse_ok)` (and
+`check_fact_completeness` to `(ids, cost, parse_ok)`) — see
+`docs/specs/custom-scripts-contracts.md` Contract 4's AC10/AC11. New
+`PipelineResult.completeness_check_parse_failed` field; the CLI now warns
+distinctly when the check ran but couldn't be understood, separate from
+the "facts were dropped" warning.
+
+Two more additions, `pipeline_runner.py` only:
+- **`PipelineResult.debug_log: list[str]`** — one line per stage
+  transition (grounding ran/skipped + tag breakdown, model count, CSS,
+  revision ran/skipped-why + accept count, chairman model, Stage 4
+  ran/skipped-why + parse outcome). The CLI prints this to stderr on
+  every run. Read top to bottom to see exactly what happened without
+  reverse-engineering it from the other result fields.
+- **MAD integrity check** — `len(stage1_results) < 2` appends a `WARNING:
+  ... this is not multi-agent debate` line. A run that silently degraded
+  to a single model (upstream fallback, config issue, etc.) can no longer
+  look identical to a real multi-model run in what a human reads.
+
+`revision_round.parse_revision_response` was deliberately left unchanged
+— its `(None, None)` "not revising" result isn't the same ambiguity
+(the prompt explicitly instructs "no citation marker means not revising,"
+so absence is a well-defined signal by the contract's own design, not a
+masked parse failure) — see the contract doc's non-goals note for the
+full reasoning.
+
+Mutation-tested clean: `completeness_check.py` 66/66,
+`pipeline_runner.py` 570/588 (same 18 previously-documented equivalent
+survivors, zero new gaps). Full suite: 215 passed.
 
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.

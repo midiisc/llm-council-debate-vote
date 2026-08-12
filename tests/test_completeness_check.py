@@ -38,10 +38,13 @@ class FakeQueryFn:
 def test_ac1_empty_facts_returns_no_op_without_calling_query_fn():
     query_fn = FakeQueryFn()
 
-    dropped, cost = asyncio.run(check_fact_completeness([], "synthesis text", "m", query_fn))
+    dropped, cost, parse_ok = asyncio.run(
+        check_fact_completeness([], "synthesis text", "m", query_fn)
+    )
 
     assert dropped == []
     assert cost == 0.0
+    assert parse_ok is True
     assert query_fn.calls == []
 
 
@@ -52,7 +55,7 @@ def test_ac2_nonempty_facts_calls_query_fn_exactly_once():
     facts = [_fact("1", "fact one"), _fact("2", "fact two")]
     query_fn = FakeQueryFn(response='["2"]', cost=0.02)
 
-    dropped, cost = asyncio.run(
+    dropped, cost, parse_ok = asyncio.run(
         check_fact_completeness(facts, "synthesis text", "my-model", query_fn)
     )
 
@@ -60,6 +63,7 @@ def test_ac2_nonempty_facts_calls_query_fn_exactly_once():
     assert query_fn.calls[0][0] == "my-model"
     assert dropped == ["2"]
     assert cost == 0.02
+    assert parse_ok is True
 
 
 def test_check_fact_completeness_sends_the_real_built_prompt():
@@ -78,52 +82,61 @@ def test_check_fact_completeness_sends_the_real_built_prompt():
 def test_ac3_parse_returns_only_ids_present_in_verified_facts():
     facts = [_fact("1", "fact one"), _fact("2", "fact two")]
 
-    dropped = parse_completeness_response('["1", "2"]', facts)
+    dropped, parse_ok = parse_completeness_response('["1", "2"]', facts)
 
     assert dropped == ["1", "2"]
+    assert parse_ok is True
 
 
 def test_ac3_parse_filters_out_hallucinated_id_not_in_verified_facts():
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response('["1", "99"]', facts)
+    dropped, parse_ok = parse_completeness_response('["1", "99"]', facts)
 
     assert dropped == ["1"]
+    assert parse_ok is True
 
 
 def test_ac3_parse_empty_array_means_nothing_dropped():
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response("[]", facts)
+    dropped, parse_ok = parse_completeness_response("[]", facts)
 
     assert dropped == []
+    assert parse_ok is True
 
 
-# --- AC4: malformed/unparseable response degrades to [] without raising ---
+# --- AC4/AC10/AC11: malformed/unparseable response degrades to ([], False)
+# without raising - and a well-formed response (even an empty array) must
+# always report parse_ok=True, so callers can distinguish "verified clean"
+# from "couldn't tell." ---
 
 
 def test_ac4_malformed_json_returns_empty_list_not_crash():
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response("not json at all", facts)
+    dropped, parse_ok = parse_completeness_response("not json at all", facts)
 
     assert dropped == []
+    assert parse_ok is False
 
 
 def test_ac4_valid_json_but_not_a_list_returns_empty_list():
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response('{"1": true}', facts)
+    dropped, parse_ok = parse_completeness_response('{"1": true}', facts)
 
     assert dropped == []
+    assert parse_ok is False
 
 
 def test_ac4_markdown_fenced_json_array_still_parses():
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response('```json\n["1"]\n```', facts)
+    dropped, parse_ok = parse_completeness_response('```json\n["1"]\n```', facts)
 
     assert dropped == ["1"]
+    assert parse_ok is True
 
 
 def test_ac4_strips_only_backticks_not_other_chars():
@@ -132,9 +145,10 @@ def test_ac4_strips_only_backticks_not_other_chars():
     # strip leading 'X' characters, turning this malformed input valid.
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response('```XX["1"]', facts)
+    dropped, parse_ok = parse_completeness_response('```XX["1"]', facts)
 
     assert dropped == []
+    assert parse_ok is False
 
 
 def test_ac4_json_tag_slice_is_exactly_four_chars():
@@ -142,19 +156,43 @@ def test_ac4_json_tag_slice_is_exactly_four_chars():
     # extra character and corrupts otherwise-valid JSON.
     facts = [_fact("1", "fact one")]
 
-    dropped = parse_completeness_response('```json["1"]```', facts)
+    dropped, parse_ok = parse_completeness_response('```json["1"]```', facts)
 
     assert dropped == ["1"]
+    assert parse_ok is True
 
 
 def test_ac4_check_fact_completeness_never_raises_on_malformed_response():
     facts = [_fact("1", "fact one")]
     query_fn = FakeQueryFn(response="garbage, not json", cost=0.01)
 
-    dropped, cost = asyncio.run(check_fact_completeness(facts, "synthesis", "m", query_fn))
+    dropped, cost, parse_ok = asyncio.run(
+        check_fact_completeness(facts, "synthesis", "m", query_fn)
+    )
 
     assert dropped == []
     assert cost == 0.01
+    assert parse_ok is False
+
+
+def test_ac10_well_formed_empty_array_reports_parse_ok_true():
+    facts = [_fact("1", "fact one")]
+
+    dropped, parse_ok = parse_completeness_response("[]", facts)
+
+    assert dropped == []
+    assert parse_ok is True
+
+
+def test_ac11_malformed_response_never_silently_looks_like_success():
+    # The exact failure mode this contract change closes: dropped==[] must
+    # NEVER coincide with parse_ok==True for a genuinely malformed input -
+    # that combination would look identical to "verified, nothing missing."
+    facts = [_fact("1", "fact one")]
+
+    dropped, parse_ok = parse_completeness_response("<<<not json>>>", facts)
+
+    assert not (dropped == [] and parse_ok is True)
 
 
 # --- AC5: build_completeness_prompt contains every fact + the synthesis verbatim ---

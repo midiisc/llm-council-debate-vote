@@ -66,6 +66,16 @@ class PipelineResult:
     # the check was skipped for cost, or nothing was dropped.
     dropped_facts: list[str] = field(default_factory=list)
     completeness_check_skipped_for_cost: bool = False
+    # True only when the completeness check actually ran (spent money) but
+    # its response couldn't be parsed - dropped_facts==[] in that case is
+    # NOT "verified clean," it's "undetermined." Never True when the check
+    # didn't run at all (no grounding, or skipped for cost).
+    completeness_check_parse_failed: bool = False
+    # One line per stage transition, in order - what actually ran, what
+    # was skipped and why, how many models/outcomes were involved. Read
+    # top to bottom to see exactly what happened in a run without
+    # reverse-engineering it from the other fields.
+    debug_log: list[str] = field(default_factory=list)
 
 
 def slugify(topic_label: str) -> str:
@@ -181,6 +191,7 @@ async def run_pipeline(
     _write_run_status(output_dir, "running")
 
     cost_so_far = 0.0
+    debug_log: list[str] = []
     try:
         verified_facts: list[TaggedClaim] = []
         if config.raw_claims_text.strip():
@@ -192,8 +203,25 @@ async def run_pipeline(
             input_path.unlink()
             tagged = [tag_claim(c, evidence_map.get(c.id, [])) for c in claims]
             verified_facts = [tc for tc in tagged if tc.tag in ("VERIFIED", "CONTRADICTED")]
+            n_verified = sum(1 for tc in tagged if tc.tag == "VERIFIED")
+            n_contradicted = sum(1 for tc in tagged if tc.tag == "CONTRADICTED")
+            n_unverifiable = sum(1 for tc in tagged if tc.tag == "UNVERIFIABLE")
+            debug_log.append(
+                f"Stage 0.5: grounding ran, {len(claims)} claim(s) "
+                f"({n_verified} verified, {n_contradicted} contradicted, "
+                f"{n_unverifiable} unverifiable)"
+            )
+        else:
+            debug_log.append("Stage 0.5: skipped (no raw_claims_text)")
 
         stage1_results, stage2_results, stage3_result, metadata = await council_fn(config.query)
+
+        debug_log.append(f"Stage 1-3.5: council returned {len(stage1_results)} model response(s)")
+        if len(stage1_results) < 2:
+            debug_log.append(
+                f"WARNING: only {len(stage1_results)} model(s) participated - "
+                "this is not multi-agent debate"
+            )
 
         css = metadata["quality_metrics"]["core"]["consensus_strength"]
         aggregate_rankings = metadata["aggregate_rankings"]
@@ -201,6 +229,7 @@ async def run_pipeline(
         usage = metadata["usage"]
         stage1to3_cost = usage["total"]["cost_usd"]
         cost_so_far = stage1to3_cost
+        debug_log.append(f"Stage 2.5: CSS={css:.3f}")
 
         revision_triggered = False
         revision_skipped_for_cost = False
@@ -210,6 +239,7 @@ async def run_pipeline(
         if should_trigger_revision(css):
             if config.max_cost_usd is not None and stage1to3_cost >= config.max_cost_usd:
                 revision_skipped_for_cost = True
+                debug_log.append("Stage 2.75: skipped (would exceed max_cost_usd)")
             else:
                 answers = [
                     ModelAnswer(
@@ -225,18 +255,37 @@ async def run_pipeline(
                 revision_cost = sum(o.cost_usd for o in outcomes)
                 cost_so_far += revision_cost
                 revision_triggered = True
+                n_accepted = sum(1 for o in outcomes if o.accepted)
+                debug_log.append(
+                    f"Stage 2.75: revision triggered, {len(outcomes)} model(s) "
+                    f"responded, {n_accepted} accepted"
+                )
+        else:
+            debug_log.append(f"Stage 2.75: skipped (CSS {css:.3f} >= threshold)")
+
+        debug_log.append(f"Stage 3: synthesis produced by {stage3_result.get('model', 'unknown')}")
 
         dropped_facts: list[str] = []
         completeness_check_skipped_for_cost = False
+        completeness_check_parse_failed = False
         completeness_check_cost = 0.0
-        if verified_facts:
-            if config.max_cost_usd is not None and cost_so_far >= config.max_cost_usd:
-                completeness_check_skipped_for_cost = True
+        if not verified_facts:
+            debug_log.append("Stage 4: skipped (no verified facts)")
+        elif config.max_cost_usd is not None and cost_so_far >= config.max_cost_usd:
+            completeness_check_skipped_for_cost = True
+            debug_log.append("Stage 4: skipped (would exceed max_cost_usd)")
+        else:
+            dropped_facts, completeness_check_cost, parse_ok = await check_fact_completeness(
+                verified_facts, synthesis, config.completeness_check_model, query_model
+            )
+            cost_so_far += completeness_check_cost
+            completeness_check_parse_failed = not parse_ok
+            if parse_ok:
+                debug_log.append(f"Stage 4: ran, parse succeeded, {len(dropped_facts)} fact(s) dropped")
             else:
-                dropped_facts, completeness_check_cost = await check_fact_completeness(
-                    verified_facts, synthesis, config.completeness_check_model, query_model
+                debug_log.append(
+                    "Stage 4: ran, parse FAILED - completeness is UNDETERMINED, not verified"
                 )
-                cost_so_far += completeness_check_cost
 
         rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
         ranks = _compute_ranks(aggregate_rankings)
@@ -280,6 +329,8 @@ async def run_pipeline(
         cost_ceiling_exceeded=cost_ceiling_exceeded,
         dropped_facts=dropped_facts,
         completeness_check_skipped_for_cost=completeness_check_skipped_for_cost,
+        completeness_check_parse_failed=completeness_check_parse_failed,
+        debug_log=debug_log,
     )
 
 
@@ -343,10 +394,21 @@ def main() -> None:
     print(f"Total cost: ${result.total_cost_usd:.4f}")
     print(result.synthesis)
 
+    print("Debug log:", file=sys.stderr)
+    for line in result.debug_log:
+        print(f"  {line}", file=sys.stderr)
+
     if result.dropped_facts:
         print(
             "WARNING: the final synthesis does not appear to address these "
             f"verified facts: {', '.join(result.dropped_facts)}",
+            file=sys.stderr,
+        )
+    if result.completeness_check_parse_failed:
+        print(
+            "WARNING: the Stage 4 completeness check ran but its response "
+            "could not be understood - completeness is UNDETERMINED, not "
+            "verified. dropped_facts=[] here does NOT mean nothing is missing.",
             file=sys.stderr,
         )
     if result.completeness_check_skipped_for_cost:

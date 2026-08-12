@@ -392,6 +392,74 @@ shifted — but the underlying equivalent categories are unchanged), zero
 new gaps from either the Stage 4 wiring or the `verified_facts` bug fix.
 Full project suite: 189 passed.
 
+### Amendment (2026-08-11): distinguish "verified clean" from "couldn't tell" (no silent degrade-as-success)
+
+User-requested hardening pass, following the stress-testing work above:
+"no silent failing of any step" + "proper debug steps so it's clear what
+failed." Auditing every stage for this specifically surfaced one real
+design gap in Contract 4 as originally written: `parse_completeness_response`
+returned `[]` both when the model's response genuinely listed no dropped
+facts AND when the response was malformed and couldn't be parsed at all —
+identical output for two completely different situations. A run whose
+Stage 4 check silently failed to parse would look, from `PipelineResult`
+alone, exactly like a run where Stage 4 genuinely verified nothing was
+missing. That's the opposite of what a diagnostic check is for.
+
+**Change:** `parse_completeness_response`'s signature changes from
+`-> list[str]` to `-> tuple[list[str], bool]` — `(dropped_ids, parse_ok)`.
+`check_fact_completeness`'s return changes from `tuple[list[str], float]`
+to `tuple[list[str], float, bool]` — `(dropped_ids, cost_usd, parse_ok)`.
+`parse_ok=False` means the check ran (money was spent) but its answer is
+undetermined, not "verified clean" — callers must not treat
+`dropped_ids=[]` and `parse_ok=False` as good news.
+
+**New acceptance criteria:**
+10. Given the model's response is a well-formed JSON array (whether empty
+    or non-empty), When `parse_completeness_response` runs, Then it
+    returns `(ids, True)`.
+11. Given the model's response is malformed JSON, not a JSON array, or
+    otherwise unparseable, When `parse_completeness_response` runs, Then
+    it returns `([], False)` — never `([], True)`, which would silently
+    claim the check succeeded and found nothing.
+
+**`pipeline_runner.run_pipeline` integration change:** new
+`PipelineResult.completeness_check_parse_failed: bool` field. The CLI
+prints a distinct stderr warning when this is `True` ("the check ran but
+its response couldn't be understood — completeness is UNDETERMINED, not
+verified"), separate from the existing dropped-facts warning.
+
+### Amendment (2026-08-11): structured per-stage debug log + MAD integrity check
+
+Same hardening pass. Two more additions, both to `pipeline_runner.py`
+only (no other file changes):
+
+1. **`PipelineResult.debug_log: list[str]`** — one line appended at every
+   stage transition, recording what actually happened: grounding
+   ran/skipped and the VERIFIED/CONTRADICTED/UNVERIFIABLE breakdown;
+   how many Stage 1 model responses came back; the CSS value; whether
+   revision ran/was skipped and why, and how many outcomes were accepted;
+   whether Stage 4 ran/was skipped and why, and whether its parse
+   succeeded. This is the direct answer to "make it clear what failed" —
+   a human debugging a run reads `debug_log` top to bottom instead of
+   reverse-engineering behavior from `PipelineResult`'s other fields.
+2. **MAD integrity check** — after `council_fn` returns, if
+   `len(stage1_results) < 2`, a `"WARNING: only N model(s) participated —
+   this is not multi-agent debate"` line is appended to `debug_log`
+   (surfaced, not silently accepted as normal). This project's whole
+   premise is genuine multi-model debate; a run that silently degraded to
+   a single model should never look identical to a real one in the
+   output a human reads.
+
+**Non-goals:** this does not change `revision_round.parse_revision_response`'s
+return type. Its `(None, None)` "not revising" result is not the same
+ambiguity as Stage 4's — the revision prompt explicitly instructs "if you
+are not revising, do not include a citation marker," so a marker's
+absence is a well-defined signal by the contract's own design, not a
+parse failure being silently mistaken for success. `debug_log` still
+reports revision's aggregate outcome (N responded, M accepted) for
+visibility, without redesigning an already mutation-tested-clean module's
+contract.
+
 ### Research findings not implemented (2026-08-11)
 
 From the same Feynman-methodology literature pass that produced Stage 4
