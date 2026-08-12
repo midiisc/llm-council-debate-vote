@@ -648,3 +648,198 @@ from that list. Caught and fixed by independently re-running the full
 test suite and re-adding it before treating any contract as final, per
 Pillar 1 ("verify by execution," not by trusting a subagent's self-report
 of its own result).
+
+## Amendment (2026-08-12): resilient Stage 1 (retry + backup substitution)
+
+**Problem:** Stage 1's current call, `query_models_parallel(_get_council_models(),
+messages, timeout=stage1_timeout)`, gives each configured model exactly one
+attempt and returns `None` for any that doesn't succeed in time — no retry,
+no distinction between "timed out once, would likely succeed on retry" and
+"genuinely unreachable," and no way to keep the live count at the
+configured minimum. Full grounding, the user-approved backup-model pair,
+and the STATUS_* retry-classification taxonomy are recorded in
+`docs/upstream-deltas.md`, "Debate resilience" entry. The new engine
+(`scripts/resilient_query.py::query_models_resilient`) implementing
+retry-with-backoff + backup substitution is specified separately in
+`docs/specs/debate-resilience-contract.md` and already implemented,
+mutation-gate clean (0 survivors, verified both by the implementing
+blind-TDV workflow and independently by re-running `mutmut` directly).
+This amendment is the integration: wiring that engine into Stage 1 and
+surfacing its outcome loudly instead of leaving it buried in `metadata`.
+
+**Decision:** `run_council_with_timeouts`'s Stage 1 replaces its
+`query_models_parallel` call with `query_models_resilient`, reading the
+backup pool / retry policy / minimum council size from `llm_council.yaml`'s
+`debate_resilience:` block (a new true-top-level key, deliberately outside
+`get_config()`'s reach — see the config-placement rule in
+`docs/upstream-deltas.md`). `query_model_with_status`
+(`llm_council.gateway_adapter`) is the injected `query_fn`, since it is the
+one call in the package that actually preserves the STATUS_* taxonomy
+`query_models_resilient`'s retry logic depends on — `query_models_parallel`
+discards it.
+
+**New helper, `council_adapter.py`:**
+```python
+@dataclass
+class DebateResilienceConfig:
+    backup_models: list[str]
+    retry_policy: RetryPolicy   # scripts.resilient_query.RetryPolicy
+    minimum_council_size: int
+
+def _load_debate_resilience_config(config_path: Optional[Path] = None) -> DebateResilienceConfig:
+    ...
+```
+Locates the YAML file the same way `llm_council.unified_config
+._find_config_file()` does (env var `LLM_COUNCIL_CONFIG` → `./llm_council.yaml`
+→ `~/.config/llm-council/llm_council.yaml`) — reusing that function directly
+rather than re-deriving the search order, matching this file's own existing
+precedent of importing package-private helpers when justified (`_get_council_models`
+is already imported this way). Parses only the `debate_resilience:` key via
+a plain `yaml.safe_load` — never through `get_config()`/`UnifiedConfig`. If
+the key or the file is entirely absent, returns safe defaults
+(`backup_models=[]`, `RetryPolicy()` defaults, `minimum_council_size=4`) —
+never raises, so a project that hasn't added this block yet degrades to
+"today's behavior plus retries," not a crash.
+
+**Stage 1 body change:**
+```python
+resilience_config = _load_debate_resilience_config()
+result = await query_models_resilient(
+    primary_models=_get_council_models(),
+    backup_models=resilience_config.backup_models,
+    messages=messages,
+    timeout=stage1_timeout,
+    query_fn=query_model_with_status,
+    retry_policy=resilience_config.retry_policy,
+    minimum_council_size=resilience_config.minimum_council_size,
+)
+```
+`result.responses` (dict, only `"ok"` entries) replaces the old
+`responses` dict — every entry is already a success, so the existing
+`if response is not None:` filter in the stage1_results-building loop is
+now unreachable and removed, not just left in place as dead code.
+`response.get("content", "")` extraction, per-model usage accumulation,
+and the safety-gate loop are otherwise unchanged.
+
+**metadata additions** (both optional, present only when non-empty —
+matching the existing `degraded_mode` key convention, never an empty
+list/None key cluttering the normal-path output):
+- `metadata["substitutions"]`: `[dataclasses.asdict(s) for s in result.substitutions]`
+  when `result.substitutions` is non-empty. Each entry:
+  `{"slot_model": str, "backup_model": str, "reason": str}`.
+- `metadata["shortfall_warning"]`: `result.shortfall_warning` when not `None`.
+
+**`pipeline_runner.py` companion change (small, additive):** immediately
+after Stage 1 completes (`stage1_results, stage2_results, stage3_result,
+metadata = await council_fn(...)`), extend the existing debug-log
+surfacing (which already warns when `len(stage1_results) < 2`) to also
+append, when present:
+- `f"WARNING: {metadata['shortfall_warning']}"` — reuses the pre-existing
+  mechanism that already prints every `debug_log` line to stderr in
+  `main()`'s `"Debug log:"` section, so this requires no new
+  `PipelineResult` field or new `main()` print branch.
+- one `f"NOTE: {slot_model} was unreachable this session, substituted with
+  backup {backup_model} ({reason})"` line per entry in
+  `metadata.get("substitutions", [])`.
+This mirrors exactly what `scripts/debate.py` already does for the ad hoc
+one-shot path (stderr `WARNING:`/`NOTE:` lines), so both call paths this
+project controls surface a shortfall the same way — never silently.
+
+**New acceptance criteria:**
+17. Given all 4 primary models succeed on the first attempt, When Stage 1
+    runs, Then `query_models_resilient` is called with `primary_models`
+    equal to `_get_council_models()`'s return value, `stage1_results`
+    contains exactly those 4 models, and neither `metadata["substitutions"]`
+    nor `metadata["shortfall_warning"]` is present at all.
+18. Given `_load_debate_resilience_config` is called against a YAML file
+    with a `debate_resilience:` block matching this project's own
+    `llm_council.yaml`, When it runs, Then the returned `backup_models`,
+    `retry_policy` (`max_attempts`/`backoff_seconds`/`retryable_statuses`),
+    and `minimum_council_size` exactly match the file's values — not
+    hardcoded defaults silently overriding a real config.
+19. Given `debate_resilience:` is absent from the config file entirely,
+    When `_load_debate_resilience_config` runs, Then it returns
+    `backup_models=[]`, `RetryPolicy()`'s own defaults, and
+    `minimum_council_size=4` — never raises.
+20. Given `query_models_resilient` returns a non-empty `substitutions`
+    list, When Stage 1 finishes, Then `metadata["substitutions"]` is a
+    list of plain dicts (JSON-serializable, not dataclass instances) with
+    exactly the `slot_model`/`backup_model`/`reason` keys, in the same
+    order `query_models_resilient` produced them.
+21. Given `query_models_resilient` returns `shortfall_warning=None`, When
+    Stage 1 finishes, Then `"shortfall_warning"` is not a key in `metadata`
+    at all (not present-and-`None` — matches the `degraded_mode`
+    precedent's "key absent, never a falsy placeholder" convention).
+22. Given Stage 1's `metadata` carries a `shortfall_warning`, When
+    `run_pipeline` runs, Then `debug_log` contains a line starting with
+    `"WARNING: "` and including the warning text verbatim, printed to
+    stderr by `main()`'s existing `"Debug log:"` loop — unchanged from
+    today's mechanism, no new field.
+23. Given `run_council_with_timeouts` is called with `query_fn` faked to
+    return `status="ok"` for every primary on the first attempt, When it
+    runs, Then `query_fn` (i.e. `query_model_with_status`) is invoked
+    exactly once per primary model — no retries, no backups ever touched,
+    confirming the happy path costs exactly what it did before this
+    amendment (no regression in the common case).
+
+### Implementation + verification (2026-08-12, blind-TDV — caught a false GREEN)
+
+Implemented via blind-TDV (isolated ws-verifier + ws-builder, RED→GREEN→
+mutation gate). The workflow self-reported `PASS: true, allPassed: true,
+mutantsKilled: 187/188` — **this was checked independently per Pillar 1
+("verify by execution," not by trusting a subagent's self-report) and the
+test-suite claim was false.**
+
+**What was actually wrong:** `tests/test_council_adapter.py` (the
+*pre-existing*, already-passing test file from the prior amendment) still
+patched `query_models_parallel` — the function Stage 1 no longer calls
+after this amendment. 12 of its tests kept "passing" their own patch setup
+silently but then exercised the REAL, unpatched `query_models_resilient`
+→ `query_model_with_status` path — live network attempts against this
+project's real `llm_council.yaml` config (including the newly-added
+backup models) with no mocking. This surfaced two ways: 12 assertion
+failures (comparing real model-slug responses against fixture data like
+`{"model-a", "model-b", ...}`), and the full suite's runtime ballooning
+from ~2s to 871s (14.5 minutes) as those unmocked calls hit real
+timeouts/retries. The blind-TDV workflow's own test run apparently
+tolerated this (or ran a narrower selection) and reported GREEN anyway —
+exactly the failure mode the "Process note" in the prior amendment's
+implementation section already flagged as a risk with multi-contract
+concurrent runs, recurring here in a single-contract run instead.
+
+**Fix (this session, not blind — a mechanical test-repair, not new
+logic):** added a `_as_resilient()` adapter in
+`tests/test_council_adapter.py` that wraps each pre-existing
+`query_models_parallel`-shaped fake into a `query_models_resilient`-shaped
+one (same per-model response/`None` semantics, translated into a
+`ResilientQueryResult`), and repointed every `_patch(monkeypatch,
+"query_models_parallel", ...)` call at `"query_models_resilient"`. This
+preserves every pre-existing test's original intent and assertions
+unchanged — only the mock boundary moved to match the real dependency.
+Verified: full suite back to 382 passed in 2.33s, zero real network
+attempts.
+
+**Mutation gate, re-verified independently after the fix:** direct
+`mutmut run` (not the workflow's own report) — 1440 total mutants across
+`only_mutate`'s 5 files, 1412 killed, 28 survived. Filtered to this
+amendment's changed surface (`council_adapter.py`, `pipeline_runner.py`):
+exactly 1 genuinely new survivor,
+`x__load_debate_resilience_config__mutmut_15` (`open(path, "r")` →
+`open(path, )`) — equivalent by construction, since Python's `open()`
+default mode is already `"r"`. The other 8 `run_council_with_timeouts`
+survivors were spot-checked and confirmed to be the same equivalent-mutant
+classes already documented in the prior amendment's implementation section
+above (unreachable `.get(..., default)` branches, an already-excluded
+`> 0` vs `>= 0` boundary) — not new regressions, just re-numbered because
+the function body changed. 0 non-equivalent survivors in the amended
+surface.
+
+**Lesson, worth repeating alongside the existing ones in this file:** a
+blind-TDV workflow's "PASS" claim covers what it actually ran — it does
+not substitute for independently re-running the full existing suite
+against the merged result. This is the second time in this repo a
+concurrent/isolated test-authoring process has produced a false "done"
+signal caught only by direct re-execution (see the "Process note" and
+"Process learning" entries above) — a pattern worth treating as a standing
+verification step for every blind-TDV amendment to a file with pre-existing
+tests, not a one-off surprise.

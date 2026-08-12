@@ -91,3 +91,70 @@ council:
                       # a free local scan on Stage-1 responses is reasonable
                       # defense-in-depth. See upstream-deltas.md, Second Expert
                       # Panel round.
+
+# CUSTOM section, added 2026-08-12 - deliberately a TRUE top-level key,
+# a SIBLING of the outer "council:" wrapper above, never nested inside it.
+# load_config() does exactly UnifiedConfig(**raw_config.get("council", {})),
+# so this key is invisible to it by construction - never read via
+# get_config()/UnifiedConfig, only via scripts/resilient_query.py's own
+# yaml.safe_load(). This is the opposite placement rule from every other
+# block in this file (which all exist to get package-native keys INTO the
+# one place load_config() reads) - see docs/upstream-deltas.md, "Debate
+# resilience" entry, for why deliberately keeping this package-invisible is
+# correct here (no UnifiedConfig field exists for it; nesting it under
+# council: would either be silently dropped or, worse, collide with a real
+# field by accident).
+#
+# Supersedes the prior "do not reflexively backfill a dropped 4th model"
+# decision (pipeline-architecture-spec.md §2) - user-approved 2026-08-12,
+# see that file's "Superseding decision" section. Backup candidates
+# live-confirmed on OpenRouter + web-researched for debate/critique fit,
+# all from labs distinct from the 4 configured council.models above
+# (Anthropic/OpenAI/Google/Zhipu) - see upstream-deltas.md for sourcing.
+#
+# Ordering below (2026-08-12) is the ranked output of a grounded 3-lens
+# judge panel run specifically to answer "which candidate maximizes
+# training-corpus/methodology diversity against the existing 4 seats" -
+# see upstream-deltas.md, "4th-seat diversity panel" entry, and
+# pipeline-architecture-spec.md §2 for the full reasoning. The panel's
+# diversity-optimized top pick was Kimi K3, not GLM-5.2's incumbent seat -
+# user explicitly chose to KEEP GLM-5.2 as the primary seat (lower risk,
+# already-verified debate/critique quality) and use the panel's own
+# backup ranking instead of its primary-seat recommendation. First-unused
+# entry wins a slot (see docs/specs/debate-resilience-contract.md) - order
+# here is deliberate, not incidental.
+debate_resilience:
+  backup_models:
+    - moonshotai/kimi-k3-20260715  # Moonshot AI - panel's diversity-optimized
+                                     # top pick (self-critique-reward alignment,
+                                     # not RLHF - most methodologically distinct
+                                     # of all 4 candidates). DATED SLUG - same
+                                     # risk class as the z-ai/glm-5.2-20260616
+                                     # slug that went dead 2026-08-12; re-verify
+                                     # against live OpenRouter before this is
+                                     # ever promoted out of the backup pool.
+    - qwen/qwen3.8-max               # Alibaba - live-confirmed 2026-08-12, 1M
+                                       # context. Methodologically redundant
+                                       # with GLM (both RLVR-primary + late
+                                       # human-preference stage) - ranked 2nd
+                                       # backup, not 1st, for that reason.
+    - x-ai/grok-4.6                   # xAI - live-confirmed 2026-08-12, 500K
+                                        # context. Ranked LAST on the diversity
+                                        # axis this pool exists for - its own
+                                        # model cards describe an RLHF/RLAIF
+                                        # pipeline built on Anthropic's own
+                                        # Petri audit tooling, structurally the
+                                        # same paradigm as the 3 incumbent
+                                        # seats. Kept as pure-resilience
+                                        # fallback, not a diversity pick.
+  minimum_council_size: 4  # below this, proceed degraded but never silently -
+                             # scripts/resilient_query.py's shortfall_warning
+                             # must be surfaced in the run's output.
+  retry:
+    max_attempts: 3         # includes the first try
+    backoff_seconds: [5, 15]  # wait before retry 2, retry 3
+    # Any status the package's query_model_with_status returns that is NOT
+    # in this list (currently only "auth_error") is treated as terminal -
+    # retrying an identical request against a bad/inaccessible key can't
+    # succeed. See upstream-deltas.md's STATUS_* taxonomy table.
+    retryable_statuses: [timeout, rate_limited, error]

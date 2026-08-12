@@ -88,6 +88,48 @@ def _patch(monkeypatch, name, fake):
     monkeypatch.setattr(ca, name, fake, raising=False)
 
 
+from scripts.resilient_query import ResilientQueryResult
+
+
+def _as_resilient(query_models_parallel_like):
+    """Adapts a query_models_parallel-shaped fake ((models, messages,
+    disable_tools=False, timeout=120.0) -> {model: response_or_None}) into
+    a query_models_resilient-shaped fake.
+
+    Post-amendment (docs/specs/pipeline-runner-contract.md, "Amendment
+    (2026-08-12): resilient Stage 1"), council_adapter.py's Stage 1 calls
+    query_models_resilient instead of query_models_parallel. Every fixture
+    in this file was authored against the pre-amendment dependency
+    boundary and still encodes the exact intent each test needs (which
+    models "respond", with what content/usage) - this adapter keeps that
+    intent intact while pointing the patch at the real call
+    run_council_with_timeouts makes today, instead of leaving tests
+    patching a function that's no longer on the call path (which was
+    silently falling through to the real, unmocked query_models_resilient
+    -> query_model_with_status and making live network attempts).
+    """
+
+    async def fake_query_models_resilient(
+        primary_models,
+        backup_models,
+        messages,
+        timeout,
+        query_fn,
+        retry_policy=None,
+        minimum_council_size=4,
+    ):
+        raw = await query_models_parallel_like(primary_models, messages, timeout=timeout)
+        return ResilientQueryResult(
+            responses={m: r for m, r in raw.items() if r is not None},
+            attempts=[],
+            substitutions=[],
+            unreachable_models=[m for m, r in raw.items() if r is None],
+            shortfall_warning=None,
+        )
+
+    return fake_query_models_resilient
+
+
 def _make_config(safety_enabled: bool, models: list | None = None):
     # `council.models` must be present (not just `evaluation`) -- the
     # contract's own "Grounded call sequence" point 1 requires
@@ -197,7 +239,7 @@ def _install_happy_path_fakes(
         return _make_config(safety_enabled, models)
 
     fakes = {
-        "query_models_parallel": query_models_parallel_fn or default_query_models_parallel,
+        "query_models_resilient": _as_resilient(query_models_parallel_fn or default_query_models_parallel),
         "check_response_safety": fake_check_response_safety,
         "stage1_5_normalize_styles": fake_stage1_5_normalize_styles,
         "stage2_collect_rankings": fake_stage2_collect_rankings,
@@ -289,7 +331,7 @@ def test_ac13_zero_successful_stage1_responses_returns_error_tuple_shape(monkeyp
     async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
         return {m: None for m in models_arg}
 
-    _patch(monkeypatch, "query_models_parallel", fake_query_models_parallel)
+    _patch(monkeypatch, "query_models_resilient", _as_resilient(fake_query_models_parallel))
     _patch(monkeypatch, "get_config", lambda: _make_config(safety_enabled=False, models=models))
 
     stage1_results, stage2_results, stage3_result, metadata = asyncio.run(
@@ -474,7 +516,7 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
         return _make_config(safety_enabled=True, models=models)
 
     fakes = {
-        "query_models_parallel": fake_query_models_parallel,
+        "query_models_resilient": _as_resilient(fake_query_models_parallel),
         "check_response_safety": fake_check_response_safety,
         "stage1_5_normalize_styles": fake_stage1_5_normalize_styles,
         "stage2_collect_rankings": fake_stage2_collect_rankings,
@@ -620,7 +662,7 @@ def test_single_model_branch_degraded_mode_and_untouched_stage1_5_stage2_usage(m
     def fail_agg(*a, **k):
         raise AssertionError("calculate_aggregate_rankings must be skipped in the single-model branch")
 
-    _patch(monkeypatch, "query_models_parallel", fake_query_models_parallel)
+    _patch(monkeypatch, "query_models_resilient", _as_resilient(fake_query_models_parallel))
     _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
     _patch(monkeypatch, "get_config", lambda: _make_config(safety_enabled=False, models=models))
     _patch(monkeypatch, "should_include_quality_metrics", lambda: False)
@@ -690,7 +732,7 @@ def test_single_model_branch_still_computes_quality_metrics_when_enabled(monkeyp
         quality_calls.append(kwargs)
         return _real_quality_metrics(0.9)
 
-    _patch(monkeypatch, "query_models_parallel", fake_query_models_parallel)
+    _patch(monkeypatch, "query_models_resilient", _as_resilient(fake_query_models_parallel))
     _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
     _patch(monkeypatch, "get_config", lambda: _make_config(safety_enabled=False, models=models))
     _patch(monkeypatch, "should_include_quality_metrics", lambda: True)
@@ -724,7 +766,7 @@ def test_zero_responses_error_tuple_has_exact_response_text(monkeypatch):
     async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
         return {m: None for m in models_arg}
 
-    _patch(monkeypatch, "query_models_parallel", fake_query_models_parallel)
+    _patch(monkeypatch, "query_models_resilient", _as_resilient(fake_query_models_parallel))
     _patch(monkeypatch, "get_config", lambda: _make_config(safety_enabled=False, models=models))
 
     _, _, stage3_result, _ = asyncio.run(ca.run_council_with_timeouts("q"))
@@ -758,7 +800,7 @@ def test_zero_responses_metadata_usage_is_fully_zeroed_across_all_four_stages(mo
     async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
         return {m: None for m in models_arg}
 
-    _patch(monkeypatch, "query_models_parallel", fake_query_models_parallel)
+    _patch(monkeypatch, "query_models_resilient", _as_resilient(fake_query_models_parallel))
     _patch(monkeypatch, "get_config", lambda: _make_config(safety_enabled=False, models=models))
 
     _, _, _, metadata = asyncio.run(ca.run_council_with_timeouts("q"))

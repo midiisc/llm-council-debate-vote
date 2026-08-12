@@ -10,6 +10,7 @@ dependencies = [
 [project.scripts]
 scorecard = "scripts.scorecard:main"
 llm-council-pipeline = "scripts.pipeline_runner:main"
+llm-council-debate = "scripts.debate:main"
 
 [dependency-groups]
 dev = [

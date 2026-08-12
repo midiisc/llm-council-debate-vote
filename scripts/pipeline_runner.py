@@ -242,6 +242,16 @@ async def run_pipeline(
                 "this is not multi-agent debate"
             )
 
+        for sub in metadata.get("substitutions") or []:
+            debug_log.append(
+                f"NOTE: {sub['slot_model']} was unreachable this session, "
+                f"substituted with backup {sub['backup_model']} ({sub['reason']})"
+            )
+
+        shortfall_warning = metadata.get("shortfall_warning")
+        if shortfall_warning:
+            debug_log.append(f"WARNING: {shortfall_warning}")
+
         css = metadata["quality_metrics"]["core"]["consensus_strength"]
         aggregate_rankings = metadata["aggregate_rankings"]
         label_to_model = metadata["label_to_model"]

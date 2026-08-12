@@ -42,7 +42,11 @@ timeout-aware `council_fn` + wall-clock ceiling".
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
 
 from llm_council.council import _get_council_models
 from llm_council.council_rankings import calculate_aggregate_rankings
@@ -52,12 +56,70 @@ from llm_council.council_stages import (
     stage3_synthesize_final,
 )
 from llm_council.council_usage import _add_cost_to_usage, _build_usage_summary
-from llm_council.gateway_adapter import query_models_parallel
+from llm_council.gateway_adapter import query_model_with_status
 from llm_council.observability.usage_metrics import emit_usage_metrics
 from llm_council.quality.integration import calculate_quality_metrics, should_include_quality_metrics
 from llm_council.safety_gate import check_response_safety
-from llm_council.unified_config import get_config
+from llm_council.unified_config import _find_config_file, get_config
 from llm_council.verdict import VerdictType
+
+from scripts.resilient_query import RetryPolicy, query_models_resilient
+
+
+@dataclass
+class DebateResilienceConfig:
+    backup_models: List[str]
+    retry_policy: RetryPolicy
+    minimum_council_size: int
+
+
+def _load_debate_resilience_config(config_path: Optional[Path] = None) -> DebateResilienceConfig:
+    """Read the `debate_resilience:` block from `llm_council.yaml` (or an
+    explicit override path, for hermetic tests). Never raises - a project
+    that hasn't added this block yet (or has no config file at all) simply
+    gets today's behavior plus retries, via safe defaults.
+
+    Deliberately bypasses `get_config()`/`UnifiedConfig` - see the
+    config-placement rule in docs/upstream-deltas.md - and locates the file
+    the same way `llm_council.unified_config._find_config_file()` does
+    (env var -> ./llm_council.yaml -> ~/.config/llm-council/llm_council.yaml)
+    when no explicit `config_path` is given.
+    """
+    defaults = DebateResilienceConfig(
+        backup_models=[],
+        retry_policy=RetryPolicy(),
+        minimum_council_size=4,
+    )
+
+    path = config_path if config_path is not None else _find_config_file()
+    if path is None:
+        return defaults
+
+    try:
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f) or {}
+    except OSError:
+        return defaults
+
+    block = raw.get("debate_resilience") if isinstance(raw, dict) else None
+    if not isinstance(block, dict):
+        return defaults
+
+    retry_block = block.get("retry") or {}
+    retry_kwargs: Dict[str, Any] = {}
+    if "max_attempts" in retry_block:
+        retry_kwargs["max_attempts"] = retry_block["max_attempts"]
+    if "backoff_seconds" in retry_block:
+        retry_kwargs["backoff_seconds"] = tuple(retry_block["backoff_seconds"])
+    if "retryable_statuses" in retry_block:
+        retry_kwargs["retryable_statuses"] = frozenset(retry_block["retryable_statuses"])
+    retry_policy = RetryPolicy(**retry_kwargs)
+
+    return DebateResilienceConfig(
+        backup_models=list(block.get("backup_models", [])),
+        retry_policy=retry_policy,
+        minimum_council_size=block.get("minimum_council_size", 4),
+    )
 
 
 async def run_council_with_timeouts(
@@ -79,19 +141,30 @@ async def run_council_with_timeouts(
     }
 
     # Stage 1: bypasses stage1_collect_responses (no timeout override there)
-    # and calls query_models_parallel directly, reproducing its aggregation.
+    # and calls query_models_resilient directly (retry-with-backoff +
+    # backup-model substitution, docs/specs/debate-resilience-contract.md),
+    # reproducing query_models_parallel's aggregation on top of its result.
     messages = [{"role": "user", "content": user_query}]
-    responses = await query_models_parallel(_get_council_models(), messages, timeout=stage1_timeout)
+    resilience_config = _load_debate_resilience_config()
+    resilient_result = await query_models_resilient(
+        primary_models=_get_council_models(),
+        backup_models=resilience_config.backup_models,
+        messages=messages,
+        timeout=stage1_timeout,
+        query_fn=query_model_with_status,
+        retry_policy=resilience_config.retry_policy,
+        minimum_council_size=resilience_config.minimum_council_size,
+    )
+    responses = resilient_result.responses
 
     stage1_results: List[Dict[str, Any]] = []
     for model, response in responses.items():
-        if response is not None:
-            stage1_results.append({"model": model, "response": response.get("content", "")})
-            usage = response.get("usage", {})
-            total_usage["stage1"]["prompt_tokens"] += usage.get("prompt_tokens", 0)
-            total_usage["stage1"]["completion_tokens"] += usage.get("completion_tokens", 0)
-            total_usage["stage1"]["total_tokens"] += usage.get("total_tokens", 0)
-            _add_cost_to_usage(total_usage["stage1"], usage, model=model)
+        stage1_results.append({"model": model, "response": response.get("content", "")})
+        usage = response.get("usage", {})
+        total_usage["stage1"]["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        total_usage["stage1"]["completion_tokens"] += usage.get("completion_tokens", 0)
+        total_usage["stage1"]["total_tokens"] += usage.get("total_tokens", 0)
+        _add_cost_to_usage(total_usage["stage1"], usage, model=model)
 
     num_responses = len(stage1_results)
 
@@ -152,7 +225,7 @@ async def run_council_with_timeouts(
         user_query,
         stage1_results,
         stage2_results,
-        aggregate_rankings,
+        aggregate_rankings=aggregate_rankings,
         verdict_type=VerdictType.SYNTHESIS,
         timeout=stage3_timeout,
     )
@@ -168,6 +241,10 @@ async def run_council_with_timeouts(
     }
     if degraded_mode:
         metadata["degraded_mode"] = degraded_mode
+    if resilient_result.substitutions:
+        metadata["substitutions"] = [asdict(s) for s in resilient_result.substitutions]
+    if resilient_result.shortfall_warning is not None:
+        metadata["shortfall_warning"] = resilient_result.shortfall_warning
 
     if should_include_quality_metrics() and len(stage1_results) > 0:
         stage1_dict = {r["model"]: {"content": r.get("response", "")} for r in stage1_results}

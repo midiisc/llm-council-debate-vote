@@ -61,6 +61,91 @@ Recorded in `docs/upstream-deltas.md`.
 - **If GLM-5.2 doesn't clear the bar:** drop back to the 3-model core. Do not
   reflexively backfill with a different 4th model (user's explicit
   instruction — a proven 3 beats a padded, unproven 4).
+  **Superseded 2026-08-12, see below** — this line governed replacing the
+  4th *permanent seat*; it does not apply to the new backup pool, which
+  exists purely to cover a transient session-level dropout, not to
+  reconsider who holds a seat.
+
+### Superseding decision (2026-08-12): 3-model backup pool added
+
+Prompted by a reported live incident where a debate ran with only 3 of 4
+models because one dropped on timeout with no retry (root-caused in
+`docs/upstream-deltas.md`, "Debate resilience" entry — the dropped model
+was never actually a configured seat, it was package-default leakage from
+an already-fixed config bug, but the underlying "no retry, no backup, silent
+drop" gap was real and is fixed by this decision).
+
+**User explicitly reversed the no-backfill line above** (asked directly,
+confirmed 2026-08-12): the 3 permanent core + 1 gated-experimental seats are
+unchanged, but a session that can't reach 4 live models from those 4 alone
+now gets backup candidates to try before giving up a seat, rather than
+silently degrading. Substitution only triggers when a primary seat is
+confirmed **genuinely unreachable** (retries exhausted or a terminal error
+like an auth failure) — never for a merely slow response that would have
+succeeded on retry. If every configured backup is also unreachable, the
+session proceeds degraded rather than hard-failing, but with a loud,
+non-silent shortfall warning (user's explicit choice — silent degradation
+is exactly the failure mode that prompted this change). Full behavioral
+contract: `docs/specs/debate-resilience-contract.md`.
+
+### 4th-seat diversity panel (2026-08-12): GLM-5.2 kept, backup pool re-ranked and expanded to 3
+
+Separately from the resilience fix above, the user asked a harder question:
+of the candidates researched for the backup pool, is GLM-5.2 actually the
+*best* 4th seat on the specific criterion this project cares about —
+maximizing training-corpus/training-methodology diversity against the 3
+Western RLHF-aligned core seats — or would a swap be better, with the
+losers becoming backups? Ran as a grounded 3-lens judge panel (corpus
+diversity, alignment-methodology diversity, practical debate-capability
+fit — deliberately blind to diversity), each lens scoring GLM-5.2, Grok
+4.6, Qwen3.8-Max, and Kimi K3 (Moonshot AI, newly researched for this
+question). Full grounded research, judge rankings, and synthesis reasoning
+recorded in `docs/upstream-deltas.md`, "4th-seat diversity panel" entry —
+summary here.
+
+**Panel finding:** 2 of 3 lenses (both diversity-focused) independently
+ranked **Kimi K3** first — not on nationality, but on alignment
+*methodology*: Kimi's post-training replaces human-preference RLHF almost
+entirely with a self-critique rubric-reward loop and trains 9 separate
+task-expert models merged by distillation, a genuinely different training
+*topology* from the RLHF/RLVR-plus-late-human-preference-stage recipe every
+other candidate (including GLM and Qwen, which cluster closely with each
+other) still uses. Grok ranked *last* on diversity specifically — its own
+model cards describe an RLHF/RLAIF/LLM-judge pipeline built in part on
+Anthropic's own Petri audit tooling, structurally the same paradigm as the
+3 incumbent seats; its differentiation is deployment-time tone/content-policy,
+not training corpus or method. The 3rd lens (practical capability, diversity
+set aside) ranked Kimi *last* — real, honestly-disclosed risk: middling
+general-purpose debate Elo relative to its coding-specific strength, a
+directional (single-source, unconfirmed) hallucination-rate gap, and
+Moonshot's own docs suggesting an agentic-harness-optimized design rather
+than bare-prompt debate use.
+
+**Decision (user, asked directly, not guessed):** **keep GLM-5.2 as the
+primary 4th seat** — the lower-risk, already-verified-quality pick over the
+panel's diversity-maximizing recommendation. The panel's own backup ranking
+is adopted instead of its primary-seat recommendation, expanding the backup
+pool from 2 to 3 (the resilience engine's `backup_models` was always a
+plain ordered list, not hardcoded to 2 — see
+`docs/specs/debate-resilience-contract.md` — so this required no contract
+change, only a config update):
+
+| Backup rank | Model | Lab | Slug | Why this rank |
+|---|---|---|---|---|
+| 1 | Kimi K3 | Moonshot AI | `moonshotai/kimi-k3-20260715` (dated slug — re-verify before ever promoting out of backup) | Most methodologically distinct candidate overall; the panel's top pick for the seat itself |
+| 2 | Qwen3.8-Max | Alibaba | `qwen/qwen3.8-max` | Solid balanced capability, but methodologically redundant with GLM (both RLVR-primary + late human-preference stage) — adds less orthogonal signal as a 2nd backup than a 1st pick would |
+| 3 | Grok 4.6 | xAI | `x-ai/grok-4.6` | Last on the diversity axis this pool exists for; kept as pure-resilience fallback only |
+
+**Not treated as closed:** GLM-5.2 still needs its 20-session ADR-029
+graduation bar; if it doesn't clear it, this panel's finding — that Kimi
+K3 is the strongest diversity-maximizing alternative, not a reflexive
+different-4th-model swap — is the grounded starting point for that
+follow-up decision, not a fresh unguided search.
+
+This does not change §2's seat-composition rules above (GLM-5.2 still needs
+20+ sessions to graduate, still never chairman) — the backup pool is a
+resilience mechanism for a single session's dropout, not a change to who
+holds a permanent or experimental seat.
 
 ## 3. Custom scripts still needing their own spec (Pillar 2/3 — not yet written)
 

@@ -49,6 +49,16 @@ happen until rotation is confirmed.** Code changes and unit/mutation
 testing continue normally — only live OpenRouter spend is paused.
 Update this entry the moment rotation is confirmed.
 
+**2026-08-12: explicit user override — proceeding with a real-money dry
+run despite unrotated key.** Asked the user directly how to handle this
+hold before running the Pillar 6 low-stakes dry run; user chose "proceed
+anyway, accept the risk" rather than rotating first or confirming a prior
+rotation. Key is still the one pasted in plaintext on 2026-08-09, still
+not rotated. This override applies to the one dry run that follows this
+entry, not a blanket lift of the hold — the hold stays in force for any
+future real-money run unless the user overrides again or the key is
+actually rotated.
+
 ## Known limitations (not upstream deltas — this repo's own design tradeoffs)
 
 **2026-08-11: Stage 0.5 grounding is single-source, not corroborated.**
@@ -612,6 +622,192 @@ blind-TDV chains share a file, verify the ACTUAL merged repo state
 not a fact, exactly as true for this session's own tool-orchestrated work
 as it is for `llm-council-core` itself.
 
+## Debate resilience: retry/backup design grounding (2026-08-12)
+
+Prompted by a reported live incident: a debate run that only used 3 of 4
+configured models because one ("deepseek") timed out. Investigation found
+that model was never actually one of this project's configured 4 — it's the
+package's hardcoded default that leaks in only through the `load_config()`
+nesting bug already documented above (Bugs #1/#2), which was fixed
+2026-08-09. The real, still-open gap: neither call path (MCP tool nor
+`pipeline_runner.py`) retries a model before dropping it on timeout, and
+neither has any backup-model substitution. User decision (2026-08-12, asked
+directly): add a 2-model backup pool, superseding the prior "do not
+reflexively backfill" decision recorded in `pipeline-architecture-spec.md`
+§2 — see that file's updated §2 for the new standing decision.
+
+**Status taxonomy grounding (source read, `llm_council/openrouter.py::query_model_with_status`, 2026-08-12, no live calls):**
+
+| status | trigger | our classification |
+|---|---|---|
+| `STATUS_OK` ("ok") | 2xx response | success |
+| `STATUS_TIMEOUT` ("timeout") | `httpx.TimeoutException` / `asyncio.wait_for` elapsed | retryable |
+| `STATUS_RATE_LIMITED` ("rate_limited") | HTTP 429 (carries `retry_after`) | retryable |
+| `STATUS_AUTH_ERROR` ("auth_error") | HTTP 401/403 | **terminal** — retrying an identical request against a bad/inaccessible key can't succeed |
+| `STATUS_ERROR` ("error") | HTTP 400, or any other exception (network error, 5xx via `raise_for_status()`, etc.) | retryable, bounded — the package doesn't split "bad request" from "server hiccup" at this interface, so we spend the same bounded retry budget on both rather than guessing further |
+
+This mirrors `scripts/live_adapters.py::_is_retryable_error`'s existing
+philosophy (retry network/5xx-shaped failures, not 4xx) as closely as the
+taxonomy this call site actually exposes allows.
+
+**Critical implementation constraint**: `query_models_parallel` (used by
+`council_adapter.py` today) discards this taxonomy entirely — on any
+non-OK status it just returns `None` for that model (confirmed by direct
+source read of `gateway_adapter.py`/`openrouter.py`'s
+`_direct_query_models_parallel`). A resilience layer that needs to
+distinguish "worth retrying" from "give up now" must call
+`query_model_with_status` per model directly, not the batch function.
+
+**Backup model research (2026-08-12, live retrieval + user-approved):**
+Candidates researched from labs distinct from the existing 4
+(Anthropic/OpenAI/Google/Zhipu). Live-confirmed via direct
+`https://openrouter.ai/api/v1/models` fetch:
+
+| Model | Lab | Slug | Context | Pricing (prompt/completion per token) |
+|---|---|---|---|---|
+| Grok 4.6 | xAI | `x-ai/grok-4.6` | 500,000 | $0.000002 / $0.000006 |
+| Qwen3.8-Max | Alibaba | `qwen/qwen3.8-max` | 1,000,000 | $0.000002 / $0.000006 |
+
+Qualitative fit backed by web research: Grok leads on pure reasoning
+benchmarks, Qwen3.8-Max competes with frontier closed models on benchmarks
+relevant to critique/debate quality, both at pricing comparable to the
+existing 4. Checked for Mistral as a possible 3rd option — no Mistral
+entries appeared in this OpenRouter pull, so it was not proposed (no live
+confirmation obtained, not a claim that it's absent from OpenRouter
+generally). User approved this pair 2026-08-12.
+Sources: [Best LLM Models 2026 Compared](https://aimlapi.com/blog/top-llm-models-in-2026-the-best-ai-models-for-reasoning-coding-multimodal-tasks), [Qwen 3 vs Mistral 2026](https://www.kunalganglani.com/blog/qwen-3-vs-mistral-2026), live `openrouter.ai/api/v1/models` fetch (2026-08-12).
+
+**Config placement rule (avoids repeating Bugs #1/#3 above):** the new
+`debate_resilience:` block must NOT go inside the outer `council:` wrapper —
+`load_config()` does exactly `UnifiedConfig(**raw_config.get("council",
+{}))`, so anything placed there either gets silently dropped (if inside the
+inner double-nested `council:`, no matching field) or, worse, actually
+*validates* against a real `UnifiedConfig` field by accidental name
+collision. `debate_resilience:` is a **new true-top-level key**, sibling to
+`council:`, deliberately outside anything `load_config()`/`get_config()`
+ever reads — `scripts/resilient_query.py` parses it directly via its own
+`yaml.safe_load()`, never through the package's config object. This is a
+different placement rule than every other entry in this ledger (which are
+all about getting *package-native* keys into the one place the package
+actually reads) — worth being explicit that this key is deliberately
+package-invisible.
+
+**Scope decision**: this fix applies to `pipeline_runner.py`'s call path
+(`council_adapter.py`) and a new `scripts/debate.py` one-shot CLI built on
+the same hardened function, per the user's "both paths" answer. The raw MCP
+`consult_council` tool remains package-native and un-hardened — its
+internals (`run_council_with_fallback`) are not something this repo can
+safely patch without forking the installed package. **Recommendation
+recorded here for future sessions: prefer `scripts/debate.py` over the raw
+`consult_council` MCP tool for any debate where losing a model to a
+transient timeout matters** — the MCP tool is still fine for quick,
+low-stakes questions where best-effort is acceptable.
+
+Contract: `docs/specs/debate-resilience-contract.md`.
+
+## 4th-seat diversity panel (2026-08-12)
+
+Follow-up question from the user, separate from the resilience fix above:
+of GLM-5.2 (incumbent 4th seat), Grok 4.6, Qwen3.8-Max, and Kimi K3
+(Moonshot AI, newly researched here), which actually maximizes
+training-corpus/methodology diversity against the 3 Western RLHF-aligned
+core seats? Ran as a `Workflow` judge panel: 4 parallel research agents
+(one per candidate, live-grounded), 3 independent judges (corpus-diversity
+lens, alignment-methodology-diversity lens, practical-capability lens —
+deliberately diversity-blind), then one synthesis agent. Decision recorded
+in `pipeline-architecture-spec.md`'s "4th-seat diversity panel" section —
+full grounded research and reasoning below.
+
+**Process failure caught before use (Pillar 1 in practice):** the first
+run's Grok 4.6 research agent returned schema-valid but content-worthless
+output — `training_corpus_summary: "test"`, `alignment_methodology: "test"`
+— i.e. it satisfied the JSON schema without doing any real research, and
+nothing in the pipeline flagged it automatically (the synthesis agent
+*did* notice and hedge its recommendation, but that's not a substitute for
+actually re-grounding). Caught by manually inspecting the raw research
+array before trusting any downstream judgment, not by any automated check.
+Fixed by re-running with an explicit anti-placeholder instruction for that
+one candidate (`resumeFromRunId`, so the 3 already-good candidates replayed
+from cache) — the corrected run is what's recorded below. **Lesson:**
+schema validation confirms shape, never content quality — a future
+multi-candidate research fan-out should spot-check for degenerate
+short/generic values before trusting aggregate judge output, the same way
+this project already treats a subagent's self-reported "done" as a claim
+to verify, not a fact (see the "Three contracts implemented" entry's
+process learning above).
+
+**Grounded findings per candidate** (condensed; full text + every source
+URL in the workflow journal, referenced here):
+
+- **GLM-5.2** (Zhipu/Z.ai, China) — RLVR-primary staged pipeline (Reasoning
+  RL → Agentic RL → General RL → cross-stage distillation), human-preference
+  RL folded in only as a late, narrower stage. Explicit avoidance of
+  synthetic data for math/science training. Domestic compute substrate
+  (Huawei Ascend, not NVIDIA). #1 open model on LMArena Text/Code, AA
+  Intelligence Index 50 (first open-weight model to reach it). Real
+  limitation: PRC political-content moderation is measurably
+  persona-gated, not uniform (return.moe finding: scores jump 28-34pts
+  when told "you are Claude"). Sources: arXiv:2508.06471, arXiv:2602.15763,
+  blog.return.moe, huggingface.co/zai-org/GLM-5.2.
+- **Grok 4.6** (xAI, USA) — per its own model cards (Grok 4.1/4.20, no
+  dedicated 4.6 card public), post-training is SFT + RLHF + RLAIF +
+  LLM-judge grading + automated alignment audits built in part on
+  Anthropic's own Petri 2.0 tool — structurally the same paradigm as the
+  incumbent 3 seats, not a different one. Stanford finding: measured
+  political lean sits closer to OpenAI's than Grok's stated philosophy
+  implies. Disclosed reliability caveat relevant to a critique-seat role:
+  MASK dishonesty rate 0.27-0.49, sycophancy 0.35-0.38 across two
+  generations. Live-confirmed: `x-ai/grok-4.6`, 500K context,
+  $0.000002/$0.000006 per token. Sources: data.x.ai model cards
+  (2025-11-17, 2026-04-07), press.farm political-lean analysis.
+- **Qwen3.8-Max** (Alibaba, China) — RLVR-primary, same structural family
+  as GLM (both fold human-preference RL in late). Broadest nominal
+  multilingual footprint (119 languages claimed, mix undisclosed), GPQA
+  Diamond 92.6. Real limitation: Stanford FMTI (Dec 2025) found zero
+  quantified safety evaluations published for the flagship — least
+  transparent of the 4 candidates. Live-confirmed: `qwen/qwen3.8-max`, 1M
+  context, $0.000002/$0.000006 per token. Sources:
+  marktechpost.com/2026/08/03, crfm.stanford.edu FMTI report,
+  qwenlm.github.io/blog/qwen3.
+- **Kimi K3** (Moonshot AI, China) — the methodological outlier: replaces
+  human-preference RLHF almost entirely with a self-critique rubric-reward
+  loop (model pairwise-judges its own rollouts against rubrics, closed-loop
+  with RLVR), trains 9 separate task-expert models merged via Multi-Teacher
+  On-Policy Distillation rather than one monolithic RLHF-tuned policy — a
+  different training *topology*, not just a different reward source. GPQA
+  Diamond ~94% (thinking budget). Real limitations: middling general-purpose
+  LMArena Elo (~1,486) vs. its #1 Frontend-Code-Arena result (1,679),
+  suggesting more code/structured-task strength than open-ended-debate
+  strength; a directional, single-source hallucination-rate figure
+  (~49% non-hallucination vs. Opus's ~64%) not confirmed by a primary
+  source; own docs suggest agentic-harness-optimized design. Live-verified
+  slug: `moonshotai/kimi-k3-20260715` (dated — same drift risk class as the
+  GLM slug that already went dead once, see "GLM-5.2 slug drift" entry
+  above; re-verify before ever promoting this out of the backup pool).
+  Sources: arXiv:2507.20534 (K2-lineage technical report, methodology
+  stable across the line), kili-technology.com benchmarks/hallucinations
+  analysis, hrichina (Human Rights in China) CCP-topic documentation.
+
+**Judge panel result:** corpus-diversity and alignment-methodology-diversity
+lenses both independently ranked Kimi K3 first, GLM-5.2 second, Qwen3.8-Max
+third, Grok 4.6 last. The practical-capability lens (diversity deliberately
+set aside) ranked GLM-5.2 first, Qwen3.8-Max second, Grok 4.6 third, Kimi K3
+last. Synthesis recommended Kimi K3 as primary seat with GLM-5.2 as
+strongest backup, reasoning that diversity is the harder property to
+recover later while capability risk is exactly what this project's ADR-029
+audition tracking exists to verify cheaply with live data.
+
+**User decision (2026-08-12, asked directly):** keep GLM-5.2 as the primary
+4th seat — lower risk over the panel's diversity-maximizing pick. Adopted
+the panel's backup ranking instead: `debate_resilience.backup_models` in
+`llm_council.yaml` is now `[moonshotai/kimi-k3-20260715, qwen/qwen3.8-max,
+x-ai/grok-4.6]`, replacing the prior 2-entry `[x-ai/grok-4.6,
+qwen/qwen3.8-max]` list. No contract change needed — `backup_models` was
+always a plain ordered list (`docs/specs/debate-resilience-contract.md`),
+not hardcoded to 2 entries.
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.
+- 2026-08-12 — debate-resilience grounding pass: STATUS_* taxonomy (source read), backup model research (live OpenRouter catalog fetch), config placement rule. See "Debate resilience" entry above.
+- 2026-08-12 — 4th-seat diversity panel: grounded GLM-5.2/Grok/Qwen/Kimi on training-corpus + alignment-methodology diversity via a 3-lens judge panel; caught and fixed one research agent's placeholder-output failure before trusting the result. See "4th-seat diversity panel" entry above.
