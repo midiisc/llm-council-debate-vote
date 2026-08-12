@@ -202,6 +202,47 @@ Mutation-tested clean: `completeness_check.py` 66/66,
 `pipeline_runner.py` 570/588 (same 18 previously-documented equivalent
 survivors, zero new gaps). Full suite: 215 passed.
 
+## Follow-up research scan (2026-08-11) — nothing actionable found
+
+Narrow, bounded follow-up literature scan (explicitly told not to re-derive
+already-covered findings) surfaced 5 papers from 2026, all verified live
+against their arXiv abstracts before being recorded here:
+
+- **arXiv:2605.29116** "Beyond Consensus: Trace-Level Synthesis in Mixture
+  of Agents" — argues aggregators should always synthesize from full
+  reasoning traces, never gate on consensus. On inspection this does
+  **not** actually indict this pipeline's design: this pipeline's Stage 3
+  chairman synthesis already runs on every call regardless of CSS (it's
+  entirely inside `run_full_council`, unconditional) — only the *extra*
+  correction-triggered revision (Stage 2.75, this project's own addition,
+  grounded separately in Choi/Zhu/Li) is CSS-gated, a different
+  mechanism the paper doesn't target. No action.
+- **arXiv:2604.01029** "Revision or Re-Solving? Decomposing Second-Pass
+  Gains" — multi-LLM revision gains are often just a stronger model
+  re-solving, not genuine correction, especially on constrained-answer
+  tasks. Supports (doesn't require changing) this pipeline's existing
+  fact-citation-only, CSS-gated revision design — noted as a caveat on
+  what "revision worked" evidence actually means, no code change.
+- **arXiv:2607.28576** "Sample More, Reflect Less" — self-refine/reflexion
+  self-critique methods are reliably worse than repeated sampling at
+  matched token cost. Relevant caution for *any future* self-critique
+  addition to Stage 3 synthesis — doesn't apply to the existing Stage 4
+  completeness check (diagnostic-only, never edits output, not the
+  self-refine pattern the paper tested). No action, logged as a caution.
+- **arXiv:2608.02827** "Emergence of Biased Consensus in Multi-Agent LLM
+  Debates" — debate can amplify bias into false consensus under a
+  temperature-driven phase transition; agent heterogeneity suppresses it.
+  Validates (doesn't require changing) this pipeline's existing
+  4-heterogeneous-model design. No action.
+- **arXiv:2604.12196** "Beyond Majority Voting: Radial Consensus Score" —
+  an embedding-space alternative to majority-vote CSS. No evidence the
+  current CSS is failing in this pipeline; logged as a candidate only if
+  CSS-gaming is ever actually observed. No action.
+
+No paper found that meaningfully contradicts Choi/Zhu/Li or the
+Deliberative Illusion paper's conclusions. Verdict: nothing from this
+scan clears the bar for implementation.
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.
