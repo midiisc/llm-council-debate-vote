@@ -198,8 +198,20 @@ def _patch(monkeypatch, host_modules, name, fake):
 
 def _make_config(safety_enabled: bool, models: list):
     return SimpleNamespace(
-        evaluation=SimpleNamespace(safety=SimpleNamespace(enabled=safety_enabled)),
-        council=SimpleNamespace(models=models),
+        evaluation=SimpleNamespace(
+            safety=SimpleNamespace(enabled=safety_enabled),
+            rubric=SimpleNamespace(
+                enabled=True,
+                weights={
+                    "accuracy": 0.3,
+                    "relevance": 0.25,
+                    "completeness": 0.2,
+                    "conciseness": 0.15,
+                    "clarity": 0.1,
+                },
+            ),
+        ),
+        council=SimpleNamespace(models=models, chairman="fake-chairman-model"),
     )
 
 
@@ -214,6 +226,11 @@ def _install_normal_flow_fakes(monkeypatch, models, captured_stage3=None):
 
     _patch(monkeypatch, [_council_module], "_get_council_models", lambda: list(models))
     _patch(monkeypatch, [_council_module], "get_config", lambda: _make_config(False, models))
+    # `_build_stage2_real_ranking_prompt` (docs/specs/stage2-3-debate-
+    # resilience-contract.md, Contract A) faithfully reproduces the real
+    # package's position-bias shuffle - no-op'd here for deterministic
+    # ordering, matching the same allowance already documented above.
+    monkeypatch.setattr(ca.random, "shuffle", lambda seq: None, raising=False)
 
     async def fake_stage1_5_normalize_styles(stage1_results):
         return stage1_results, {}
@@ -266,6 +283,15 @@ def _ok_response(model: str) -> dict:
     return {"status": "ok", "content": f"answer-from-{model} [unverified]", "usage": {}}
 
 
+def _is_stage2_call(messages) -> bool:
+    """Stage 2's real rubric ranking prompt (docs/specs/stage2-3-debate-
+    resilience-contract.md, Contract A) always contains this marker; Stage
+    1's build_stage1_prompt never does. Stage 2 now reuses the same
+    query_models_resilient engine these Stage-1-focused fakes patch, so a
+    fake capturing "the" call must distinguish which stage it's seeing."""
+    return "<responses_to_evaluate>" in messages[0]["content"]
+
+
 def test_c1_ac4_stage1_messages_built_from_build_stage1_prompt(monkeypatch):
     models = ["model-a", "model-b", "model-c"]
     _install_normal_flow_fakes(monkeypatch, models)
@@ -273,7 +299,8 @@ def test_c1_ac4_stage1_messages_built_from_build_stage1_prompt(monkeypatch):
     captured = {}
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
-        captured["messages"] = messages
+        if not _is_stage2_call(messages):
+            captured["messages"] = messages
         return ca_resilient_query_module.ResilientQueryResult(
             responses={m: _ok_response(m) for m in primary_models},
             attempts=[ca_resilient_query_module.ModelAttempt(model=m, attempt_number=1, status="ok") for m in primary_models],
@@ -424,7 +451,8 @@ def test_c3_ac3_verified_facts_play_no_role_in_stage1_messages(monkeypatch):
     captured_messages = {}
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
-        captured_messages["messages"] = messages
+        if not _is_stage2_call(messages):
+            captured_messages["messages"] = messages
         return ca_resilient_query_module.ResilientQueryResult(
             responses={m: _ok_response(m) for m in primary_models},
             attempts=[ca_resilient_query_module.ModelAttempt(model=m, attempt_number=1, status="ok") for m in primary_models],

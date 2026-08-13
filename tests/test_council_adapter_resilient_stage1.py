@@ -111,8 +111,20 @@ def _patch(monkeypatch, host_modules, name, fake):
 
 def _make_config(safety_enabled: bool, models: list):
     return SimpleNamespace(
-        evaluation=SimpleNamespace(safety=SimpleNamespace(enabled=safety_enabled)),
-        council=SimpleNamespace(models=models),
+        evaluation=SimpleNamespace(
+            safety=SimpleNamespace(enabled=safety_enabled),
+            rubric=SimpleNamespace(
+                enabled=True,
+                weights={
+                    "accuracy": 0.3,
+                    "relevance": 0.25,
+                    "completeness": 0.2,
+                    "conciseness": 0.15,
+                    "clarity": 0.1,
+                },
+            ),
+        ),
+        council=SimpleNamespace(models=models, chairman="fake-chairman-model"),
     )
 
 
@@ -135,6 +147,14 @@ def _install_normal_flow_fakes(monkeypatch, models, resilience_config=None):
     """
     _patch(monkeypatch, [_council_module], "_get_council_models", lambda: list(models))
     _patch(monkeypatch, [_council_module], "get_config", lambda: _make_config(False, models))
+    # `_build_stage2_real_ranking_prompt` (docs/specs/stage2-3-debate-
+    # resilience-contract.md, Contract A) faithfully reproduces the real
+    # package's position-bias-mitigating shuffle - deterministic ordering
+    # was never a real contract of Stage 2, but several of these AC17-23
+    # tests assert on exact stage2/aggregate_rankings order as a fixture
+    # convenience. No-op it here so that convenience keeps working without
+    # weakening what's actually being tested.
+    monkeypatch.setattr(ca.random, "shuffle", lambda seq: None, raising=False)
 
     async def fake_stage1_5_normalize_styles(stage1_results):
         return stage1_results, {}
@@ -175,6 +195,16 @@ def _install_normal_flow_fakes(monkeypatch, models, resilience_config=None):
 
 def _ok_response(model: str) -> dict:
     return {"status": "ok", "content": f"answer-from-{model}", "usage": {}}
+
+
+def _is_stage2_call(messages) -> bool:
+    """Stage 2's real (rubric-aware) ranking prompt (docs/specs/stage2-3-
+    debate-resilience-contract.md, Contract A) always contains this marker;
+    Stage 1's `build_stage1_prompt` never does. Needed because Stage 2 now
+    reuses the same `query_models_resilient` engine these AC17-23 fakes
+    patch, so a fake written only to model Stage 1 must not also swallow
+    Stage 2's independent call in the same debate."""
+    return "<responses_to_evaluate>" in messages[0]["content"]
 
 
 def _run(coro):
@@ -342,6 +372,14 @@ def test_ac20_substitutions_surfaced_as_plain_dicts_in_order(monkeypatch):
     ]
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
+        if _is_stage2_call(messages):
+            return ResilientQueryResult(
+                responses={m: _ok_response(m) for m in primary_models},
+                attempts=[],
+                substitutions=[],
+                unreachable_models=[],
+                shortfall_warning=None,
+            )
         winners = ["backup-1", "backup-2", "model-c", "model-d"]
         return ResilientQueryResult(
             responses={w: _ok_response(w) for w in winners},
@@ -397,6 +435,14 @@ def test_ac21_shortfall_warning_present_when_not_none(monkeypatch):
     warning_text = "Only 3 of the required minimum 4 council models responded; unreachable: model-d"
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
+        if _is_stage2_call(messages):
+            return ResilientQueryResult(
+                responses={m: _ok_response(m) for m in primary_models},
+                attempts=[],
+                substitutions=[],
+                unreachable_models=[],
+                shortfall_warning=None,
+            )
         return ResilientQueryResult(
             responses={m: _ok_response(m) for m in primary_models},
             attempts=[],
@@ -444,6 +490,14 @@ def test_property_metadata_mirrors_resilient_result_substitutions_and_shortfall(
     ]
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
+        if _is_stage2_call(messages):
+            return ResilientQueryResult(
+                responses={m: _ok_response(m) for m in primary_models},
+                attempts=[],
+                substitutions=[],
+                unreachable_models=[],
+                shortfall_warning=None,
+            )
         return ResilientQueryResult(
             responses={m: _ok_response(m) for m in primary_models},
             attempts=[],
@@ -496,10 +550,14 @@ def test_ac23_happy_path_calls_query_fn_exactly_once_per_primary_no_backups(monk
     )
     monkeypatch.setattr(ca, "query_models_resilient", real_query_models_resilient, raising=False)
 
-    calls = []
+    stage1_calls = []
+    stage2_calls = []
 
     async def fake_query_model_with_status(model, messages, timeout, *a, **kw):
-        calls.append(model)
+        if _is_stage2_call(messages):
+            stage2_calls.append(model)
+        else:
+            stage1_calls.append(model)
         return {"status": "ok", "content": f"answer-from-{model}", "usage": {}}
 
     _patch(
@@ -511,9 +569,16 @@ def test_ac23_happy_path_calls_query_fn_exactly_once_per_primary_no_backups(monk
 
     stage1_results, _, _, metadata = _run(ca.run_council_with_timeouts("some query"))
 
-    assert sorted(calls) == sorted(models)
-    assert len(calls) == len(models)
-    assert "unused-backup" not in calls
+    # AC23 is a Stage 1 contract - Stage 2 now legitimately reuses the same
+    # real query_models_resilient engine (docs/specs/stage2-3-debate-
+    # resilience-contract.md, Contract A) and makes its own independent
+    # once-per-reviewer call set, asserted separately so it can't mask a
+    # Stage 1 regression by coincidentally matching call counts.
+    assert sorted(stage1_calls) == sorted(models)
+    assert len(stage1_calls) == len(models)
+    assert "unused-backup" not in stage1_calls
+    assert sorted(stage2_calls) == sorted(models)
+    assert "unused-backup" not in stage2_calls
     assert "substitutions" not in metadata
     assert "shortfall_warning" not in metadata
     assert {r["model"] for r in stage1_results} == set(models)
@@ -561,6 +626,14 @@ def test_stage1_results_content_and_usage_accumulation_are_correct(monkeypatch):
     responses["model-d"] = {"status": "ok"}  # no "content", no "usage" key at all
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
+        if _is_stage2_call(messages):
+            return ResilientQueryResult(
+                responses={m: _ok_response(m) for m in primary_models},
+                attempts=[],
+                substitutions=[],
+                unreachable_models=[],
+                shortfall_warning=None,
+            )
         return ResilientQueryResult(
             responses={m: responses[m] for m in primary_models},
             attempts=[],
@@ -599,7 +672,15 @@ def test_stage1_results_content_and_usage_accumulation_are_correct(monkeypatch):
     assert stage1_usage["completion_tokens"] == sum(u["completion_tokens"] for u in usage_by_model.values())
     assert stage1_usage["total_tokens"] == sum(u["total_tokens"] for u in usage_by_model.values())
 
-    assert sorted(cost_calls) == sorted(models)
+    # `_add_cost_to_usage` is now invoked once per Stage 1 draft AND once
+    # per Stage 2 reviewer (docs/specs/stage2-3-debate-resilience-
+    # contract.md, Contract A - Stage 2 now does its own real cost
+    # accounting too, same models list) - exactly twice per model, not
+    # zero/once/thrice, keeps this AC's "no double-counting, no dropped
+    # accounting" intent while reflecting the real two-stage call shape.
+    assert sorted(cost_calls) == sorted(models + models)
+    for m in models:
+        assert cost_calls.count(m) == 2
 
 
 def test_query_models_resilient_receives_correct_messages_and_timeout(monkeypatch):
@@ -609,8 +690,9 @@ def test_query_models_resilient_receives_correct_messages_and_timeout(monkeypatc
     captured = {}
 
     async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
-        captured["messages"] = messages
-        captured["timeout"] = timeout
+        if not _is_stage2_call(messages):
+            captured["messages"] = messages
+            captured["timeout"] = timeout
         return ResilientQueryResult(
             responses={m: _ok_response(m) for m in primary_models},
             attempts=[],

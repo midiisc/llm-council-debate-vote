@@ -48,8 +48,20 @@ def _install_minimal_fakes(monkeypatch, models, resilient_query_spy):
         monkeypatch,
         "get_config",
         lambda: SimpleNamespace(
-            evaluation=SimpleNamespace(safety=SimpleNamespace(enabled=False)),
-            council=SimpleNamespace(models=list(models)),
+            evaluation=SimpleNamespace(
+                safety=SimpleNamespace(enabled=False),
+                rubric=SimpleNamespace(
+                    enabled=True,
+                    weights={
+                        "accuracy": 0.3,
+                        "relevance": 0.25,
+                        "completeness": 0.2,
+                        "conciseness": 0.15,
+                        "clarity": 0.1,
+                    },
+                ),
+            ),
+            council=SimpleNamespace(models=list(models), chairman="fake-chairman-model"),
         ),
     )
     monkeypatch.setattr(ca, "query_models_resilient", resilient_query_spy)
