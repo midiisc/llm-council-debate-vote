@@ -34,6 +34,34 @@ def test_council_models_and_high_tier_pool_are_in_sync():
     )
 
 
+def test_council_models_and_reasoning_tier_pool_are_in_sync():
+    # The 'high' check above does NOT cover this - tiers.default is
+    # "reasoning" (see llm_council.yaml's own comment on why: same allowed
+    # models as "high", larger timeout/token budget), so a real
+    # consult_council() call resolves ITS model list via
+    # tiers.pools["reasoning"], not tiers.pools["high"]. Confirmed
+    # architecture-stress-test-2026-08-13.md finding: this file's own
+    # docstring says it exists to catch exactly this drift class, but only
+    # asserted against the tier that isn't actually used in production.
+    config = _load_real_config()
+    council_models = config.council.models
+    reasoning_tier_models = config.tiers.pools["reasoning"].models
+    assert council_models == reasoning_tier_models, (
+        "council.models and tiers.pools.reasoning.models have drifted apart - "
+        "tiers.default is 'reasoning', so THIS is the pool a real "
+        "consult_council() call actually resolves against. "
+        "See docs/upstream-deltas.md."
+    )
+
+
+def test_tiers_default_is_reasoning():
+    # Pins the assumption both sync tests above depend on - if this ever
+    # changes, the "which tier is actually live" reasoning in this file's
+    # module docstring and in docs/upstream-deltas.md needs re-checking too.
+    config = _load_real_config()
+    assert config.tiers.default == "reasoning"
+
+
 def test_chairman_is_a_council_member():
     config = _load_real_config()
     assert config.council.chairman in config.council.models

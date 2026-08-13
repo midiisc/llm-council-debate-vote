@@ -25,7 +25,7 @@ $MARKER
 # client's default 60s tool-call timeout (llm-council-core's own per-tier
 # deadline_ms is 180000-600000ms — see docs/upstream-deltas.md, "Timeout
 # architecture fix"). Only raises the value if nothing stronger is already set.
-export MCP_TIMEOUT="\${MCP_TIMEOUT:-60000}"
+export MCP_TIMEOUT="\${MCP_TIMEOUT:-900000}"
 export MCP_TOOL_TIMEOUT="\${MCP_TOOL_TIMEOUT:-900000}"
 $END_MARKER
 EOF
