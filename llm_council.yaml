@@ -125,14 +125,19 @@ council:
 # here is deliberate, not incidental.
 debate_resilience:
   backup_models:
-    - moonshotai/kimi-k3-20260715  # Moonshot AI - panel's diversity-optimized
+    - moonshotai/kimi-k3           # Moonshot AI - panel's diversity-optimized
                                      # top pick (self-critique-reward alignment,
                                      # not RLHF - most methodologically distinct
-                                     # of all 4 candidates). DATED SLUG - same
-                                     # risk class as the z-ai/glm-5.2-20260616
-                                     # slug that went dead 2026-08-12; re-verify
-                                     # against live OpenRouter before this is
-                                     # ever promoted out of the backup pool.
+                                     # of all 4 candidates). 2026-08-13: the
+                                     # dated slug moonshotai/kimi-k3-20260715
+                                     # pinned here since 2026-08-12 went DEAD on
+                                     # live OpenRouter (confirmed via direct
+                                     # /api/v1/models fetch) - same drift pattern
+                                     # already seen with z-ai/glm-5.2-20260616.
+                                     # Undated moonshotai/kimi-k3 is the live
+                                     # replacement, same 1,048,576 context. See
+                                     # upstream-deltas.md, "Kimi K3 slug drift"
+                                     # entry, for the full grounding.
     - qwen/qwen3.8-max               # Alibaba - live-confirmed 2026-08-12, 1M
                                        # context. Methodologically redundant
                                        # with GLM (both RLVR-primary + late
