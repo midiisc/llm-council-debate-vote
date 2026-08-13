@@ -90,14 +90,35 @@ _STAGE1_REFERENCE_INSTRUCTION_BLOCK = (
     "unverified claim unlabeled to make it look grounded."
 )
 
+# docs/specs/human-debate-characteristics-contract.md, Contract 4. Never
+# varies by model, same reasoning as the reference-instruction block above.
+# Also closes a real, previously-decided-but-never-wired gap: an earlier
+# session decision (docs/agent-model-reasoning-config.md section 5) adopted
+# asking Stage 1 to weigh counterfactuals/weaknesses in its own reasoning,
+# but that instruction was never actually added to build_stage1_prompt -
+# folded in here rather than left undelivered a second time.
+_STAGE1_COLLABORATIVE_FRAMING_BLOCK = (
+    "\n\n---\n"
+    "Other models are independently drafting answers to this same "
+    "question, without seeing each other's work. The goal of this "
+    "exercise is to converge on the best-supported shared answer, not to "
+    "win an argument against them - as you form your answer, weigh "
+    "counterfactuals and potential weaknesses in your own reasoning, and "
+    "note where a well-informed peer might reasonably disagree, while "
+    "staying concise."
+)
+
 
 def build_stage1_prompt(user_query: str) -> str:
-    """Appends a uniform reference-reporting instruction to user_query.
-    Never varies by model. General/background-knowledge claims may be
-    noted but must be labeled unverified - never presented as a citable
-    reference (fabrication risk: model confidence is uncorrelated with
-    citation correctness, arXiv:2607.11127)."""
-    return f"{user_query}{_STAGE1_REFERENCE_INSTRUCTION_BLOCK}"
+    """Appends uniform reference-reporting and collaborative-framing
+    instructions to user_query. Never varies by model. General/background-
+    knowledge claims may be noted but must be labeled unverified - never
+    presented as a citable reference (fabrication risk: model confidence is
+    uncorrelated with citation correctness, arXiv:2607.11127)."""
+    return (
+        f"{user_query}{_STAGE1_REFERENCE_INSTRUCTION_BLOCK}"
+        f"{_STAGE1_COLLABORATIVE_FRAMING_BLOCK}"
+    )
 
 
 @dataclass

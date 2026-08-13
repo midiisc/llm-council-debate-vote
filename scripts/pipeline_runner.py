@@ -132,15 +132,18 @@ def _write_run_status(output_dir: Path, status: str, **extra) -> None:
     tmp_path.rename(final_path)
 
 
+def _label_for_model(model: str, label_to_model: dict) -> Optional[str]:
+    for label, entry in label_to_model.items():
+        if entry["model"] == model:
+            return label
+    return None
+
+
 def _rubric_scores_for_model(
     model: str, stage2_results: list[dict], label_to_model: dict
 ) -> dict[str, list[float]]:
     """All reviewers' per-dimension scores for `model`'s response."""
-    label_for_model = None
-    for label, entry in label_to_model.items():
-        if entry["model"] == model:
-            label_for_model = label
-            break
+    label_for_model = _label_for_model(model, label_to_model)
     if label_for_model is None:
         return {}
 
@@ -154,6 +157,37 @@ def _rubric_scores_for_model(
             if dim in scores:
                 per_dim[dim].append(scores[dim])
     return per_dim
+
+
+def _rubric_notes_for_model(
+    model: str, stage2_results: list[dict], label_to_model: dict
+) -> list[str]:
+    """docs/specs/human-debate-characteristics-contract.md, Contract 1.
+
+    Each reviewer's free-text "notes" justification for `model`'s response,
+    in stage2_results order - real critique CONTENT, distinct from
+    _rubric_scores_for_model's numeric-only summary. Upstream's rubric-
+    scoring prompt (llm_council.council_stages.stage2_collect_rankings,
+    confirmed by direct source read) asks each reviewer for a
+    "notes": "<brief justification>" string alongside the five numeric
+    dimensions - this was previously read nowhere in this repo, so a real
+    reviewer's actual reasoning never reached the model doing Stage 2.75
+    revision, only the numbers did.
+    """
+    label_for_model = _label_for_model(model, label_to_model)
+    if label_for_model is None:
+        return []
+
+    notes: list[str] = []
+    for reviewer_entry in stage2_results:
+        evaluations = reviewer_entry.get("parsed_ranking", {}).get("evaluations", {})
+        scores = evaluations.get(label_for_model)
+        if not scores:
+            continue
+        note = scores.get("notes")
+        if note:
+            notes.append(note)
+    return notes
 
 
 def build_critique_from_rubric(
@@ -177,11 +211,19 @@ def build_critique_from_rubric(
     # is unreachable dead code. Verified by direct execution (mutmut run,
     # 3 survivors on this line, traced by hand).
     n_reviewers = max((len(v) for v in per_dim.values() if v), default=0)
-    return (
+    summary = (
         f"Reviewers scored your response ({n_reviewers} reviewer(s)) — "
         + ", ".join(parts)
         + f". Weakest dimension: {weakest_dim} ({averages[weakest_dim]:.1f})."
     )
+
+    notes = _rubric_notes_for_model(model, stage2_results, label_to_model)
+    if notes:
+        # No forced trailing period - reviewer notes are free text and may
+        # already end with their own punctuation (a forced "." would double
+        # up, e.g. "...inputs..").
+        summary += " Reviewer notes: " + " | ".join(notes)
+    return summary
 
 
 def extract_rubric_scores_for_scorecard(

@@ -140,22 +140,58 @@ def build_revision_prompt(
     facts_section = _build_facts_section(verified_facts)
     document_section = _build_document_section(source_document, max_document_tokens)
 
+    # docs/specs/quantitative-evidence-weighting-contract.md, Contract 2:
+    # the added sentence only ever applies to verified_facts that already
+    # passed Stage 0.5's own retrieval + reachability gate - never a
+    # blanket "numbers beat words" instruction over raw, ungated text.
+    # Appended to, not a replacement of, the existing single-source
+    # caveat - and omitted entirely when there's nothing to weigh.
+    findings_note = (
+        "Single-source research findings (id, tag, source, text) — each "
+        "comes from one automated web search, not multi-source "
+        "verification. Weigh accordingly, do not treat as infallible."
+    )
+    if verified_facts:
+        findings_note += (
+            " Among these, weigh specific, dated, sourced findings more "
+            "heavily than vague or unsourced ones."
+        )
+
+    # docs/specs/human-debate-characteristics-contract.md, Contract 2:
+    # Rapoport's-Rules-style restate-then-respond framing (Daniel Dennett,
+    # crediting game theorist Anatol Rapoport) plus "addressing the gap"
+    # framing for the not-revising case - additive to, never a
+    # replacement of, the existing citation-gated revision rule and
+    # _NO_SWITCH_SENTENCE. Reasoning is explicitly placed BEFORE the
+    # citation marker so parse_revision_response's Contract 3 change keeps
+    # it out of the synthesized answer.
     return (
         "Your original answer:\n"
         f"{answer.original_text}\n\n"
         "Your own critique from the previous round:\n"
         f"{answer.critique}\n\n"
         f"{document_section}"
-        "Single-source research findings (id, tag, source, text) — each "
-        "comes from one automated web search, not multi-source "
-        "verification. Weigh accordingly, do not treat as infallible:\n"
+        f"{findings_note}\n"
         f"{facts_section}\n\n"
+        "Before deciding whether to revise: restate what the critique "
+        "above is actually saying, in your own words, well enough that a "
+        "reviewer would recognize it as a fair summary of their own "
+        "point. Note any part of it you agree with, even if it doesn't "
+        "change your answer. The goal of this round is the best shared "
+        "answer, not defending your original one.\n\n"
         "You may revise your answer ONLY by citing a specific finding id "
         "above that directly contradicts your own claim. "
         f"{_NO_SWITCH_SENTENCE}\n\n"
-        "If you revise, start your response with a citation marker naming the "
-        "fact id, e.g. `[[cite:<id>]]`, followed by your revised answer text. "
-        "If you are not revising, do not include a citation marker."
+        "If you are not revising, state plainly what specific new finding "
+        "would change your mind, rather than only restating why you "
+        "disagree.\n\n"
+        "Write your restatement and reasoning first. If you revise, place "
+        "a citation marker naming the fact id, e.g. `[[cite:<id>]]`, "
+        "immediately before your revised answer text - only the text "
+        "after the marker is treated as your answer, so keep your "
+        "reasoning before it, never mixed into it. If you are not "
+        "revising, do not include a citation marker anywhere in your "
+        "response."
     )
 
 
@@ -177,7 +213,16 @@ def parse_revision_response(
     if cited_id not in valid_ids:
         return None, None
 
-    revised_text = _CITE_MARKER_RE.sub("", response_text, count=1).strip()
+    # docs/specs/human-debate-characteristics-contract.md, Contract 3: keep
+    # only the text AFTER the marker, not "the whole response minus the
+    # marker itself". Contract 2's Rapoport's-Rules-style instruction asks
+    # the model to restate the critique and reason about it BEFORE the
+    # marker - that reasoning must never leak into the synthesized answer
+    # Stage 3 eventually sees. Byte-identical to the old
+    # `.sub("", count=1).strip()` behavior whenever the marker is the first
+    # thing in the response (today's only real-world shape), since
+    # `response_text[:cite_match.start()]` is then empty either way.
+    revised_text = response_text[cite_match.end():].strip()
     if not revised_text:
         return None, None
 

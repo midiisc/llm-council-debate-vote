@@ -60,7 +60,7 @@ def test_get_openrouter_key_raises_exact_message_when_missing(monkeypatch):
 def test_build_evidence_prompt_exact_content():
     claim = Claim(id="3", text="The sky is blue.")
     prompt = build_evidence_prompt(claim)
-    assert prompt == (
+    header = (
         "Research this claim using web search and respond with ONLY a JSON "
         "object (no markdown fences, no other text), in exactly this shape:\n"
         '{"verdict": "supports"|"contradicts"|"unverifiable", '
@@ -69,7 +69,194 @@ def test_build_evidence_prompt_exact_content():
         "--- BEGIN CLAIM ---\n"
         "The sky is blue.\n"
         "--- END CLAIM ---"
+        "\n\n"
     )
+    instruction_block = (
+        'Prefer a specific, dated, independently verifiable finding over a vague or unsourced one when a real one actually exists. Do not invent a plausible-sounding report, survey, or source name to satisfy this preference - if no real, checkable source turns up, the verdict must be "unverifiable". An unverified claim that merely sounds specific or numeric is LOWER trust than a hedged, transparently-sourced claim, not higher - never mark something as supporting or contradicting on the strength of specificity alone. When the finding itself aggregates or surveys many independent sources - a systematic review, meta-analysis, or industry-wide survey, rather than one study, one opinion, or one anecdote - note that explicitly: aggregated evidence is stronger than an isolated data point, but only when the aggregation is itself real and cited, never estimated or guessed at. A dated, verifiable action - a signed agreement, a completed transaction, a public commitment - is often stronger evidence of an entity\'s actual direction than a stated prediction or opinion about that direction; when both are found and both are real, treat the verified action as at least as weighty as the stated forecast. When the same underlying direction is independently corroborated by real, cited sources from more than one sphere of activity - for example, research literature, commercial or industrial activity, and observable market behavior - note that convergence explicitly: independent corroboration across spheres is stronger signal than any single source. But this only holds when each corroborating source is itself real, dated, and cited - citing more sources than actually exist, or treating repeated mentions of the same underlying source as independent corroboration, is exactly the fabrication risk this instruction exists to prevent. Judge a found source not just by how strongly it seems to support the claim on its own, but by whether it would be unlikely to exist if the claim were false - specifically, unlikely under the claim\'s own negation or the specific rival option the claim names. A finding equally compatible with the opposite conclusion adds little value even when well-sourced and specific. This also catches a related failure: a real, dated, cited source that turns out to address a different, similar-sounding claim contributes nothing here. Only compare against the alternative the claim itself implies - its plain negation, or a rival it explicitly names - never invent a new alternative to test against, and never assert that a source distinguishes the claim from its alternative unless the source\'s own stated content actually does so; if no source addresses the actual claim, as opposed to a look-alike neighbor, default to unverifiable. When a source explicitly discloses that making a statement or taking an action was costly, risky, or worked against the stating party\'s own apparent interest - an explicit penalty, a disclosed conflict of interest, a stated resource commitment, or a concession that undercuts the party\'s own position - weight that finding more heavily than an equivalent statement or action with no such disclosed cost; a low-cost, self-serving announcement is easy to make regardless of whether it\'s true, and this can outweigh the default action-over-opinion ranking above. Apply this only when the cost, risk, or against-interest nature is explicitly stated in the source itself - never estimate a cost, infer risk, or guess at a party\'s true incentive from general knowledge of how such situations usually work; if the source does not disclose it, this factor does not apply, and the finding is scored on the other criteria alone. When a finding offers a continuously-observable stand-in measurement - a count, index, volume, or rate - as evidence for a separate, not-yet-confirmed outcome, a precise and well-sourced number for that stand-in does not by itself establish that it predicts the outcome. Trust the link between the two only if the source itself states, or cites, an established relationship between that specific measurement and that specific outcome - never invent a predictive relationship, correlation, or lead-time the source does not state. Absent that grounding, treat the finding as unverified for the outcome it is cited to support, even though the underlying number is itself real and dated. When more than one real, cited source agrees on a direction, treat agreement between sources produced by genuinely different methods or processes - for example, a recorded transaction, an independent survey, a firsthand account, a direct measurement - as stronger evidence than agreement between sources produced the same way, or that turn out to be restatements of one original report carried by multiple outlets. Apply this only when each source\'s production method is actually stated or evident from the source itself - never infer, assume, or guess a method that isn\'t shown, and never treat two copies or reprints of the same underlying report as independent methods just because they appear in different places. If the sources\' methods can\'t be verified as both real and different, give no diversity bonus and fall back to judging each source on its own merits.'
+    )
+    assert prompt == header + instruction_block
+
+
+# --- Contract 1 (docs/specs/quantitative-evidence-weighting-contract.md):
+# weighting + anti-fabrication instruction, domain-neutral, outside the
+# claim delimiters ---
+
+
+def test_build_evidence_prompt_weighting_instruction_covers_cross_sphere_corroboration():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "more than one sphere of activity" in prompt.lower()
+    assert "stronger signal than any single source" in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_warns_against_fake_corroboration():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "citing more sources than actually exist" in prompt.lower()
+    assert "repeated mentions of the same underlying source" in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_spheres_named_no_specific_industry():
+    # "research literature"/"commercial or industrial activity"/"observable
+    # market behavior" are SPHERE-of-activity labels, not a named industry,
+    # company, or research field - must read the same whether the decision
+    # is about semiconductors, healthcare policy, or a hiring choice.
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    for banned_word in ("semiconductor", "pharma", "software", "biotech", "fintech"):
+        assert banned_word not in prompt.lower()
+
+
+# --- Contract (docs/specs/stage-0-5-epistemic-clauses-contract.md):
+# clauses 5-8 - diagnosticity, cost-to-fake, proxy validity, production-
+# method diversity ---
+
+
+def test_build_evidence_prompt_covers_diagnosticity():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "unlikely to exist if the claim were false" in prompt
+    assert "different, similar-sounding claim" in prompt
+    assert "default to unverifiable" in prompt.lower()
+
+
+def test_build_evidence_prompt_diagnosticity_forbids_inventing_a_rival():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "never invent a new alternative to test against" in prompt.lower()
+
+
+def test_build_evidence_prompt_covers_cost_to_fake():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "worked against the stating party's own apparent interest" in prompt
+    assert "low-cost, self-serving announcement" in prompt
+
+
+def test_build_evidence_prompt_cost_to_fake_forbids_inferring_cost():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "never estimate a cost, infer risk, or guess at a party's true incentive" in prompt
+
+
+def test_build_evidence_prompt_covers_proxy_validity():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "continuously-observable stand-in measurement" in prompt
+    assert "does not by itself establish that it predicts the outcome" in prompt
+
+
+def test_build_evidence_prompt_proxy_validity_forbids_inventing_predictive_link():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "never invent a predictive relationship, correlation, or lead-time" in prompt
+
+
+def test_build_evidence_prompt_covers_production_method_diversity():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "produced by genuinely different methods or processes" in prompt
+    assert "restatements of one original report" in prompt
+
+
+def test_build_evidence_prompt_production_method_diversity_forbids_inferring_method():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "never infer, assume, or guess a method that isn't shown" in prompt
+    assert "never treat two copies or reprints of the same underlying report as independent methods" in prompt
+
+
+def test_build_evidence_prompt_clauses_5_to_8_name_no_subject_matter_category():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    for banned_word in ("market share", "revenue", "acquisition", "merger", "semiconductor"):
+        assert banned_word not in prompt.lower()
+
+
+def test_build_evidence_prompt_clauses_5_to_8_come_after_the_original_four():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    cross_domain_index = prompt.find("more than one sphere of activity")
+    diagnosticity_index = prompt.find("unlikely to exist if the claim were false")
+    assert cross_domain_index != -1
+    assert diagnosticity_index != -1
+    assert diagnosticity_index > cross_domain_index
+
+
+def test_build_evidence_prompt_weighting_instruction_covers_aggregated_sources():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "systematic review" in prompt.lower()
+    assert "aggregated evidence is stronger" in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_covers_revealed_action():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "verified action as at least as weighty" in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_names_no_corporate_specific_vocabulary():
+    # The user's own examples (M&A, competitor, partnership, alliance) are
+    # legitimate signals but belong in a session's Stage 0 pre-registration,
+    # not hardcoded here - this instruction must stay usable for a hire, a
+    # research direction, or a hardware purchase, not just a business deal.
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    for banned_word in ("acquisition", "merger", "competitor", "partnership", "alliance"):
+        assert banned_word not in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_names_no_subject_matter_category():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    # "industry-wide survey" is a legitimate evidence-METHODOLOGY example
+    # (paired with "systematic review"/"meta-analysis"), not itself banned -
+    # it names no specific market/sector, same status as "meta-analysis"
+    # naming no specific research field.
+    for banned_word in ("market share", "revenue", "growth rate"):
+        assert banned_word not in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_forbids_inventing_a_source():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "do not invent" in prompt.lower()
+    assert "unverifiable" in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_states_default_polarity_inversion():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    assert "lower trust" in prompt.lower()
+
+
+def test_build_evidence_prompt_weighting_instruction_sits_after_end_claim_marker():
+    claim = Claim(id="1", text="anything")
+    prompt = build_evidence_prompt(claim)
+
+    end_marker_index = prompt.rfind("--- END CLAIM ---")
+    weighting_index = prompt.lower().find("prefer a specific")
+    assert weighting_index > end_marker_index
 
 
 # --- Contract 2 completion (docs/specs/proposal-a-reference-grounding-contract.md,
@@ -285,6 +472,7 @@ def test_post_chat_completion_succeeds_first_try_no_retry_no_sleep(monkeypatch):
         return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "sk-test-key")
 
     result = _post_chat_completion(
         "m", "p", sleep_fn=lambda s: sleeps.append(s)
@@ -306,6 +494,7 @@ def test_post_chat_completion_retries_on_retryable_error_then_succeeds(monkeypat
         return _FakeResponse({"choices": [{"message": {"content": "recovered"}}]})
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "sk-test-key")
 
     result = _post_chat_completion("m", "p", sleep_fn=lambda s: sleeps.append(s))
 
@@ -321,6 +510,7 @@ def test_post_chat_completion_backoff_is_exponential(monkeypatch):
         raise urllib.error.URLError("down")
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "sk-test-key")
 
     with pytest.raises(urllib.error.URLError):
         _post_chat_completion("m", "p", max_retries=3, sleep_fn=lambda s: sleeps.append(s))
@@ -336,6 +526,7 @@ def test_post_chat_completion_gives_up_after_max_retries(monkeypatch):
         raise urllib.error.HTTPError("u", 503, "unavailable", {}, None)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "sk-test-key")
 
     with pytest.raises(urllib.error.HTTPError):
         _post_chat_completion("m", "p", max_retries=2, sleep_fn=lambda s: None)
@@ -352,6 +543,7 @@ def test_post_chat_completion_non_retryable_error_raises_immediately_no_sleep(mo
         raise urllib.error.HTTPError("u", 401, "unauthorized", {}, None)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "sk-test-key")
 
     with pytest.raises(urllib.error.HTTPError):
         _post_chat_completion("m", "p", sleep_fn=lambda s: sleeps.append(s))
@@ -404,7 +596,13 @@ def test_post_chat_completion_async_returns_the_same_shape_as_the_sync_function(
     assert result == {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.01}}
 
 
-def _fake_post_async_factory(cost_per_call=0.05, verdict="supports", source="http://x"):
+def _fake_post_async_factory(cost_per_call=0.05, verdict="supports", source="x"):
+    # source defaults to a bare, non-http(s) string deliberately - none of
+    # these tests assert on evidence content, and a real "http://..." value
+    # would make _source_is_reachable attempt a real network call during
+    # unit tests (Contract 3, docs/specs/quantitative-evidence-weighting-contract.md).
+    # "x" hits _source_is_reachable's synchronous not-http(s) short-circuit,
+    # zero network I/O.
     calls = []
 
     async def fake_post_async(model, prompt, max_tokens=500, **kw):
@@ -517,3 +715,294 @@ def test_real_fetch_evidence_default_max_claims_is_50():
 
     sig = inspect.signature(real_fetch_evidence)
     assert sig.parameters["max_claims"].default == 50
+
+
+# ---------------------------------------------------------------------------
+# Contract 3 (docs/specs/quantitative-evidence-weighting-contract.md):
+# URL-reachability guardrail before VERIFIED/CONTRADICTED.
+# ---------------------------------------------------------------------------
+
+from scripts.live_adapters import _source_is_reachable  # noqa: E402
+
+
+def test_source_is_reachable_empty_string_is_false_no_network_call():
+    assert asyncio.run(_source_is_reachable("")) is False
+
+
+def test_source_is_reachable_non_http_scheme_is_false_no_network_call():
+    assert asyncio.run(_source_is_reachable("ftp://example.com/x")) is False
+
+
+def test_source_is_reachable_bare_word_is_false_no_network_call():
+    assert asyncio.run(_source_is_reachable("McKinsey State of the Market 2026")) is False
+
+
+def test_source_is_reachable_true_on_2xx(monkeypatch):
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResp())
+
+    assert asyncio.run(_source_is_reachable("http://example.com/report")) is True
+
+
+def test_source_is_reachable_true_on_3xx_redirect(monkeypatch):
+    class _FakeResp:
+        status = 301
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResp())
+
+    assert asyncio.run(_source_is_reachable("https://example.com/report")) is True
+
+
+def test_source_is_reachable_false_on_4xx(monkeypatch):
+    class _FakeResp:
+        status = 404
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResp())
+
+    assert asyncio.run(_source_is_reachable("https://example.com/missing")) is False
+
+
+def test_source_is_reachable_false_on_connection_error_never_raises(monkeypatch):
+    def raise_url_error(req, timeout=None):
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr("urllib.request.urlopen", raise_url_error)
+
+    assert asyncio.run(_source_is_reachable("https://nonexistent.example")) is False
+
+
+def test_source_is_reachable_uses_head_method(monkeypatch):
+    captured = {}
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["method"] = req.get_method()
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    asyncio.run(_source_is_reachable("https://example.com"))
+    assert captured["method"] == "HEAD"
+
+
+def test_source_is_reachable_default_timeout_is_5_seconds():
+    import inspect
+
+    sig = inspect.signature(_source_is_reachable)
+    assert sig.parameters["timeout"].default == 5.0
+
+
+def test_source_is_reachable_passes_configured_timeout_to_urlopen(monkeypatch):
+    captured = {}
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["timeout"] = timeout
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    asyncio.run(_source_is_reachable("https://example.com", timeout=1.5))
+    assert captured["timeout"] == 1.5
+
+
+class _StatusResp:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_source_is_reachable_boundary_399_reachable_400_not(monkeypatch):
+    for status, expected in ((200, True), (399, True), (400, False), (299, True), (300, True)):
+        monkeypatch.setattr(
+            "urllib.request.urlopen", lambda req, timeout=None, s=status: _StatusResp(s)
+        )
+
+        assert asyncio.run(_source_is_reachable("https://example.com")) is expected, status
+
+
+def test_source_is_reachable_false_when_to_thread_itself_raises(monkeypatch):
+    async def raising_to_thread(func, *args, **kwargs):
+        raise RuntimeError("thread pool exhausted")
+
+    monkeypatch.setattr("asyncio.to_thread", raising_to_thread)
+
+    assert asyncio.run(_source_is_reachable("https://example.com")) is False
+
+
+def test_source_is_reachable_nonhttp_string_never_calls_urlopen(monkeypatch):
+    # A raise-if-called fake would be silently swallowed by
+    # _source_is_reachable's own broad except Exception - use an observable
+    # side effect instead, checked AFTER the call returns.
+    was_called = {"yes": False}
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def tracking_urlopen(req, timeout=None):
+        was_called["yes"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", tracking_urlopen)
+
+    result = asyncio.run(_source_is_reachable("McKinsey State of the Market 2026"))
+
+    assert result is False
+    assert was_called["yes"] is False
+
+
+def test_real_fetch_evidence_checks_reachability_of_the_actual_parsed_source(monkeypatch):
+    checked = []
+
+    async def tracking_reachable(url, timeout=5.0):
+        checked.append(url)
+        return True
+
+    fake_post_async, _ = _fake_post_async_factory(source="https://real.example/specific-report")
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+    monkeypatch.setattr("scripts.live_adapters._source_is_reachable", tracking_reachable)
+
+    asyncio.run(real_fetch_evidence([Claim(id="1", text="a")]))
+
+    assert checked == ["https://real.example/specific-report"]
+
+
+def test_real_fetch_evidence_cost_defaults_to_zero_when_usage_cost_is_falsy(monkeypatch):
+    async def fake_post_async(model, prompt, max_tokens=500, **kw):
+        return {
+            "choices": [{"message": {"content": '{"verdict": "supports", "source": "x", "date": "d"}'}}],
+            "usage": {"cost": 0},  # present but falsy - the "or 0.0" fallback path
+        }
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+
+    result = asyncio.run(real_fetch_evidence([Claim(id="1", text="a")]))
+
+    assert result.cost_usd == 0.0
+
+
+def test_real_fetch_evidence_drops_evidence_when_source_unreachable(monkeypatch):
+    fake_post_async, _ = _fake_post_async_factory(source="https://fabricated.example/report")
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+    monkeypatch.setattr("scripts.live_adapters._source_is_reachable", _false_async)
+
+    result = asyncio.run(real_fetch_evidence([Claim(id="1", text="a")]))
+
+    assert result["1"] == []
+
+
+def test_real_fetch_evidence_keeps_evidence_when_source_reachable(monkeypatch):
+    fake_post_async, _ = _fake_post_async_factory(source="https://real.example/report")
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+    monkeypatch.setattr("scripts.live_adapters._source_is_reachable", _true_async)
+
+    result = asyncio.run(real_fetch_evidence([Claim(id="1", text="a")]))
+
+    assert len(result["1"]) == 1
+    assert result["1"][0].source == "https://real.example/report"
+
+
+def test_real_fetch_evidence_skips_reachability_check_when_already_unverifiable(monkeypatch):
+    checked = []
+
+    async def tracking_reachable(url, timeout=5.0):
+        checked.append(url)
+        return True
+
+    fake_post_async, _ = _fake_post_async_factory(verdict="unverifiable", source="")
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+    monkeypatch.setattr("scripts.live_adapters._source_is_reachable", tracking_reachable)
+
+    result = asyncio.run(real_fetch_evidence([Claim(id="1", text="a")]))
+
+    assert result["1"] == []
+    assert checked == []  # nothing to check - parse_evidence_response already returned []
+
+
+def test_real_fetch_evidence_reachability_check_stays_inside_the_semaphore(monkeypatch):
+    in_flight = {"count": 0, "max_seen": 0}
+
+    async def fake_post_async(model, prompt, max_tokens=500, **kw):
+        in_flight["count"] += 1
+        in_flight["max_seen"] = max(in_flight["max_seen"], in_flight["count"])
+        await asyncio.sleep(0.02)
+        return {
+            "choices": [
+                {"message": {"content": '{"verdict": "supports", "source": "https://x.example", "date": "d"}'}}
+            ],
+            "usage": {"cost": 0.0},
+        }
+
+    async def slow_reachable(url, timeout=5.0):
+        # If this ran OUTSIDE the semaphore, in_flight bookkeeping above
+        # would already have decremented before this starts, hiding an
+        # overlap violation. Keeping it inside the same _fetch_one body
+        # (as implemented) means in_flight["count"] is still incremented
+        # while this runs, so max_concurrency is genuinely respected
+        # end-to-end, not just for the HTTP call.
+        await asyncio.sleep(0.01)
+        in_flight["count"] -= 1
+        return True
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+    monkeypatch.setattr("scripts.live_adapters._source_is_reachable", slow_reachable)
+
+    claims = [Claim(id=str(i), text=f"c{i}") for i in range(6)]
+    asyncio.run(real_fetch_evidence(claims, max_concurrency=2))
+
+    assert in_flight["max_seen"] <= 2
+
+
+async def _true_async(url, timeout=5.0):
+    return True
+
+
+async def _false_async(url, timeout=5.0):
+    return False

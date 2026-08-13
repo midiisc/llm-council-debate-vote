@@ -324,19 +324,82 @@ def test_build_revision_prompt_exact_content_with_verified_facts():
         "MY CRITIQUE\n\n"
         "Single-source research findings (id, tag, source, text) — each "
         "comes from one automated web search, not multi-source "
-        "verification. Weigh accordingly, do not treat as infallible:\n"
+        "verification. Weigh accordingly, do not treat as infallible. "
+        "Among these, weigh specific, dated, sourced findings more heavily "
+        "than vague or unsourced ones.\n"
         "--- BEGIN VERIFIED FACTS ---\n"
         "[1] (VERIFIED, source: src) fact one\n"
         "[2] (CONTRADICTED, source: src) fact two\n"
         "--- END VERIFIED FACTS ---\n\n"
+        "Before deciding whether to revise: restate what the critique "
+        "above is actually saying, in your own words, well enough that a "
+        "reviewer would recognize it as a fair summary of their own "
+        "point. Note any part of it you agree with, even if it doesn't "
+        "change your answer. The goal of this round is the best shared "
+        "answer, not defending your original one.\n\n"
         "You may revise your answer ONLY by citing a specific finding id "
         "above that directly contradicts your own claim. "
         f"{REQUIRED_SENTENCE}\n\n"
-        "If you revise, start your response with a citation marker naming the "
-        "fact id, e.g. `[[cite:<id>]]`, followed by your revised answer text. "
-        "If you are not revising, do not include a citation marker."
+        "If you are not revising, state plainly what specific new finding "
+        "would change your mind, rather than only restating why you "
+        "disagree.\n\n"
+        "Write your restatement and reasoning first. If you revise, place "
+        "a citation marker naming the fact id, e.g. `[[cite:<id>]]`, "
+        "immediately before your revised answer text - only the text "
+        "after the marker is treated as your answer, so keep your "
+        "reasoning before it, never mixed into it. If you are not "
+        "revising, do not include a citation marker anywhere in your "
+        "response."
     )
     assert prompt == expected
+
+
+# --- Contract 2 (docs/specs/human-debate-characteristics-contract.md):
+# Rapoport's-Rules-style restate-then-respond + addressing-the-gap framing ---
+
+
+def test_build_revision_prompt_instructs_restating_critique_fairly():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    prompt = build_revision_prompt(answer, [])
+
+    assert "restate what the critique above is actually saying" in prompt
+    assert "a reviewer would recognize it as a fair summary" in prompt
+
+
+def test_build_revision_prompt_instructs_noting_agreement():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    prompt = build_revision_prompt(answer, [])
+
+    assert "Note any part of it you agree with" in prompt
+
+
+def test_build_revision_prompt_states_dialectic_not_eristic_goal():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    prompt = build_revision_prompt(answer, [])
+
+    assert "the best shared answer, not defending your original one" in prompt
+
+
+def test_build_revision_prompt_addresses_the_gap_when_not_revising():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    prompt = build_revision_prompt(answer, [])
+
+    assert "what specific new finding would change your mind" in prompt
+
+
+def test_build_revision_prompt_still_requires_no_switch_sentence_verbatim():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    prompt = build_revision_prompt(answer, [])
+
+    assert REQUIRED_SENTENCE in prompt
+
+
+def test_build_revision_prompt_instructs_reasoning_before_marker():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    prompt = build_revision_prompt(answer, [])
+
+    assert "Write your restatement and reasoning first" in prompt
+    assert "only the text after the marker is treated as your answer" in prompt
 
 
 def test_build_revision_prompt_exact_content_with_no_verified_facts():
@@ -346,6 +409,53 @@ def test_build_revision_prompt_exact_content_with_no_verified_facts():
 
     assert "not multi-source verification" in prompt
     assert "--- BEGIN VERIFIED FACTS ---\n(no verified facts available)\n--- END VERIFIED FACTS ---" in prompt
+
+
+# --- Contract 2 (docs/specs/quantitative-evidence-weighting-contract.md):
+# weigh specific/dated/sourced findings more heavily, only among facts that
+# already passed Stage 0.5's own gate ---
+
+
+def test_build_revision_prompt_weighting_sentence_present_with_verified_facts():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    verified = [_fact("1", "fact one")]
+
+    prompt = build_revision_prompt(answer, verified)
+
+    assert "weigh specific, dated, sourced findings more heavily" in prompt
+
+
+def test_build_revision_prompt_weighting_sentence_absent_with_no_verified_facts():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+
+    prompt = build_revision_prompt(answer, [])
+
+    assert "weigh specific, dated, sourced findings more heavily" not in prompt
+
+
+def test_build_revision_prompt_existing_caveat_still_present_byte_for_byte():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    verified = [_fact("1", "fact one")]
+
+    prompt = build_revision_prompt(answer, verified)
+
+    assert (
+        "Single-source research findings (id, tag, source, text) — each "
+        "comes from one automated web search, not multi-source "
+        "verification. Weigh accordingly, do not treat as infallible."
+    ) in prompt
+
+
+def test_build_revision_prompt_weighting_sentence_immediately_follows_caveat():
+    answer = ModelAnswer(model="alpha", original_text="A", critique="C")
+    verified = [_fact("1", "fact one")]
+
+    prompt = build_revision_prompt(answer, verified)
+
+    caveat_end = prompt.find("do not treat as infallible.") + len("do not treat as infallible.")
+    weighting_start = prompt.find("Among these, weigh specific")
+    between = prompt[caveat_end:weighting_start]
+    assert between.strip() == ""  # only whitespace between the two sentences, nothing inserted
 
 
 # --- AC7-9 (docs/specs/custom-scripts-contracts.md, Contract 2 amendment):
@@ -460,6 +570,37 @@ def test_parse_revision_response_removes_marker_with_empty_string_not_placeholde
 
     assert revised_text == "clean text"
     assert "[[cite:5]]" not in revised_text
+
+
+# --- Contract 3 (docs/specs/human-debate-characteristics-contract.md):
+# text BEFORE the marker (Rapoport's-Rules-style reasoning/restatement) is
+# discarded, never leaked into the synthesized answer ---
+
+
+def test_parse_revision_response_discards_reasoning_before_the_marker():
+    verified = [_fact("5", "some fact")]
+    response = (
+        "I agree the completeness critique is fair - I skipped the edge case. "
+        "[[cite:5]] The corrected answer accounts for the edge case."
+    )
+
+    revised_text, cited_fact_id = parse_revision_response(response, verified)
+
+    assert cited_fact_id == "5"
+    assert revised_text == "The corrected answer accounts for the edge case."
+    assert "I agree" not in revised_text
+
+
+def test_parse_revision_response_marker_at_start_is_still_byte_identical_to_before():
+    # Regression: today's only real-world shape (marker first, nothing
+    # before it) must behave exactly as it did before Contract 3.
+    verified = [_fact("5", "some fact")]
+    response = "[[cite:5]] My answer mentions [[cite:5]] again in the body."
+
+    revised_text, cited_fact_id = parse_revision_response(response, verified)
+
+    assert cited_fact_id == "5"
+    assert revised_text == "My answer mentions [[cite:5]] again in the body."
 
 
 def test_accepted_requires_both_revised_text_and_cited_fact_id_not_either(monkeypatch):

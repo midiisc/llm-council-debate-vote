@@ -138,6 +138,112 @@ async def real_query_model(model: str, prompt: str) -> tuple[str, float]:
 _CLAIM_SECTION_BEGIN = "--- BEGIN CLAIM ---"
 _CLAIM_SECTION_END = "--- END CLAIM ---"
 
+# docs/specs/quantitative-evidence-weighting-contract.md, Contract 1. Sits
+# OUTSIDE the claim delimiters (appended after _CLAIM_SECTION_END) so it
+# reads as a trusted instruction bracketing the untrusted claim text on both
+# sides, same reasoning as _STAGE1_REFERENCE_INSTRUCTION_BLOCK
+# (council_adapter.py). Domain-neutral by construction - names no
+# subject-matter category (no "revenue"/"market share"/etc, per
+# pipeline-architecture-spec.md section 6's domain-neutrality rule).
+# Evidence-methodology terms (systematic review, meta-analysis, survey) are
+# evidence-TYPE labels, not subject-matter content - same status as
+# "input document"/"verified facts" in the Stage 1 reference instruction -
+# so naming them stays domain-neutral: they apply identically whether the
+# decision under debate is a hire, a fundraise, or a hardware purchase.
+#
+# Clauses 5-8 (docs/specs/stage-0-5-epistemic-clauses-contract.md): added
+# after a 12-agent sweep + adversarial panel (docs/stage-0-5-epistemic-
+# clauses-decision-2026-08-13.md) surfaced 23 candidate epistemic checks,
+# narrowed to 6 adversarially-judged, narrowed again at synthesis to these
+# 4 - each closes a gap none of clauses 1-4 catch (diagnosticity, cost-to-
+# fake, proxy validity, production-method diversity). 2 individually-passing
+# candidates (base-rate anchoring, absence-of-expected-signal) were
+# deliberately NOT shipped - both reopen clause 1's fabrication-risk profile
+# for a signal that fires rarely under the one-search-call-per-claim
+# architecture; see the decision doc for the full reasoning.
+_EVIDENCE_WEIGHTING_INSTRUCTION_BLOCK = (
+    "\n\n"
+    "Prefer a specific, dated, independently verifiable finding over a "
+    "vague or unsourced one when a real one actually exists. Do not invent "
+    "a plausible-sounding report, survey, or source name to satisfy this "
+    "preference - if no real, checkable source turns up, the verdict must "
+    'be "unverifiable". An unverified claim that merely sounds specific or '
+    "numeric is LOWER trust than a hedged, transparently-sourced claim, not "
+    "higher - never mark something as supporting or contradicting on the "
+    "strength of specificity alone. When the finding itself aggregates or "
+    "surveys many independent sources - a systematic review, meta-analysis, "
+    "or industry-wide survey, rather than one study, one opinion, or one "
+    "anecdote - note that explicitly: aggregated evidence is stronger than "
+    "an isolated data point, but only when the aggregation is itself real "
+    "and cited, never estimated or guessed at. A dated, verifiable action - "
+    "a signed agreement, a completed transaction, a public commitment - is "
+    "often stronger evidence of an entity's actual direction than a stated "
+    "prediction or opinion about that direction; when both are found and "
+    "both are real, treat the verified action as at least as weighty as the "
+    "stated forecast. When the same underlying direction is independently "
+    "corroborated by real, cited sources from more than one sphere of "
+    "activity - for example, research literature, commercial or industrial "
+    "activity, and observable market behavior - note that convergence "
+    "explicitly: independent corroboration across spheres is stronger "
+    "signal than any single source. But this only holds when each "
+    "corroborating source is itself real, dated, and cited - citing more "
+    "sources than actually exist, or treating repeated mentions of the "
+    "same underlying source as independent corroboration, is exactly the "
+    "fabrication risk this instruction exists to prevent. "
+    "Judge a found source not just by how strongly it seems to support the "
+    "claim on its own, but by whether it would be unlikely to exist if the "
+    "claim were false - specifically, unlikely under the claim's own "
+    "negation or the specific rival option the claim names. A finding "
+    "equally compatible with the opposite conclusion adds little value even "
+    "when well-sourced and specific. This also catches a related failure: a "
+    "real, dated, cited source that turns out to address a different, "
+    "similar-sounding claim contributes nothing here. Only compare against "
+    "the alternative the claim itself implies - its plain negation, or a "
+    "rival it explicitly names - never invent a new alternative to test "
+    "against, and never assert that a source distinguishes the claim from "
+    "its alternative unless the source's own stated content actually does "
+    "so; if no source addresses the actual claim, as opposed to a "
+    "look-alike neighbor, default to unverifiable. When a source explicitly "
+    "discloses that making a statement or taking an action was costly, "
+    "risky, or worked against the stating party's own apparent interest - "
+    "an explicit penalty, a disclosed conflict of interest, a stated "
+    "resource commitment, or a concession that undercuts the party's own "
+    "position - weight that finding more heavily than an equivalent "
+    "statement or action with no such disclosed cost; a low-cost, "
+    "self-serving announcement is easy to make regardless of whether it's "
+    "true, and this can outweigh the default action-over-opinion ranking "
+    "above. Apply this only when the cost, risk, or against-interest nature "
+    "is explicitly stated in the source itself - never estimate a cost, "
+    "infer risk, or guess at a party's true incentive from general "
+    "knowledge of how such situations usually work; if the source does not "
+    "disclose it, this factor does not apply, and the finding is scored on "
+    "the other criteria alone. When a finding offers a "
+    "continuously-observable stand-in measurement - a count, index, "
+    "volume, or rate - as evidence for a separate, not-yet-confirmed "
+    "outcome, a precise and well-sourced number for that stand-in does not "
+    "by itself establish that it predicts the outcome. Trust the link "
+    "between the two only if the source itself states, or cites, an "
+    "established relationship between that specific measurement and that "
+    "specific outcome - never invent a predictive relationship, "
+    "correlation, or lead-time the source does not state. Absent that "
+    "grounding, treat the finding as unverified for the outcome it is "
+    "cited to support, even though the underlying number is itself real "
+    "and dated. When more than one real, cited source agrees on a "
+    "direction, treat agreement between sources produced by genuinely "
+    "different methods or processes - for example, a recorded transaction, "
+    "an independent survey, a firsthand account, a direct measurement - as "
+    "stronger evidence than agreement between sources produced the same "
+    "way, or that turn out to be restatements of one original report "
+    "carried by multiple outlets. Apply this only when each source's "
+    "production method is actually stated or evident from the source "
+    "itself - never infer, assume, or guess a method that isn't shown, and "
+    "never treat two copies or reprints of the same underlying report as "
+    "independent methods just because they appear in different places. If "
+    "the sources' methods can't be verified as both real and different, "
+    "give no diversity bonus and fall back to judging each source on its "
+    "own merits."
+)
+
 
 def build_evidence_prompt(claim: Claim) -> str:
     # Delimited (docs/specs/proposal-a-reference-grounding-contract.md,
@@ -156,6 +262,7 @@ def build_evidence_prompt(claim: Claim) -> str:
         f"{_CLAIM_SECTION_BEGIN}\n"
         f"{claim.text}\n"
         f"{_CLAIM_SECTION_END}"
+        f"{_EVIDENCE_WEIGHTING_INSTRUCTION_BLOCK}"
     )
 
 
@@ -188,6 +295,37 @@ def parse_evidence_response(raw_content: str, retrieval_date: str) -> list[Evide
     return [Evidence(source=source, date=date, supports=(verdict == "supports"))]
 
 
+async def _source_is_reachable(url: str, timeout: float = 5.0) -> bool:
+    """docs/specs/quantitative-evidence-weighting-contract.md, Contract 3.
+
+    Guards VERIFIED/CONTRADICTED status behind an actual resolvability
+    check on the evidence model's self-reported source, so a fabricated
+    "McKinsey 2026 State of the Market Report" can't pass as identically
+    trustworthy to a real one. Conservative by design (false-positive
+    "verified" is worse than a missed one, per the grounding decision this
+    closes): any exception, any non-2xx/3xx status, or a non-http(s) string
+    all return False, never raise. HEAD request via asyncio.to_thread -
+    same non-blocking pattern as _post_chat_completion_async, so this
+    doesn't reopen the wall-clock-preemption gap that pattern already
+    closed.
+    """
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return False
+
+    def _check() -> bool:
+        req = urllib.request.Request(url, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return 200 <= resp.status < 400
+        except Exception:
+            return False
+
+    try:
+        return await asyncio.to_thread(_check)
+    except Exception:
+        return False
+
+
 async def real_fetch_evidence(
     claims: list[Claim], max_claims: int = 50, max_concurrency: int = 5,
 ) -> EvidenceMap:
@@ -200,6 +338,12 @@ async def real_fetch_evidence(
     (bounded by max_concurrency, not one-at-a-time), real cost is tracked
     and returned via EvidenceMap.cost_usd, and total claims are capped at
     max_claims with EvidenceMap.truncated=True set - never a silent drop.
+
+    docs/specs/quantitative-evidence-weighting-contract.md, Contract 3: a
+    claim whose self-reported source doesn't actually resolve has its
+    evidence dropped to [] here, before grounding_pass.tag_claim ever sees
+    it - an empty evidence list is what tag_claim already treats as
+    UNVERIFIABLE, so this needs no change to tag_claim itself.
     """
     from datetime import datetime, timezone
 
@@ -213,9 +357,12 @@ async def real_fetch_evidence(
         async with semaphore:
             prompt = build_evidence_prompt(claim)
             data = await _post_chat_completion_async(EVIDENCE_MODEL, prompt, max_tokens=500)
-        content = data["choices"][0]["message"]["content"]
-        cost = data.get("usage", {}).get("cost") or 0.0
-        return claim.id, parse_evidence_response(content, retrieval_date), cost
+            content = data["choices"][0]["message"]["content"]
+            cost = data.get("usage", {}).get("cost") or 0.0
+            claim_evidence = parse_evidence_response(content, retrieval_date)
+            if claim_evidence and not await _source_is_reachable(claim_evidence[0].source):
+                claim_evidence = []
+        return claim.id, claim_evidence, cost
 
     results = await asyncio.gather(*(_fetch_one(claim) for claim in claims_to_fetch))
 

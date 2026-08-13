@@ -158,6 +158,34 @@ def test_c1_ac3_instruction_names_the_two_checkable_grounding_classes_and_unveri
     assert "omit sourcing" not in lowered and "hide the source" not in lowered
 
 
+# --- Contract 4 (docs/specs/human-debate-characteristics-contract.md):
+# dialectic-not-eristic + cooperation framing, and the previously-decided-
+# but-never-wired counterfactual/weakness instruction ---
+
+
+def test_c4_states_dialectic_not_eristic_goal():
+    prompt = ca.build_stage1_prompt("some query")
+    assert "converge on the best-supported shared answer" in prompt
+    assert "not to win an argument against them" in prompt
+
+
+def test_c4_instructs_weighing_counterfactuals_and_weaknesses():
+    prompt = ca.build_stage1_prompt("some query")
+    assert "weigh counterfactuals and potential weaknesses in your own reasoning" in prompt
+
+
+def test_c4_instructs_staying_concise():
+    prompt = ca.build_stage1_prompt("some query")
+    assert "staying concise" in prompt
+
+
+def test_c4_names_no_subject_matter_category():
+    prompt = ca.build_stage1_prompt("some query")
+    lowered = prompt.lower()
+    for banned_word in ("market share", "revenue", "acquisition", "merger"):
+        assert banned_word not in lowered
+
+
 # --- AC4: run_council_with_timeouts calls build_stage1_prompt(user_query)
 # in place of the raw user_query when building `messages` ---
 

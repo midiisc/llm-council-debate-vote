@@ -22,6 +22,7 @@ from scripts.pipeline_runner import (
     PipelineResult,
     _build_arg_parser,
     _compute_outliers,
+    _rubric_notes_for_model,
     _rubric_scores_for_model,
     _write_run_status,
     build_critique_from_rubric,
@@ -720,6 +721,156 @@ def test_rubric_scores_for_model_returns_empty_dict_not_all_dims_when_model_abse
         "absent-model", [], {"Response A": {"model": "other-model", "display_index": 0}}
     )
     assert result == {}
+
+
+# --- Contract 1 (docs/specs/human-debate-characteristics-contract.md):
+# thread reviewers' real free-text "notes" into the revision critique, not
+# just the numeric rubric averages ---
+
+
+def _stage2_results_with_notes_fixture():
+    label_to_model = {
+        "Response A": {"model": "model-x", "display_index": 0},
+        "Response B": {"model": "model-y", "display_index": 1},
+    }
+    stage2_results = [
+        {
+            "model": "model-y",
+            "ranking": "raw text",
+            "parsed_ranking": {
+                "evaluations": {
+                    "Response A": {
+                        "accuracy": 8,
+                        "relevance": 7,
+                        "completeness": 6,
+                        "conciseness": 9,
+                        "clarity": 8,
+                        "notes": "Missed the edge case about negative inputs.",
+                    },
+                },
+                "rubric_scoring": True,
+            },
+        },
+    ]
+    return stage2_results, label_to_model
+
+
+def test_rubric_notes_for_model_returns_the_real_note():
+    stage2_results, label_to_model = _stage2_results_with_notes_fixture()
+    notes = _rubric_notes_for_model("model-x", stage2_results, label_to_model)
+    assert notes == ["Missed the edge case about negative inputs."]
+
+
+def test_rubric_notes_for_model_empty_when_no_notes_key():
+    stage2_results, label_to_model = _stage2_results_fixture()  # no "notes" in this fixture
+    notes = _rubric_notes_for_model("model-x", stage2_results, label_to_model)
+    assert notes == []
+
+
+def test_rubric_notes_for_model_empty_when_model_absent():
+    notes = _rubric_notes_for_model(
+        "absent-model", [], {"Response A": {"model": "other-model", "display_index": 0}}
+    )
+    assert notes == []
+
+
+def test_rubric_notes_for_model_skips_reviewer_with_missing_parsed_ranking():
+    stage2_results = [{"model": "model-y", "ranking": "raw text"}]  # no parsed_ranking
+    label_to_model = {"Response A": {"model": "model-x", "display_index": 0}}
+    notes = _rubric_notes_for_model("model-x", stage2_results, label_to_model)
+    assert notes == []
+
+
+def test_rubric_notes_for_model_continues_past_a_reviewer_with_no_scores():
+    # A reviewer with no/empty scores must be SKIPPED, not treated as a
+    # reason to stop checking the remaining reviewers (continue, not break).
+    stage2_results = [
+        {"model": "model-y", "ranking": "raw text"},  # no parsed_ranking at all
+        {
+            "model": "model-z",
+            "parsed_ranking": {
+                "evaluations": {"Response A": {"accuracy": 8, "notes": "Second reviewer's note."}},
+            },
+        },
+    ]
+    label_to_model = {"Response A": {"model": "model-x", "display_index": 0}}
+    notes = _rubric_notes_for_model("model-x", stage2_results, label_to_model)
+    assert notes == ["Second reviewer's note."]
+
+
+def test_rubric_notes_for_model_skips_reviewer_with_empty_notes_string():
+    stage2_results = [
+        {
+            "model": "model-y",
+            "parsed_ranking": {
+                "evaluations": {"Response A": {"accuracy": 8, "notes": ""}},
+            },
+        },
+    ]
+    label_to_model = {"Response A": {"model": "model-x", "display_index": 0}}
+    notes = _rubric_notes_for_model("model-x", stage2_results, label_to_model)
+    assert notes == []
+
+
+def test_build_critique_from_rubric_appends_notes_when_present():
+    stage2_results, label_to_model = _stage2_results_with_notes_fixture()
+    critique = build_critique_from_rubric("model-x", stage2_results, label_to_model)
+    assert critique == (
+        "Reviewers scored your response (1 reviewer(s)) — "
+        "accuracy: 8.0/10, relevance: 7.0/10, completeness: 6.0/10, "
+        "conciseness: 9.0/10, clarity: 8.0/10. "
+        "Weakest dimension: completeness (6.0). "
+        "Reviewer notes: Missed the edge case about negative inputs."
+    )
+
+
+def test_build_critique_from_rubric_unchanged_when_no_notes():
+    # Byte-identical to the pre-Contract-1 behavior when no reviewer
+    # provided a "notes" field - backward compatible.
+    stage2_results, label_to_model = _stage2_results_fixture()
+    critique = build_critique_from_rubric("model-x", stage2_results, label_to_model)
+    assert critique == (
+        "Reviewers scored your response (1 reviewer(s)) — "
+        "accuracy: 8.0/10, relevance: 7.0/10, completeness: 6.0/10, "
+        "conciseness: 9.0/10, clarity: 8.0/10. "
+        "Weakest dimension: completeness (6.0)."
+    )
+    assert "Reviewer notes" not in critique
+
+
+def test_build_critique_from_rubric_joins_multiple_reviewer_notes():
+    stage2_results = [
+        {
+            "model": "model-y",
+            "parsed_ranking": {
+                "evaluations": {
+                    "Response A": {
+                        "accuracy": 8, "relevance": 7, "completeness": 6,
+                        "conciseness": 9, "clarity": 8,
+                        "notes": "Missed the edge case.",
+                    },
+                },
+            },
+        },
+        {
+            "model": "model-z",
+            "parsed_ranking": {
+                "evaluations": {
+                    "Response A": {
+                        "accuracy": 6, "relevance": 8, "completeness": 5,
+                        "conciseness": 7, "clarity": 9,
+                        "notes": "Strong on clarity, weak on completeness.",
+                    },
+                },
+            },
+        },
+    ]
+    label_to_model = {"Response A": {"model": "model-x", "display_index": 0}}
+    critique = build_critique_from_rubric("model-x", stage2_results, label_to_model)
+    assert (
+        "Reviewer notes: Missed the edge case. | "
+        "Strong on clarity, weak on completeness."
+    ) in critique
 
 
 # --- AC8: output dir created even if parent missing ---
