@@ -98,15 +98,40 @@ couples reasoning injection to unwanted dynamic model selection).
 
 | Round | Models | Target effort | Why | Reachable today? |
 |---|---|---|---|---|
-| Stage 1 — independent draft | opus-4.8, gpt-5.5 | **high** | substantive generation task | ❌ needs `resilient_query.py`/`council_adapter.py` swapped to `llm_council.openrouter.query_model_with_status` (which *does* accept `reasoning_params`) — bounded change, touches mutation-gated test surface, needs blind-TDV (§7) |
-| Stage 1 — independent draft | gemini-3.6-flash, glm-5.2 | **medium** | Flash is a deliberate cost-tier pick; GLM hasn't graduated its 20-session bar — neither should be silently promoted to frontier-effort | same fix as above |
+| Stage 1 — independent draft | opus-4.8, gpt-5.5 | **high** | substantive generation task | ❌ needs `resilient_query.py`/`council_adapter.py` swapped to `llm_council.openrouter.query_model_with_status` (which *does* accept `reasoning_params`) — bounded change, touches mutation-gated test surface, needs blind-TDV (§7). **Not attempted this pass** — still open. |
+| Stage 1 — independent draft | gemini-3.6-flash, glm-5.2 | **medium** | Flash is a deliberate cost-tier pick; GLM hasn't graduated its 20-session bar — neither should be silently promoted to frontier-effort | same fix as above, same not-attempted status |
 | Stage 1.5 — style normalization | n/a (package-internal) | — | no model call this project owns | n/a |
 | Stage 2 — peer review/ranking | all 4 core seats | **none/off** | ranking existing text doesn't need reasoning depth (package's own default agrees) | ❌ `council_stages.stage2_collect_rankings` has no `reasoning_params` kwarg at all — needs a reimplementation of the stage outside the package (comparable scope to the existing timeout-workaround module) or an upstream fix. **Logged as a Pillar-5 follow-up watch item, not buildable this session.** |
 | Stage 2.5 — CSS gate | n/a (arithmetic) | — | no model call | n/a |
-| Stage 2.75 — conditional revision (CSS<0.50) | all participating core seats | **high** | same substantive-rewrite shape as Stage 1; under-provisioning defeats why it triggered | ✅ reachable today — goes through `real_query_model` in `live_adapters.py`, a raw HTTP JSON POST with zero llm-council-core dependency; adding the `reasoning` object is a ~5-line change |
+| Stage 2.75 — conditional revision (CSS<0.50) | all participating core seats | **high** | same substantive-rewrite shape as Stage 1; under-provisioning defeats why it triggered | ✅ **wired 2026-08-13** (`docs/specs/reasoning-effort-wiring-contract.md`) — every revision-round call now sends `reasoning_effort="high"` |
 | Stage 3 — chairman synthesis | opus-4.8 only | **high** | highest-leverage single call in the pipeline | ❌ `council_stages.stage3_synthesize_final` has no `reasoning_params` kwarg either — same follow-up-item status as Stage 2 |
-| **Stage 3.75 (NEW) — devil's-advocate + counterfactual critique on the synthesis** | **gpt-5.5** only, gated on `CSS < 0.50 OR any model flagged is_outlier` | **high** | one bounded call, not fanned across the roster; needs to carry enough weight not to be steamrolled by majority framing (arXiv:2511.07784) | ✅ reachable today, same raw-HTTP path as Stage 2.75 — see §5 for full design and why it's never run by Opus/the chairman |
-| Stage 4 — completeness check | whichever model executes it | **low/minimal** | narrow yes/no classification against an already-provided fact list — no accuracy upside from more effort | ✅ reachable today, same raw-HTTP path |
+| **Stage 3.75 — devil's-advocate + counterfactual critique on the synthesis** | **gpt-5.5** only, gated on `CSS < 0.50 OR any model flagged is_outlier` | **high** | one bounded call, not fanned across the roster; needs to carry enough weight not to be steamrolled by majority framing (arXiv:2511.07784) | ✅ built, wired, **and now reasoning-effort-wired 2026-08-13** — every critique call sends `reasoning_effort="high"` |
+| Stage 4 — completeness check | whichever model executes it | **low/minimal** | narrow yes/no classification against an already-provided fact list — no accuracy upside from more effort | ✅ **wired 2026-08-13** — sends `reasoning_effort="low"` |
+
+**2026-08-13 correction to the mechanism-gap note above**: the nested
+`reasoning: {effort, max_tokens, exclude}` object turned out to have a real
+complication the earlier grounding pass didn't catch — live-fetched from
+`openrouter.ai/docs/api-reference/parameters`, `effort` and `max_tokens` are
+**mutually exclusive within that object**, and provider support for each
+sub-field differs (confirmed: Anthropic accepts `max_tokens` only, min 1024/
+max 128000; OpenAI o-series/GPT-5-series and Google Gemini 3 accept
+`effort`). The installed package's own `ReasoningParams` dataclass
+(`llm_council.gateway.types`) always sends all three fields together when
+used, which would violate that mutual-exclusivity rule for any Anthropic
+call. **Sidestepped entirely**: OpenRouter also exposes a separate,
+simpler top-level `reasoning_effort: "none"|"minimal"|"low"|"medium"|
+"high"|"xhigh"` field ("OpenAI-style reasoning effort setting"). A live
+`/api/v1/models` catalog fetch confirmed all 4 models this project's real
+call paths use — `anthropic/claude-opus-4.8`, `openai/gpt-5.5`,
+`google/gemini-3.6-flash`, `z-ai/glm-5.2` — list `reasoning_effort` in their
+own `supported_parameters`. This project's Stage 2.75/3.75/4 wiring above
+uses that top-level field exclusively, never the nested object. Also found
+while grounding this: the installed package's
+`llm_council.metadata.get_provider().supports_reasoning(model)` check is
+**stale** for this exact question — it reports `False` for both
+`openai/gpt-5.5` and `google/gemini-3.6-flash`, contradicted by the live
+catalog. Not used for that reason; see
+`docs/specs/reasoning-effort-wiring-contract.md` for the full record.
 
 ## 4. Meta Muse Spark 1.2 — researched, not adopted this session
 

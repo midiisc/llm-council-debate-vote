@@ -52,6 +52,10 @@ FetchEvidenceFn = Callable[[list[Claim]], Awaitable[dict[str, list[Evidence]]]]
 # result computed earlier in _run_stages(), no re-computation.
 CouncilFn = Callable[[str, list[TaggedClaim]], Awaitable[tuple[list, list, dict, dict]]]
 QueryModelFn = Callable[[str, str], Awaitable[tuple[str, float]]]
+# (model, prompt, effort) -> (text, cost) - docs/specs/reasoning-effort-
+# wiring-contract.md, Contract 2. Strictly additive/optional: None keeps
+# every existing call site and test byte-identical to before this contract.
+ReasoningQueryModelFn = Callable[[str, str, str], Awaitable[tuple[str, float]]]
 
 
 @dataclass
@@ -295,6 +299,10 @@ async def run_pipeline(
     # audition tracking entirely - this stays an additive, optional feature
     # for every existing PipelineConfig/run_pipeline call site.
     council_models: Optional[list[str]] = None,
+    # docs/specs/reasoning-effort-wiring-contract.md, Contract 2. None
+    # (default) means Stage 2.75/3.75/4 call plain `query_model` exactly as
+    # before this contract - every existing call site/test is unaffected.
+    query_model_with_effort: Optional[ReasoningQueryModelFn] = None,
 ) -> PipelineResult:
     from datetime import datetime, timezone
 
@@ -308,6 +316,21 @@ async def run_pipeline(
 
     async def _run_stages():
         nonlocal cost_so_far
+
+        def _query_model_for_effort(effort: str) -> QueryModelFn:
+            # docs/specs/reasoning-effort-wiring-contract.md, Contract 2.
+            # query_model_with_effort is None on every existing call site,
+            # so this is a pure passthrough there - only a caller that
+            # actually supplies it (main()) gets effort-tagged requests.
+            if query_model_with_effort is None:
+                return query_model
+            effort_fn = query_model_with_effort
+
+            async def _fn(model: str, prompt: str) -> tuple[str, float]:
+                return await effort_fn(model, prompt, effort)
+
+            return _fn
+
         # docs/specs/reasoning-graph-contract.md, Stage 5 wall-clock
         # soft-budget self-check.
         stage_start = time.monotonic()
@@ -456,7 +479,11 @@ async def run_pipeline(
                     for s1 in stage1_results
                 ]
                 outcomes = await run_revision_round(
-                    css, answers, verified_facts, query_model, source_document=config.query
+                    css,
+                    answers,
+                    verified_facts,
+                    _query_model_for_effort("high"),
+                    source_document=config.query,
                 )
                 revision_cost = sum(o.cost_usd for o in outcomes)
                 cost_so_far += revision_cost
@@ -491,7 +518,9 @@ async def run_pipeline(
             debug_log.append("Stage 3.75: skipped (would exceed max_cost_usd)")
         else:
             try:
-                critique_outcome = await run_critique_round(synthesis, query_model)
+                critique_outcome = await run_critique_round(
+                    synthesis, _query_model_for_effort("high")
+                )
                 cost_so_far += critique_outcome.cost_usd
                 critique_triggered = True
                 critique_text = critique_outcome.critique_text
@@ -514,7 +543,10 @@ async def run_pipeline(
             debug_log.append("Stage 4: skipped (would exceed max_cost_usd)")
         else:
             dropped_facts, completeness_check_cost, parse_ok = await check_fact_completeness(
-                verified_facts, synthesis, config.completeness_check_model, query_model
+                verified_facts,
+                synthesis,
+                config.completeness_check_model,
+                _query_model_for_effort("low"),
             )
             cost_so_far += completeness_check_cost
             completeness_check_parse_failed = not parse_ok
@@ -792,6 +824,11 @@ def main() -> None:
             overall_wall_clock_seconds=args.max_wall_clock_seconds,
         )
 
+    # docs/specs/reasoning-effort-wiring-contract.md, Contract 3 - the only
+    # place this project actually sends the live `reasoning_effort` field.
+    async def _query_model_with_effort(model: str, prompt: str, effort: str) -> tuple[str, float]:
+        return await real_query_model(model, prompt, reasoning_effort=effort)
+
     config = PipelineConfig(
         topic_label=args.topic_label,
         query=args.query,
@@ -809,6 +846,7 @@ def main() -> None:
                 council_fn,
                 real_query_model,
                 council_models=council_models,
+                query_model_with_effort=_query_model_with_effort,
             )
         )
     except TimeoutError as e:

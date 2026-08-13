@@ -1226,6 +1226,99 @@ def test_debug_log_records_grounding_and_revision_when_they_run(tmp_path):
     assert "Stage 4: ran, parse succeeded, 0 fact(s) dropped" in result.debug_log
 
 
+# --- docs/specs/reasoning-effort-wiring-contract.md, Contract 2 ---
+
+
+class FakeQueryModelWithEffort:
+    def __init__(self, response_by_model=None, cost_per_call=0.0):
+        self.calls = []  # (model, prompt, effort)
+        self.response_by_model = response_by_model or {}
+        self.cost_per_call = cost_per_call
+
+    async def __call__(self, model: str, prompt: str, effort: str) -> tuple[str, float]:
+        self.calls.append((model, prompt, effort))
+        return self.response_by_model.get(model, "no revision"), self.cost_per_call
+
+
+def test_query_model_with_effort_none_leaves_every_stage_on_plain_query_model(tmp_path):
+    # AC5: the default (None) must be a pure no-op - every existing
+    # run_pipeline call site/test already exercises this implicitly, but
+    # this test asserts it directly rather than only by absence of failure.
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.2))
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "[]"})
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = asyncio.run(
+        run_pipeline(config, fetch_evidence, council_fn, query_model, query_model_with_effort=None)
+    )
+
+    assert result.revision_triggered is True
+    assert len(query_model.calls) > 0
+
+
+def test_query_model_with_effort_routes_revision_and_critique_at_high_and_completeness_at_low(
+    tmp_path,
+):
+    # AC6-8: when supplied, Stage 2.75 revision and Stage 3.75 critique both
+    # request "high"; Stage 4 completeness requests "low". The plain
+    # query_model fake is never called at all for these three stages once
+    # query_model_with_effort is supplied.
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.2))  # triggers revision + critique
+    query_model = FakeQueryModel()
+    query_model_with_effort = FakeQueryModelWithEffort(
+        response_by_model={"google/gemini-3.6-flash": "[]"}
+    )
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = asyncio.run(
+        run_pipeline(
+            config,
+            fetch_evidence,
+            council_fn,
+            query_model,
+            query_model_with_effort=query_model_with_effort,
+        )
+    )
+
+    assert result.revision_triggered is True
+    assert result.critique_triggered is True
+    # Stage 5's reasoning-graph extraction is explicitly out of scope for
+    # this contract (docs/specs/reasoning-effort-wiring-contract.md,
+    # Contract 2 AC9) and keeps calling the plain query_model directly - so
+    # it's the ONLY caller left on query_model once effort routing is
+    # supplied for revision/critique/completeness.
+    assert {m for m, _p in query_model.calls} == {config.completeness_check_model}
+
+    efforts_by_model = {}
+    prompts_by_model = {}
+    for model, prompt, effort in query_model_with_effort.calls:
+        efforts_by_model.setdefault(model, set()).add(effort)
+        prompts_by_model.setdefault(model, []).append(prompt)
+
+    # revision calls (model-x, model-y) and the critique call (gpt-5.5) all
+    # requested "high"
+    assert efforts_by_model["model-x"] == {"high"}
+    assert efforts_by_model["model-y"] == {"high"}
+    assert efforts_by_model["openai/gpt-5.5"] == {"high"}
+    # the completeness check call (google/gemini-3.6-flash) requested "low"
+    assert efforts_by_model["google/gemini-3.6-flash"] == {"low"}
+
+    # the real prompt text must actually reach the effort-routed call, not
+    # a placeholder - each model's own revision prompt carries its own
+    # original answer, and the critique prompt carries the real synthesis.
+    assert any("Answer from X" in p for p in prompts_by_model["model-x"])
+    assert any("Answer from Y" in p for p in prompts_by_model["model-y"])
+    assert any("Final synthesis text" in p for p in prompts_by_model["openai/gpt-5.5"])
+
+
 def test_debug_log_grounding_counts_each_tag_correctly(tmp_path):
     # Distinguishes each of n_verified/n_contradicted/n_unverifiable's own
     # count from the others - a single-VERIFIED-only fixture can't tell
@@ -2251,9 +2344,17 @@ def _make_pipeline_result(**overrides):
 def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None, freshness_result=None):
     calls = {"run_pipeline_args": None, "council_fn_query": None}
 
-    async def fake_run_pipeline(config, fetch_evidence, council_fn, query_model, council_models=None):
+    async def fake_run_pipeline(
+        config,
+        fetch_evidence,
+        council_fn,
+        query_model,
+        council_models=None,
+        query_model_with_effort=None,
+    ):
         calls["run_pipeline_args"] = (config, fetch_evidence, council_fn, query_model)
         calls["council_models"] = council_models
+        calls["query_model_with_effort"] = query_model_with_effort
         if exc is not None:
             raise exc
         return result
@@ -2477,6 +2578,37 @@ def test_main_passes_the_real_fetch_evidence_and_query_model_adapters(monkeypatc
     _, fetch_evidence, _, query_model = calls["run_pipeline_args"]
     assert fetch_evidence is _la_module.real_fetch_evidence
     assert query_model is _la_module.real_query_model
+
+
+def test_main_query_model_with_effort_forwards_model_prompt_effort_to_real_query_model(
+    monkeypatch, capsys
+):
+    # docs/specs/reasoning-effort-wiring-contract.md, Contract 3: main()
+    # must wire a query_model_with_effort closure that actually reaches
+    # real_query_model with the effort string forwarded as
+    # reasoning_effort - not just be non-None.
+    result = _make_pipeline_result()
+    captured = {}
+
+    async def fake_real_query_model(model, prompt, reasoning_effort=None):
+        captured["model"] = model
+        captured["prompt"] = prompt
+        captured["reasoning_effort"] = reasoning_effort
+        return "text", 0.0
+
+    monkeypatch.setattr(_la_module, "real_query_model", fake_real_query_model)
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    query_model_with_effort = calls["query_model_with_effort"]
+    assert query_model_with_effort is not None
+    asyncio.run(query_model_with_effort("some/model", "some prompt", "high"))
+
+    assert captured["model"] == "some/model"
+    assert captured["prompt"] == "some prompt"
+    assert captured["reasoning_effort"] == "high"
 
 
 def test_main_cost_ceiling_exceeded_exits_3_with_exact_warning(monkeypatch, capsys):

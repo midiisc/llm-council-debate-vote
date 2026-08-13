@@ -13,7 +13,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Optional
 
 import keyring
 
@@ -77,14 +77,23 @@ def _post_chat_completion(
     max_tokens: int = 2000,
     max_retries: int = MAX_RETRIES,
     sleep_fn=time.sleep,
+    reasoning_effort: Optional[str] = None,
 ) -> dict[str, Any]:
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-        }
-    ).encode()
+    # docs/specs/reasoning-effort-wiring-contract.md, Contract 1: the
+    # top-level `reasoning_effort` field, not the nested `reasoning` object
+    # - confirmed live (openrouter.ai/docs/api-reference/parameters, plus a
+    # live /api/v1/models supported_parameters check) as supported per-model
+    # for every model this project's real call paths use, and it sidesteps
+    # the nested object's effort/max_tokens mutual-exclusivity and
+    # per-provider max_tokens-mapping complexity entirely.
+    request_body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+    }
+    if reasoning_effort is not None:
+        request_body["reasoning_effort"] = reasoning_effort
+    body = json.dumps(request_body).encode()
     req = urllib.request.Request(
         OPENROUTER_URL,
         data=body,
@@ -106,7 +115,11 @@ def _post_chat_completion(
 
 
 async def _post_chat_completion_async(
-    model: str, prompt: str, max_tokens: int = 2000, max_retries: int = MAX_RETRIES,
+    model: str,
+    prompt: str,
+    max_tokens: int = 2000,
+    max_retries: int = MAX_RETRIES,
+    reasoning_effort: Optional[str] = None,
 ) -> dict[str, Any]:
     """Runs the existing synchronous _post_chat_completion (urllib +
     blocking time.sleep backoff) in a worker thread via asyncio.to_thread,
@@ -117,19 +130,32 @@ async def _post_chat_completion_async(
     calls" finding). No migration off urllib, minimal-diff fix - the
     synchronous _post_chat_completion itself is unchanged."""
     return await asyncio.to_thread(
-        _post_chat_completion, model, prompt, max_tokens=max_tokens, max_retries=max_retries
+        _post_chat_completion,
+        model,
+        prompt,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        reasoning_effort=reasoning_effort,
     )
 
 
-async def real_query_model(model: str, prompt: str) -> tuple[str, float]:
+async def real_query_model(
+    model: str, prompt: str, reasoning_effort: Optional[str] = None
+) -> tuple[str, float]:
     """query_model for revision_round.run_revision_round.
 
     Returns (response_text, cost_usd). cost_usd comes from OpenRouter's own
     usage.cost field; treated as 0.0 if the provider didn't report it rather
     than raising, since a missing cost figure shouldn't crash a revision
     round that otherwise succeeded.
+
+    reasoning_effort (docs/specs/reasoning-effort-wiring-contract.md,
+    Contract 1): None (default) preserves this function's exact prior
+    behavior/request body - every existing call site keeps working
+    unchanged. A non-None value threads straight into the top-level
+    `reasoning_effort` request field.
     """
-    data = await _post_chat_completion_async(model, prompt)
+    data = await _post_chat_completion_async(model, prompt, reasoning_effort=reasoning_effort)
     text = data["choices"][0]["message"]["content"]
     cost_usd = data.get("usage", {}).get("cost") or 0.0
     return text, cost_usd

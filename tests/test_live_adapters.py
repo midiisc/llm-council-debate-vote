@@ -463,6 +463,153 @@ def test_post_chat_completion_default_max_tokens_is_2000(monkeypatch):
     assert captured["body"]["max_tokens"] == 2000
 
 
+# --- docs/specs/reasoning-effort-wiring-contract.md, Contract 1 ---
+
+
+def test_post_chat_completion_default_reasoning_effort_omits_the_key(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = json.loads(req.data)
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "k")
+
+    _post_chat_completion("m", "p", sleep_fn=lambda s: None)
+
+    assert "reasoning_effort" not in captured["body"]
+
+
+def test_post_chat_completion_reasoning_effort_adds_top_level_field(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = json.loads(req.data)
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("scripts.live_adapters._get_openrouter_key", lambda: "k")
+
+    _post_chat_completion("m", "p", sleep_fn=lambda s: None, reasoning_effort="high")
+
+    assert captured["body"]["reasoning_effort"] == "high"
+    # Contract 1, AC2: the nested reasoning object is never used for this
+    # project's own raw-HTTP path - only the top-level field.
+    assert "reasoning" not in captured["body"]
+
+
+def test_post_chat_completion_async_passes_every_arg_through(monkeypatch):
+    captured = {}
+
+    def fake_sync_post(
+        model, prompt, max_tokens=2000, max_retries=3, sleep_fn=None, reasoning_effort=None
+    ):
+        captured["model"] = model
+        captured["prompt"] = prompt
+        captured["max_tokens"] = max_tokens
+        captured["max_retries"] = max_retries
+        captured["reasoning_effort"] = reasoning_effort
+        return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.01}}
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion", fake_sync_post)
+
+    asyncio.run(
+        _post_chat_completion_async(
+            "m", "p", max_tokens=777, max_retries=5, reasoning_effort="medium"
+        )
+    )
+
+    assert captured["model"] == "m"
+    assert captured["prompt"] == "p"
+    assert captured["max_tokens"] == 777
+    assert captured["max_retries"] == 5
+    assert captured["reasoning_effort"] == "medium"
+
+
+def test_post_chat_completion_async_default_max_tokens_is_2000(monkeypatch):
+    captured = {}
+
+    def fake_sync_post(
+        model, prompt, max_tokens=2000, max_retries=3, sleep_fn=None, reasoning_effort=None
+    ):
+        captured["max_tokens"] = max_tokens
+        return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.01}}
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion", fake_sync_post)
+
+    asyncio.run(_post_chat_completion_async("m", "p"))
+
+    assert captured["max_tokens"] == 2000
+
+
+def test_real_query_model_default_reasoning_effort_is_none(monkeypatch):
+    captured = {}
+
+    async def fake_post_async(model, prompt, reasoning_effort=None):
+        captured["model"] = model
+        captured["prompt"] = prompt
+        captured["reasoning_effort"] = reasoning_effort
+        return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.01}}
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+
+    text, cost = asyncio.run(real_query_model("my/model", "my prompt"))
+
+    assert captured["model"] == "my/model"
+    assert captured["prompt"] == "my prompt"
+    assert captured["reasoning_effort"] is None
+    assert text == "hi"
+    assert cost == 0.01
+
+
+def test_real_query_model_threads_reasoning_effort_through(monkeypatch):
+    captured = {}
+
+    async def fake_post_async(model, prompt, reasoning_effort=None):
+        captured["reasoning_effort"] = reasoning_effort
+        return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.01}}
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+
+    asyncio.run(real_query_model("m", "p", reasoning_effort="low"))
+
+    assert captured["reasoning_effort"] == "low"
+
+
+def test_real_query_model_cost_falls_back_to_zero_when_usage_missing(monkeypatch):
+    async def fake_post_async(model, prompt, reasoning_effort=None):
+        return {"choices": [{"message": {"content": "hi"}}]}  # no "usage" key at all
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+
+    text, cost = asyncio.run(real_query_model("m", "p"))
+
+    assert cost == 0.0
+
+
+def test_real_query_model_cost_falls_back_to_zero_when_cost_is_none(monkeypatch):
+    async def fake_post_async(model, prompt, reasoning_effort=None):
+        return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": None}}
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+
+    text, cost = asyncio.run(real_query_model("m", "p"))
+
+    assert cost == 0.0
+
+
+def test_real_query_model_real_nonzero_cost_is_not_hardcoded(monkeypatch):
+    async def fake_post_async(model, prompt, reasoning_effort=None):
+        return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.0347}}
+
+    monkeypatch.setattr("scripts.live_adapters._post_chat_completion_async", fake_post_async)
+
+    text, cost = asyncio.run(real_query_model("m", "p"))
+
+    assert cost == 0.0347
+
+
 def test_post_chat_completion_succeeds_first_try_no_retry_no_sleep(monkeypatch):
     calls = []
     sleeps = []
@@ -562,7 +709,12 @@ def test_post_chat_completion_non_retryable_error_raises_immediately_no_sleep(mo
 import asyncio
 import time
 
-from scripts.live_adapters import EvidenceMap, _post_chat_completion_async, real_fetch_evidence
+from scripts.live_adapters import (
+    EvidenceMap,
+    _post_chat_completion_async,
+    real_fetch_evidence,
+    real_query_model,
+)
 
 
 def test_post_chat_completion_async_lets_asyncio_wait_for_actually_preempt(monkeypatch):
@@ -587,7 +739,9 @@ def test_post_chat_completion_async_lets_asyncio_wait_for_actually_preempt(monke
 
 
 def test_post_chat_completion_async_returns_the_same_shape_as_the_sync_function(monkeypatch):
-    def fake_sync_post(model, prompt, max_tokens=2000, max_retries=3, sleep_fn=None):
+    def fake_sync_post(
+        model, prompt, max_tokens=2000, max_retries=3, sleep_fn=None, reasoning_effort=None
+    ):
         return {"choices": [{"message": {"content": "hi"}}], "usage": {"cost": 0.01}}
 
     monkeypatch.setattr("scripts.live_adapters._post_chat_completion", fake_sync_post)
