@@ -23,6 +23,13 @@ FetchModelsFn = Callable[[], Awaitable[list[str]]]
 # Injected so tests never make a real network call.
 
 
+def default_slug_freshness_cache_path(cwd: Path) -> Path:
+    # docs/specs/pending-stage-wiring-contract.md, Contract 1: folder-scoped,
+    # never ~/.llm-council/, matching default_scorecard_path/
+    # default_audition_path's existing convention.
+    return cwd / "council-runs" / "slug_freshness_cache.json"
+
+
 @dataclass
 class FreshnessResult:
     checked_slugs: list[str]  # every configured slug this check covers, in input order

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import statistics
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -23,6 +24,8 @@ from scripts.grounding_pass import (
     tag_claim,
 )
 from scripts.audition_tracking import default_audition_path, record_session_for_all_models
+from scripts.critique_round import run_critique_round, should_trigger_critique
+from scripts.reasoning_graph import build_reasoning_graph, write_reasoning_graph_files
 from scripts.revision_round import ModelAnswer, run_revision_round, should_trigger_revision
 from scripts.scorecard import ScorecardRecord, append_record, default_scorecard_path
 from scripts.transcript_writer import (
@@ -93,6 +96,15 @@ class PipelineResult:
     # NOT "verified clean," it's "undetermined." Never True when the check
     # didn't run at all (no grounding, or skipped for cost).
     completeness_check_parse_failed: bool = False
+    # Stage 3.75 (docs/specs/stage-3-75-critique-contract.md).
+    critique_triggered: bool = False
+    critique_text: Optional[str] = None
+    critique_skipped_for_cost: bool = False
+    # Stage 5 (docs/specs/reasoning-graph-contract.md). None iff the stage
+    # was skipped for any reason (reasoning_graph_skipped_reason then names why).
+    reasoning_graph_path: Optional[Path] = None
+    reasoning_graph_skipped_reason: Optional[str] = None
+    reasoning_graph_dropped_count: Optional[dict] = None
     # One line per stage transition, in order - what actually ran, what
     # was skipped and why, how many models/outcomes were involved. Read
     # top to bottom to see exactly what happened in a run without
@@ -262,6 +274,16 @@ def _compute_outliers(aggregate_rankings: list[dict]) -> dict[str, bool]:
     }
 
 
+def _reasoning_graph_wall_clock_margin_exceeded(
+    stage_start: float, max_wall_clock_seconds: float, now_fn: Callable[[], float] = time.monotonic
+) -> bool:
+    # docs/specs/reasoning-graph-contract.md's wall-clock soft-budget
+    # self-check. Injectable now_fn (mirrors resilient_query.py's own
+    # time_fn convention) so this is unit-testable without touching real
+    # event-loop timing.
+    return now_fn() - stage_start > max_wall_clock_seconds - 60.0
+
+
 async def run_pipeline(
     config: PipelineConfig,
     fetch_evidence: FetchEvidenceFn,
@@ -286,6 +308,9 @@ async def run_pipeline(
 
     async def _run_stages():
         nonlocal cost_so_far
+        # docs/specs/reasoning-graph-contract.md, Stage 5 wall-clock
+        # soft-budget self-check.
+        stage_start = time.monotonic()
         verified_facts: list[TaggedClaim] = []
         if config.raw_claims_text.strip():
             claims = parse_claims(config.raw_claims_text)
@@ -344,6 +369,23 @@ async def run_pipeline(
                 "this is not multi-agent debate"
             )
 
+        # architecture-stress-test-2026-08-13.md, High finding: the safety
+        # gate (evaluation.safety.enabled) was computed per Stage 1 response
+        # (council_adapter.py's check_response_safety) but never read
+        # anywhere - a flagged response passed through completely silently.
+        # Surfaced here the same way every other real signal in this
+        # function is: a loud debug_log WARNING, never a silent drop. Not a
+        # new blocking/scoring behavior (that would be a separate, larger
+        # design decision) - closes the specific "computed but never read"
+        # gap on file, nothing more.
+        for r in stage1_results:
+            safety_check = r.get("safety_check")
+            if safety_check and not safety_check.get("passed", True):
+                debug_log.append(
+                    f"WARNING: {r['model']}'s Stage 1 draft failed the safety "
+                    f"check ({safety_check.get('reason')})"
+                )
+
         # Durable persistence (docs/specs/durable-persistence-contract.md) -
         # best-effort, a disk-write failure must never crash an otherwise-
         # successful pipeline run (mirrors the audition-tracking try/except
@@ -362,6 +404,12 @@ async def run_pipeline(
         shortfall_warning = metadata.get("shortfall_warning")
         if shortfall_warning:
             debug_log.append(f"WARNING: {shortfall_warning}")
+
+        for model in metadata.get("ungrounded_models") or []:
+            debug_log.append(
+                f"WARNING: {model}'s Stage 1 draft carried no grounding tags "
+                "despite being instructed to tag every substantive claim"
+            )
 
         css = metadata["quality_metrics"]["core"]["consensus_strength"]
         aggregate_rankings = metadata["aggregate_rankings"]
@@ -429,6 +477,32 @@ async def run_pipeline(
 
         debug_log.append(f"Stage 3: synthesis produced by {stage3_result.get('model', 'unknown')}")
 
+        # docs/specs/stage-3-75-critique-contract.md: devil's-advocate +
+        # counterfactual critique, GPT-5.5 only, never the chairman, gated
+        # on CSS<0.50 OR any outlier. Never auto-triggers re-synthesis -
+        # the memo is for the still-manual Stage 4 premortem to read.
+        critique_triggered = False
+        critique_text: Optional[str] = None
+        critique_skipped_for_cost = False
+        if not should_trigger_critique(css, is_outlier):
+            debug_log.append(f"Stage 3.75: skipped (CSS {css:.3f} >= threshold and no outlier)")
+        elif config.max_cost_usd is not None and cost_so_far >= config.max_cost_usd:
+            critique_skipped_for_cost = True
+            debug_log.append("Stage 3.75: skipped (would exceed max_cost_usd)")
+        else:
+            try:
+                critique_outcome = await run_critique_round(synthesis, query_model)
+                cost_so_far += critique_outcome.cost_usd
+                critique_triggered = True
+                critique_text = critique_outcome.critique_text
+                debug_log.append("Stage 3.75: critique produced by openai/gpt-5.5")
+                try:
+                    (output_dir / "critique_memo.md").write_text(critique_outcome.critique_text)
+                except Exception as e:
+                    debug_log.append(f"Transcript write (critique_memo.md): failed non-fatally ({e})")
+            except Exception as e:
+                debug_log.append(f"Stage 3.75: failed non-fatally ({e})")
+
         dropped_facts: list[str] = []
         completeness_check_skipped_for_cost = False
         completeness_check_parse_failed = False
@@ -450,6 +524,68 @@ async def run_pipeline(
                 debug_log.append(
                     "Stage 4: ran, parse FAILED - completeness is UNDETERMINED, not verified"
                 )
+
+        # docs/specs/reasoning-graph-contract.md, Integration section: all
+        # three gates must pass, else skip loudly (never a silent absence).
+        # A dropped_fact_ids set feeds build_reference_nodes_and_edges so a
+        # fact Stage 4 flagged as unaddressed renders distinctly from one
+        # the synthesis actually covered.
+        reasoning_graph_path: Optional[Path] = None
+        reasoning_graph_skipped_reason: Optional[str] = None
+        reasoning_graph_dropped_count: Optional[dict] = None
+        if config.max_cost_usd is not None and cost_so_far >= config.max_cost_usd:
+            reasoning_graph_skipped_reason = "cost_ceiling"
+            debug_log.append("Stage 5: skipped (would exceed max_cost_usd)")
+        elif _reasoning_graph_wall_clock_margin_exceeded(
+            stage_start, config.max_wall_clock_seconds
+        ):
+            reasoning_graph_skipped_reason = "wall_clock_margin"
+            debug_log.append("Stage 5: skipped (too little wall-clock budget remaining)")
+        else:
+            try:
+                async def _reasoning_graph_query_fn(model: str, prompt: str, timeout: float):
+                    try:
+                        text, cost = await asyncio.wait_for(
+                            query_model(model, prompt), timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        return None
+                    nonlocal cost_so_far
+                    cost_so_far += cost
+                    # build_reasoning_graph only ever reads response["content"] -
+                    # no "usage" key needed here (unlike live_adapters.py's raw
+                    # HTTP responses, which include it for other consumers).
+                    return {"content": text}
+
+                graph, extraction_skip_reason = await build_reasoning_graph(
+                    run_id=timestamp,
+                    synthesis_text=synthesis,
+                    verified_facts=verified_facts,
+                    dropped_fact_ids=set(dropped_facts),
+                    model=config.completeness_check_model,
+                    query_fn=_reasoning_graph_query_fn,
+                    timeout=120.0,
+                )
+                if graph is None:
+                    reasoning_graph_skipped_reason = extraction_skip_reason
+                    debug_log.append(f"Stage 5: skipped ({extraction_skip_reason})")
+                else:
+                    json_path, _, _ = write_reasoning_graph_files(output_dir, graph, synthesis)
+                    reasoning_graph_path = json_path
+                    reasoning_graph_dropped_count = {
+                        "nodes": graph.dropped_node_count,
+                        "edges": graph.dropped_edge_count,
+                    }
+                    n_nodes = len(graph.nodes) - graph.dropped_node_count
+                    n_edges = len(graph.edges) - graph.dropped_edge_count
+                    debug_log.append(
+                        f"Stage 5: graph extracted, {n_nodes} node(s) kept "
+                        f"({graph.dropped_node_count} dropped), {n_edges} edge(s) "
+                        f"kept ({graph.dropped_edge_count} dropped)"
+                    )
+            except Exception as e:
+                reasoning_graph_skipped_reason = "extraction_error"
+                debug_log.append(f"Stage 5: skipped (extraction_error: {e})")
 
         rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
         ranks = _compute_ranks(aggregate_rankings)
@@ -506,6 +642,12 @@ async def run_pipeline(
             dropped_facts,
             completeness_check_skipped_for_cost,
             completeness_check_parse_failed,
+            critique_triggered,
+            critique_text,
+            critique_skipped_for_cost,
+            reasoning_graph_path,
+            reasoning_graph_skipped_reason,
+            reasoning_graph_dropped_count,
         )
 
     try:
@@ -519,6 +661,12 @@ async def run_pipeline(
             dropped_facts,
             completeness_check_skipped_for_cost,
             completeness_check_parse_failed,
+            critique_triggered,
+            critique_text,
+            critique_skipped_for_cost,
+            reasoning_graph_path,
+            reasoning_graph_skipped_reason,
+            reasoning_graph_dropped_count,
         ) = await asyncio.wait_for(_run_stages(), timeout=config.max_wall_clock_seconds)
     except asyncio.TimeoutError:
         # asyncio.TimeoutError is TimeoutError itself on Python 3.11+ (the
@@ -554,6 +702,12 @@ async def run_pipeline(
         dropped_facts=dropped_facts,
         completeness_check_skipped_for_cost=completeness_check_skipped_for_cost,
         completeness_check_parse_failed=completeness_check_parse_failed,
+        critique_triggered=critique_triggered,
+        critique_text=critique_text,
+        critique_skipped_for_cost=critique_skipped_for_cost,
+        reasoning_graph_path=reasoning_graph_path,
+        reasoning_graph_skipped_reason=reasoning_graph_skipped_reason,
+        reasoning_graph_dropped_count=reasoning_graph_dropped_count,
         debug_log=debug_log,
     )
 
@@ -593,13 +747,43 @@ def _build_arg_parser():
 
 def main() -> None:
     import sys
+    from datetime import datetime, timezone
 
-    from scripts.council_adapter import run_council_with_timeouts
-    from scripts.live_adapters import real_fetch_evidence, real_query_model
+    from scripts.council_adapter import _load_debate_resilience_config, run_council_with_timeouts
+    from scripts.live_adapters import (
+        real_fetch_evidence,
+        real_fetch_live_model_ids,
+        real_query_model,
+    )
+    from scripts.slug_freshness import check_slug_freshness, default_slug_freshness_cache_path
 
     from llm_council.unified_config import get_config
 
     args = _build_arg_parser().parse_args()
+
+    council_models = get_config().council.models
+
+    # docs/specs/pending-stage-wiring-contract.md, Contract 1: at most
+    # once/day, covers every slug this project actually configures (core
+    # roster + backup pool) - visibility only, never blocking, since the
+    # resilience/backup mechanism already handles a dead slug at call time.
+    backup_models = _load_debate_resilience_config().backup_models
+    freshness_result = asyncio.run(
+        check_slug_freshness(
+            configured_slugs=list(council_models) + list(backup_models),
+            cache_path=default_slug_freshness_cache_path(Path.cwd()),
+            fetch_fn=real_fetch_live_model_ids,
+            today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        )
+    )
+    if freshness_result.warning:
+        print(f"WARNING: {freshness_result.warning}", file=sys.stderr)
+    if freshness_result.fetch_error:
+        print(
+            f"WARNING: slug freshness check could not reach OpenRouter "
+            f"({freshness_result.fetch_error}) - proceeding without it",
+            file=sys.stderr,
+        )
 
     async def council_fn(query: str, verified_facts: list[TaggedClaim]):
         return await run_council_with_timeouts(
@@ -607,8 +791,6 @@ def main() -> None:
             verified_facts,
             overall_wall_clock_seconds=args.max_wall_clock_seconds,
         )
-
-    council_models = get_config().council.models
 
     config = PipelineConfig(
         topic_label=args.topic_label,

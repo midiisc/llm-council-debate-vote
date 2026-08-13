@@ -1006,3 +1006,75 @@ async def _true_async(url, timeout=5.0):
 
 async def _false_async(url, timeout=5.0):
     return False
+
+
+# ---------------------------------------------------------------------------
+# docs/specs/pending-stage-wiring-contract.md, Contract 1: real_fetch_live_model_ids
+# ---------------------------------------------------------------------------
+
+from scripts.live_adapters import real_fetch_live_model_ids  # noqa: E402
+
+
+def test_real_fetch_live_model_ids_parses_data_ids(monkeypatch):
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"data": [{"id": "openai/gpt-5.5"}, {"id": "anthropic/claude-opus-4.8"}]}
+            ).encode()
+
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    ids = asyncio.run(real_fetch_live_model_ids())
+
+    assert ids == ["openai/gpt-5.5", "anthropic/claude-opus-4.8"]
+    assert captured["url"] == "https://openrouter.ai/api/v1/models"
+    assert captured["method"] == "GET"
+
+
+def test_real_fetch_live_model_ids_skips_entries_without_id(monkeypatch):
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"id": "a/b"}, {"name": "no id field"}]}).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResp())
+
+    ids = asyncio.run(real_fetch_live_model_ids())
+
+    assert ids == ["a/b"]
+
+
+def test_real_fetch_live_model_ids_empty_data_yields_empty_list(monkeypatch):
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"data": []}).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResp())
+
+    ids = asyncio.run(real_fetch_live_model_ids())
+
+    assert ids == []

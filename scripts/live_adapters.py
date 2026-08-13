@@ -375,3 +375,25 @@ async def real_fetch_evidence(
     evidence.cost_usd = total_cost
     evidence.truncated = truncated
     return evidence
+
+
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+
+async def real_fetch_live_model_ids() -> list[str]:
+    """docs/specs/pending-stage-wiring-contract.md, Contract 1.
+    fetch_fn for slug_freshness.check_slug_freshness. No API key required -
+    /api/v1/models is OpenRouter's public catalog. Raw json.loads, never a
+    summarizing fetch tool: this project already caught WebFetch truncating/
+    misreporting entries on this exact catalog (docs/upstream-deltas.md,
+    2026-08-13). asyncio.to_thread, matching every other real HTTP call in
+    this file - keeps the event loop responsive to the caller's own
+    timeout/cancellation."""
+
+    def _fetch() -> list[str]:
+        req = urllib.request.Request(OPENROUTER_MODELS_URL, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read())
+        return [entry["id"] for entry in payload.get("data", []) if "id" in entry]
+
+    return await asyncio.to_thread(_fetch)

@@ -16,12 +16,14 @@ from hypothesis import given, settings, strategies as st
 import scripts.council_adapter as _ca_module
 import scripts.live_adapters as _la_module
 import scripts.pipeline_runner as _pr_module
+import scripts.slug_freshness as _sf_module
 from scripts.pipeline_runner import (
     DEFAULT_MAX_WALL_CLOCK_SECONDS,
     PipelineConfig,
     PipelineResult,
     _build_arg_parser,
     _compute_outliers,
+    _reasoning_graph_wall_clock_margin_exceeded,
     _rubric_notes_for_model,
     _rubric_scores_for_model,
     _write_run_status,
@@ -343,8 +345,15 @@ def test_revision_prompt_receives_config_query_as_source_document(tmp_path):
     )
     _run(config, fetch_evidence, council_fn, query_model)
 
-    assert query_model.calls, "revision must have actually run for this to be meaningful"
-    for _model, prompt in query_model.calls:
+    # Stage 5's reasoning-graph extraction also calls query_model now
+    # (docs/specs/reasoning-graph-contract.md) but its prompt never
+    # includes the source document - scope this check to revision-round
+    # calls specifically, identified by their own document-section marker.
+    revision_calls = [
+        (m, p) for m, p in query_model.calls if "--- BEGIN SOURCE DOCUMENT ---" in p
+    ]
+    assert revision_calls, "revision must have actually run for this to be meaningful"
+    for _model, prompt in revision_calls:
         assert "UNIQUE_SOURCE_DOCUMENT_MARKER_TEXT" in prompt
         assert "--- BEGIN SOURCE DOCUMENT ---" in prompt
 
@@ -360,7 +369,10 @@ def test_ac3_high_css_skips_revision(tmp_path):
     config = PipelineConfig(topic_label="t", query="the actual question", output_root=tmp_path)
     result = _run(config, fetch_evidence, council_fn, query_model)
 
-    assert query_model.calls == []
+    # No revision call - the only call() is Stage 5's reasoning-graph
+    # extraction attempt (unconditional, subject to cost/wall-clock gates
+    # only - docs/specs/reasoning-graph-contract.md).
+    assert [m for m, _ in query_model.calls] == [config.completeness_check_model]
     assert result.revision_triggered is False
     assert result.css == 0.6
     assert result.synthesis == "Final synthesis text"
@@ -494,7 +506,13 @@ def test_ac4_low_css_triggers_revision(tmp_path):
     assert result.revision_skipped_for_cost is False
     assert result.css == 0.3
     called_models = {m for m, _ in query_model.calls}
-    assert called_models == {"model-x", "model-y"}
+    # + config.completeness_check_model: Stage 5's unconditional reasoning-
+    # graph extraction attempt (docs/specs/reasoning-graph-contract.md).
+    # + openai/gpt-5.5: Stage 3.75's critique, also gated on css<0.50
+    # (docs/specs/stage-3-75-critique-contract.md).
+    assert called_models == {
+        "model-x", "model-y", config.completeness_check_model, "openai/gpt-5.5",
+    }
     # each model's own original answer text must reach the revision prompt
     prompt_for_x = next(p for m, p in query_model.calls if m == "model-x")
     assert "Answer from X" in prompt_for_x
@@ -521,8 +539,11 @@ def test_revision_cost_is_real_not_hardcoded_zero(tmp_path):
     result = _run(config, fetch_evidence, council_fn, query_model)
 
     assert result.revision_triggered is True
-    # stage1-3 cost (0.03) + 2 revision calls at 0.05 each = 0.13
-    assert result.total_cost_usd == pytest.approx(0.13)
+    # stage1-3 cost (0.03) + 2 revision calls at 0.05 each (0.10) + Stage 3.75's
+    # critique (0.05, docs/specs/stage-3-75-critique-contract.md) + Stage 5's
+    # own reasoning-graph extraction attempt at 0.05
+    # (docs/specs/reasoning-graph-contract.md) = 0.23
+    assert result.total_cost_usd == pytest.approx(0.23)
 
 
 @given(
@@ -542,7 +563,12 @@ def test_property_total_cost_always_equals_sum_of_all_stage_costs(
     config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
     result = _run(config, fetch_evidence, council_fn, query_model)
 
-    expected = cost_x + cost_y + 2 * revision_cost_per_call
+    # 2 revision calls + Stage 3.75's critique
+    # (docs/specs/stage-3-75-critique-contract.md) + Stage 5's own
+    # reasoning-graph extraction attempt
+    # (docs/specs/reasoning-graph-contract.md), all through the same
+    # query_model fake.
+    expected = cost_x + cost_y + 4 * revision_cost_per_call
     assert result.total_cost_usd == pytest.approx(expected)
 
 
@@ -1093,7 +1119,12 @@ def test_completeness_check_not_called_when_no_grounding(tmp_path):
 
     assert result.dropped_facts == []
     assert result.completeness_check_skipped_for_cost is False
-    assert query_model.calls == []
+    # Stage 4 (completeness check) never called query_model - Stage 5's own
+    # unconditional reasoning-graph extraction attempt
+    # (docs/specs/reasoning-graph-contract.md) still does, distinguished by
+    # its own prompt content since both stages default to the same model.
+    completeness_calls = [c for c in query_model.calls if "Extract a small reasoning graph" not in c[1]]
+    assert completeness_calls == []
 
 
 def test_completeness_check_called_once_when_grounding_ran(tmp_path):
@@ -1110,7 +1141,13 @@ def test_completeness_check_called_once_when_grounding_ran(tmp_path):
     )
     result = _run(config, fetch_evidence, council_fn, query_model)
 
-    completeness_calls = [c for c in query_model.calls if c[0] == "google/gemini-3.6-flash"]
+    # Filter out Stage 5's own reasoning-graph extraction call
+    # (docs/specs/reasoning-graph-contract.md) - same default model as
+    # Stage 4, distinguished by prompt content.
+    completeness_calls = [
+        c for c in query_model.calls
+        if c[0] == "google/gemini-3.6-flash" and "Extract a small reasoning graph" not in c[1]
+    ]
     assert len(completeness_calls) == 1
     # the actual synthesis text must reach the completeness prompt, not be
     # swapped for a placeholder
@@ -1247,6 +1284,345 @@ def test_debug_log_flags_single_model_as_not_mad(tmp_path):
     )
 
 
+def test_debug_log_warns_for_each_ungrounded_model(tmp_path):
+    # docs/specs/grounding-annotation-enforcement-contract.md, Contract 2,
+    # AC9: metadata["ungrounded_models"] must be surfaced loudly, matching
+    # how shortfall_warning/substitutions are already surfaced - never
+    # silently dropped.
+    fetch_evidence = _make_fetch_evidence()
+
+    async def two_model_council_fn(query, verified_facts=None):
+        stage1_results = [
+            {"model": "model-x", "response": "Answer from X [unverified]"},
+            {"model": "model-y", "response": "Answer from Y, no tags at all"},
+        ]
+        stage2_results = []
+        aggregate_rankings = [
+            {"model": "model-x", "borda_score": 1.0, "rank": 1},
+            {"model": "model-y", "borda_score": 0.5, "rank": 2},
+        ]
+        stage3_result = {"model": "model-x", "response": "Final synthesis text"}
+        metadata = {
+            "quality_metrics": {"core": {"consensus_strength": 0.9}},
+            "aggregate_rankings": aggregate_rankings,
+            "label_to_model": {
+                "Response A": {"model": "model-x", "display_index": 0},
+                "Response B": {"model": "model-y", "display_index": 1},
+            },
+            "ungrounded_models": ["model-y"],
+            "usage": {
+                "by_model": {"model-x": {"cost_usd": 0.01}, "model-y": {"cost_usd": 0.01}},
+                "total": {"cost_usd": 0.02},
+            },
+        }
+        return stage1_results, stage2_results, stage3_result, metadata
+
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, two_model_council_fn, query_model)
+
+    assert (
+        "WARNING: model-y's Stage 1 draft carried no grounding tags despite "
+        "being instructed to tag every substantive claim"
+        in result.debug_log
+    )
+
+
+def test_debug_log_no_grounding_warning_when_key_absent(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert not any("grounding tags" in line for line in result.debug_log)
+
+
+def test_debug_log_warns_for_a_flagged_safety_check(tmp_path):
+    # architecture-stress-test-2026-08-13.md High finding: safety_check was
+    # computed per Stage 1 response but never read anywhere - must now
+    # surface loudly, never silently.
+    fetch_evidence = _make_fetch_evidence()
+
+    async def flagged_council_fn(query, verified_facts=None):
+        stage1_results = [
+            {
+                "model": "model-x",
+                "response": "Answer from X [unverified]",
+                "safety_check": {"passed": False, "reason": "flagged-pattern", "flagged_patterns": ["p1"]},
+            },
+            {"model": "model-y", "response": "Answer from Y [unverified]", "safety_check": {"passed": True}},
+        ]
+        stage2_results = []
+        aggregate_rankings = [
+            {"model": "model-x", "borda_score": 1.0, "rank": 1},
+            {"model": "model-y", "borda_score": 0.5, "rank": 2},
+        ]
+        stage3_result = {"model": "model-x", "response": "Final synthesis text"}
+        metadata = {
+            "quality_metrics": {"core": {"consensus_strength": 0.9}},
+            "aggregate_rankings": aggregate_rankings,
+            "label_to_model": {
+                "Response A": {"model": "model-x", "display_index": 0},
+                "Response B": {"model": "model-y", "display_index": 1},
+            },
+            "usage": {
+                "by_model": {"model-x": {"cost_usd": 0.01}, "model-y": {"cost_usd": 0.01}},
+                "total": {"cost_usd": 0.02},
+            },
+        }
+        return stage1_results, stage2_results, stage3_result, metadata
+
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, flagged_council_fn, query_model)
+
+    assert (
+        "WARNING: model-x's Stage 1 draft failed the safety check (flagged-pattern)"
+        in result.debug_log
+    )
+    assert not any("model-y" in line and "safety check" in line for line in result.debug_log)
+
+
+def test_debug_log_no_safety_warning_when_check_absent(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert not any("safety check" in line for line in result.debug_log)
+
+
+# ---------------------------------------------------------------------------
+# docs/specs/pending-stage-wiring-contract.md, Contract 2 / reasoning-graph-
+# contract.md: Stage 5 wired into _run_stages(), unconditional (subject to
+# cost/wall-clock gates), never blocking an otherwise-successful run.
+# ---------------------------------------------------------------------------
+
+
+def test_stage5_writes_reasoning_graph_file_on_success(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '{"nodes": [], "edges": []}'})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.reasoning_graph_path is not None
+    assert result.reasoning_graph_path.exists()
+    assert result.reasoning_graph_skipped_reason is None
+    assert result.reasoning_graph_dropped_count == {"nodes": 0, "edges": 0}
+    # Exact match, not a prefix check - guards against n_nodes/n_edges
+    # being computed wrong (e.g. None instead of a real int) while the
+    # line's opening words still happen to match.
+    assert (
+        "Stage 5: graph extracted, 0 node(s) kept (0 dropped), "
+        "0 edge(s) kept (0 dropped)"
+        in result.debug_log
+    )
+
+
+def test_stage5_skipped_when_cost_ceiling_already_met(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=3.0, cost_y=3.0))
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '{"nodes": [], "edges": []}'})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=1.0)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.reasoning_graph_path is None
+    assert result.reasoning_graph_skipped_reason == "cost_ceiling"
+    assert "Stage 5: skipped (would exceed max_cost_usd)" in result.debug_log
+    # confirms no extraction call was attempted once the ceiling was already met
+    assert query_model.calls == []
+
+
+def test_reasoning_graph_wall_clock_margin_not_exceeded_with_room_to_spare():
+    assert _reasoning_graph_wall_clock_margin_exceeded(
+        stage_start=1000.0, max_wall_clock_seconds=120.0, now_fn=lambda: 1001.0
+    ) is False
+
+
+def test_reasoning_graph_wall_clock_margin_exceeded_inside_the_60s_buffer():
+    # elapsed (100s) > max_wall_clock_seconds (120) - 60 = 60
+    assert _reasoning_graph_wall_clock_margin_exceeded(
+        stage_start=1000.0, max_wall_clock_seconds=120.0, now_fn=lambda: 1100.0
+    ) is True
+
+
+def test_reasoning_graph_wall_clock_margin_boundary_exactly_at_threshold_not_exceeded():
+    # elapsed == max - 60 exactly: > is strict, must not trip on equality
+    assert _reasoning_graph_wall_clock_margin_exceeded(
+        stage_start=1000.0, max_wall_clock_seconds=120.0, now_fn=lambda: 1060.0
+    ) is False
+
+
+def test_stage5_skipped_when_wall_clock_margin_exceeded(tmp_path, monkeypatch):
+    import scripts.pipeline_runner as pr_module
+
+    monkeypatch.setattr(pr_module, "_reasoning_graph_wall_clock_margin_exceeded", lambda *a, **kw: True)
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '{"nodes": [], "edges": []}'})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.reasoning_graph_path is None
+    assert result.reasoning_graph_skipped_reason == "wall_clock_margin"
+    assert "Stage 5: skipped (too little wall-clock budget remaining)" in result.debug_log
+    assert query_model.calls == []
+
+
+def test_stage5_skipped_on_malformed_extraction_response_never_crashes(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    # not valid JSON - build_reasoning_graph's own malformed-response path
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "not json at all"})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.reasoning_graph_path is None
+    assert result.reasoning_graph_skipped_reason == "malformed_extraction_response"
+    assert "Stage 5: skipped (malformed_extraction_response)" in result.debug_log
+    # the run as a whole must still succeed - Stage 5 failure is never fatal
+    assert result.synthesis == "Final synthesis text"
+
+
+def test_stage5_skipped_when_query_model_raises_never_crashes(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+
+    async def raising_query_model(model, prompt):
+        raise RuntimeError("simulated provider outage")
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, raising_query_model)
+
+    assert result.reasoning_graph_path is None
+    assert result.reasoning_graph_skipped_reason == "extraction_error"
+    assert result.synthesis == "Final synthesis text"
+
+
+# ---------------------------------------------------------------------------
+# docs/specs/stage-3-75-critique-contract.md: Stage 3.75, gated on
+# CSS<0.50 OR any outlier, GPT-5.5 only, never auto-triggers re-synthesis.
+# ---------------------------------------------------------------------------
+
+
+def test_stage375_triggers_and_persists_memo_on_low_css(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3))
+    query_model = FakeQueryModel(response_by_model={"openai/gpt-5.5": "a real critique"})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.critique_triggered is True
+    assert result.critique_text == "a real critique"
+    assert (result.output_dir / "critique_memo.md").read_text() == "a real critique"
+    assert "Stage 3.75: critique produced by openai/gpt-5.5" in result.debug_log
+
+
+def test_stage375_skipped_on_high_css_no_outlier(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.critique_triggered is False
+    assert result.critique_text is None
+    assert not (result.output_dir / "critique_memo.md").exists()
+    assert any(
+        line.startswith("Stage 3.75: skipped (CSS") for line in result.debug_log
+    )
+    assert "openai/gpt-5.5" not in [m for m, _ in query_model.calls]
+
+
+def test_stage375_skipped_when_cost_ceiling_already_met(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=3.0, cost_y=3.0))
+    query_model = FakeQueryModel(response_by_model={"openai/gpt-5.5": "critique"})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=1.0)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.critique_triggered is False
+    assert result.critique_skipped_for_cost is True
+    assert "Stage 3.75: skipped (would exceed max_cost_usd)" in result.debug_log
+    assert "openai/gpt-5.5" not in [m for m, _ in query_model.calls]
+
+
+def test_stage375_failure_is_never_fatal_to_the_run(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1))
+
+    async def raising_query_model(model, prompt):
+        if model == "openai/gpt-5.5":
+            raise RuntimeError("simulated provider outage")
+        return "no revision", 0.0
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, raising_query_model)
+
+    assert result.critique_triggered is False
+    assert result.synthesis == "Final synthesis text"
+    assert any("Stage 3.75: failed non-fatally" in line for line in result.debug_log)
+
+
+def test_stage375_cost_is_added_to_total_not_hardcoded_zero(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.3, cost_x=0.01, cost_y=0.02))
+
+    async def query_model(model, prompt):
+        if model == "openai/gpt-5.5":
+            return "critique", 0.04
+        return "no revision", 0.0
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.critique_triggered is True
+    # stage1-3 (0.03) + Stage 3.75's real critique cost (0.04, not 0.0) -
+    # Stage 5's own extraction attempt costs 0.0 here since "no revision" is
+    # not parseable JSON and never reports a cost.
+    assert result.total_cost_usd == pytest.approx(0.03 + 0.04)
+
+
+def test_stage375_triggers_on_outlier_even_with_high_css(tmp_path):
+    # 4-model ranking spread verified directly against the real
+    # _compute_outliers math: 3 tightly clustered near 9, 1 far below ->
+    # exactly one outlier flagged, css itself stays high (0.9).
+    stage1_results, stage2_results, stage3_result, metadata = _council_result_fixture(css=0.9)
+    metadata["aggregate_rankings"] = [
+        {"model": "model-a", "borda_score": 9.0, "rank": 1},
+        {"model": "model-b", "borda_score": 9.5, "rank": 2},
+        {"model": "model-c", "borda_score": 9.2, "rank": 3},
+        {"model": "model-d", "borda_score": 0.1, "rank": 4},
+    ]
+    council_result = (stage1_results, stage2_results, stage3_result, metadata)
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(council_result)
+    query_model = FakeQueryModel(response_by_model={"openai/gpt-5.5": "outlier critique"})
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.critique_triggered is True
+    assert result.critique_text == "outlier critique"
+
+
 def test_debug_log_no_mad_warning_with_exactly_two_models(tmp_path):
     # Boundary: 2 is the minimum for "multi-agent" - must NOT warn at
     # exactly 2 (distinguishes < 2 from <= 2 or < 3).
@@ -1361,7 +1737,10 @@ def test_completeness_check_cost_included_in_total_cost(tmp_path):
     )
     result = _run(config, fetch_evidence, council_fn, query_model)
 
-    assert result.total_cost_usd == pytest.approx(0.03 + 0.05)
+    # stage1-3 (0.03) + Stage 4 completeness check (0.05) + Stage 5's own
+    # reasoning-graph extraction attempt (0.05,
+    # docs/specs/reasoning-graph-contract.md) = 0.13
+    assert result.total_cost_usd == pytest.approx(0.03 + 0.05 + 0.05)
 
 
 def test_total_cost_accumulates_revision_and_completeness_cost_additively(tmp_path):
@@ -1383,7 +1762,11 @@ def test_total_cost_accumulates_revision_and_completeness_cost_additively(tmp_pa
     result = _run(config, fetch_evidence, council_fn, query_model)
 
     # stage1to3 (0.03) + revision (2 calls x 0.05) + completeness (1 call x 0.05)
-    assert result.total_cost_usd == pytest.approx(0.03 + 0.10 + 0.05)
+    # + Stage 3.75's critique (1 call x 0.05,
+    # docs/specs/stage-3-75-critique-contract.md) + Stage 5's own
+    # reasoning-graph extraction attempt (1 call x 0.05,
+    # docs/specs/reasoning-graph-contract.md)
+    assert result.total_cost_usd == pytest.approx(0.03 + 0.10 + 0.05 + 0.05 + 0.05)
 
 
 def test_cost_so_far_includes_completeness_check_cost_not_overwritten(tmp_path, monkeypatch):
@@ -1412,7 +1795,11 @@ def test_cost_so_far_includes_completeness_check_cost_not_overwritten(tmp_path, 
     run_dirs = list(tmp_path.iterdir())
     status = _read_run_status(run_dirs[0])
     # stage1-3 (0.03) + 2 revision calls (0.10) + 1 completeness call (0.05)
-    assert status["cost_so_far_usd"] == pytest.approx(0.18)
+    # + Stage 3.75's critique (0.05,
+    # docs/specs/stage-3-75-critique-contract.md) + Stage 5's own
+    # reasoning-graph extraction attempt (0.05,
+    # docs/specs/reasoning-graph-contract.md)
+    assert status["cost_so_far_usd"] == pytest.approx(0.28)
 
 
 def test_completeness_check_skipped_when_cost_ceiling_already_met(tmp_path):
@@ -1688,8 +2075,11 @@ def test_cost_so_far_accumulates_stage1to3_plus_revision_not_overwritten(tmp_pat
 
     run_dirs = list(tmp_path.iterdir())
     status = _read_run_status(run_dirs[0])
-    # stage1-3 (0.03) + 2 revision calls at 0.05 each (0.10) = 0.13
-    assert status["cost_so_far_usd"] == pytest.approx(0.13)
+    # stage1-3 (0.03) + 2 revision calls at 0.05 each (0.10) + Stage 3.75's
+    # critique (0.05, docs/specs/stage-3-75-critique-contract.md) + Stage 5's
+    # own reasoning-graph extraction attempt (0.05,
+    # docs/specs/reasoning-graph-contract.md) = 0.23
+    assert status["cost_so_far_usd"] == pytest.approx(0.23)
 
 
 def test_ac14_run_status_written_atomically_no_tmp_file_left_behind(tmp_path):
@@ -1858,7 +2248,7 @@ def _make_pipeline_result(**overrides):
     return PipelineResult(**defaults)
 
 
-def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None):
+def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None, freshness_result=None):
     calls = {"run_pipeline_args": None, "council_fn_query": None}
 
     async def fake_run_pipeline(config, fetch_evidence, council_fn, query_model, council_models=None):
@@ -1874,8 +2264,21 @@ def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None):
         calls["council_fn_overall_wall_clock_seconds"] = overall_wall_clock_seconds
         return ([], [], {}, {})
 
+    # docs/specs/pending-stage-wiring-contract.md, Contract 1: main() now
+    # runs a slug-freshness precheck before anything else - never make a
+    # real network call from a unit test, even though check_slug_freshness
+    # itself would degrade gracefully on failure. Callers wanting to
+    # exercise the warning/fetch_error paths pass freshness_result.
+    resolved_freshness_result = freshness_result or _sf_module.FreshnessResult(
+        checked_slugs=[], missing_slugs=[], warning=None, cache_hit=False, fetch_error=None,
+    )
+
+    async def fake_check_slug_freshness(**kwargs):
+        return resolved_freshness_result
+
     monkeypatch.setattr(_pr_module, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(_ca_module, "run_council_with_timeouts", fake_run_council_with_timeouts)
+    monkeypatch.setattr(_sf_module, "check_slug_freshness", fake_check_slug_freshness)
     monkeypatch.setattr(sys, "argv", ["llm-council-pipeline"] + argv_tail)
 
     with pytest.raises(SystemExit) as exc_info:
@@ -1883,6 +2286,45 @@ def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None):
 
     out = capsys.readouterr()
     return exc_info.value.code, calls, out
+
+
+def test_main_prints_slug_freshness_warning_when_slugs_missing(monkeypatch, capsys, tmp_path):
+    freshness_result = _sf_module.FreshnessResult(
+        checked_slugs=["a", "b"],
+        missing_slugs=["a"],
+        warning="Slug freshness check found configured slug(s) no longer live on OpenRouter: a",
+        cache_hit=False,
+        fetch_error=None,
+    )
+
+    result = _make_pipeline_result(output_dir=tmp_path / "run1", css=0.5, debug_log=[])
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"],
+        result=result, freshness_result=freshness_result,
+    )
+
+    assert code == 0
+    assert (
+        "WARNING: Slug freshness check found configured slug(s) no longer "
+        "live on OpenRouter: a" in out.err
+    )
+
+
+def test_main_prints_warning_when_slug_freshness_fetch_fails(monkeypatch, capsys, tmp_path):
+    freshness_result = _sf_module.FreshnessResult(
+        checked_slugs=["a"], missing_slugs=[], warning=None, cache_hit=False,
+        fetch_error="URLError: name resolution failed",
+    )
+
+    result = _make_pipeline_result(output_dir=tmp_path / "run1", css=0.5, debug_log=[])
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"],
+        result=result, freshness_result=freshness_result,
+    )
+
+    assert code == 0
+    assert "WARNING: slug freshness check could not reach OpenRouter" in out.err
+    assert "URLError: name resolution failed" in out.err
 
 
 def test_main_happy_path_prints_output_and_exits_0(monkeypatch, capsys, tmp_path):

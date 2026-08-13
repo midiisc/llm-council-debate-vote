@@ -945,3 +945,12 @@ def test_write_cache_opens_with_explicit_utf8_encoding(tmp_path, monkeypatch):
     sf._write_cache(cache_path, TODAY, "irrelevant", [])
 
     assert captured_kwargs.get("encoding") == "utf-8"
+
+
+def test_default_slug_freshness_cache_path_is_folder_scoped(tmp_path):
+    # docs/specs/pending-stage-wiring-contract.md, Contract 1: cwd /
+    # "council-runs" / "slug_freshness_cache.json" - never ~/.llm-council/,
+    # matching default_scorecard_path/default_audition_path's convention.
+    assert sf.default_slug_freshness_cache_path(tmp_path) == (
+        tmp_path / "council-runs" / "slug_freshness_cache.json"
+    )
