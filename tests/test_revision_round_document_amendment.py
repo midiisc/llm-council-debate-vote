@@ -109,6 +109,18 @@ def test_ac10_document_section_textually_separated_from_facts_block():
     )
 
 
+def test_ac10_document_section_uses_exact_delimiter_text_not_a_near_miss():
+    # The AC10 tests above only ever check loosely (case-insensitive
+    # "document" substring, or the doc's own verbatim text) - a mutated
+    # delimiter (wrong case, or padded with extra characters) would still
+    # satisfy those. This pins the literal, exact BEGIN/END delimiter text
+    # the contract's own docstring names.
+    doc = "hello document body"
+    prompt = build_revision_prompt(_answer(), [], doc, max_document_tokens=1000)
+
+    assert "--- BEGIN SOURCE DOCUMENT ---\n" + doc + "\n--- END SOURCE DOCUMENT ---" in prompt
+
+
 # ---------------------------------------------------------------------------
 # AC11: Given estimate_tokens(source_document) > max_document_tokens, When
 # rendered, Then the document section contains a structured omission marker
@@ -123,6 +135,18 @@ def test_ac11_document_exceeding_threshold_replaced_with_named_omission_marker()
     assert doc not in prompt, "the raw document text must never leak through when over threshold"
     assert "5" in prompt, "the omission marker must name the configured threshold"
     assert re.search(r"(?i)omit", prompt), "omission must be a visible, structured marker, not silent"
+
+
+def test_ac11_omission_marker_uses_exact_text_not_a_near_miss():
+    # test_ac11_document_exceeding_threshold_replaced_with_named_omission_
+    # marker above only checks loosely ("5" in prompt, case-insensitive
+    # "omit" substring) - a mutated marker (wrong case, or padded with
+    # extra characters) would still satisfy those. This pins the literal,
+    # exact prefix text.
+    doc = "B" * 24  # estimate_tokens == 24 // 4 == 6 > 5
+    prompt = build_revision_prompt(_answer(), [], doc, max_document_tokens=5)
+
+    assert "[document omitted from revision prompt - exceeds 5-token threshold]" in prompt
 
 
 def test_ac11_boundary_exactly_at_threshold_is_included_not_omitted():

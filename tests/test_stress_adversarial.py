@@ -144,7 +144,7 @@ def test_total_cost_always_equals_all_three_cost_sources_combined(tmp_path_facto
 
     result_fixture = _stress_council_result(css=0.1, cost_x=cost_x, cost_y=cost_y)  # low CSS -> revision fires
 
-    async def council_fn(query):
+    async def council_fn(query, verified_facts=None):
         return result_fixture
 
     calls = {"n": 0}
@@ -187,7 +187,7 @@ def test_end_to_end_adversarial_scenario_completes_without_crashing(tmp_path):
 
     result_fixture = _stress_council_result(css=0.2, cost_x=0.05, cost_y=0.05)
 
-    async def council_fn(query):
+    async def council_fn(query, verified_facts=None):
         return result_fixture
 
     async def malformed_query_model(model, prompt):

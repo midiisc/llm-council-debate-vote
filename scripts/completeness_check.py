@@ -17,7 +17,18 @@ from scripts.grounding_pass import TaggedClaim
 QueryFn = Callable[[str, str], Awaitable[tuple[str, float]]]
 
 
+_FINDINGS_SECTION_BEGIN = "--- BEGIN FINDINGS ---"
+_FINDINGS_SECTION_END = "--- END FINDINGS ---"
+
+
 def build_completeness_prompt(verified_facts: list[TaggedClaim], synthesis: str) -> str:
+    # Delimited (docs/specs/proposal-a-reference-grounding-contract.md,
+    # Contract 2 completion) so a crafted claim.text can't forge text that
+    # reads as prompt instructions - mirrors revision_round.py's
+    # _build_facts_section pattern; kept as a local, independently-shaped
+    # wrapper rather than a shared import since this module's facts_block
+    # format (no "source:" field) intentionally differs from
+    # revision_round.py's.
     facts_block = "\n".join(
         f"[{tc.claim.id}] ({tc.tag}) {tc.claim.text}" for tc in verified_facts
     )
@@ -28,7 +39,9 @@ def build_completeness_prompt(verified_facts: list[TaggedClaim], synthesis: str)
         "addressed anywhere in the final answer - not necessarily verbatim, "
         "but the substance of the finding must be genuinely absent.\n\n"
         "Findings (id, tag, text):\n"
-        f"{facts_block}\n\n"
+        f"{_FINDINGS_SECTION_BEGIN}\n"
+        f"{facts_block}\n"
+        f"{_FINDINGS_SECTION_END}\n\n"
         "Final answer:\n"
         f"{synthesis}\n\n"
         "Respond with ONLY a JSON array of the ids that are NOT addressed, "

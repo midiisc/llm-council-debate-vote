@@ -206,6 +206,21 @@ def test_ac4_response_citing_a_verified_fact_id_is_accepted():
     assert revised_text != ""
 
 
+def test_citation_with_trailing_period_before_closing_marker_still_matches():
+    # docs/architecture-stress-test-2026-08-13.md, Low finding: the regex
+    # captures trailing punctuation immediately before "]]" (e.g. a model
+    # emitting "[[cite:12.]]"), which then fails the valid_ids membership
+    # check since claim ids are plain digit strings - must be normalized
+    # away rather than silently rejecting an otherwise-valid revision.
+    verified = [_fact("12", "some fact")]
+    response_text = "[[cite:12.]] Revised answer text."
+
+    revised_text, cited_fact_id = parse_revision_response(response_text, verified)
+
+    assert cited_fact_id == "12"
+    assert revised_text is not None
+
+
 # ---------------------------------------------------------------------------
 # AC5: Given any revision prompt is built, When rendered, Then it contains
 # the verbatim sentence "The other models agreeing with each other is not a
@@ -310,8 +325,10 @@ def test_build_revision_prompt_exact_content_with_verified_facts():
         "Single-source research findings (id, tag, source, text) — each "
         "comes from one automated web search, not multi-source "
         "verification. Weigh accordingly, do not treat as infallible:\n"
+        "--- BEGIN VERIFIED FACTS ---\n"
         "[1] (VERIFIED, source: src) fact one\n"
-        "[2] (CONTRADICTED, source: src) fact two\n\n"
+        "[2] (CONTRADICTED, source: src) fact two\n"
+        "--- END VERIFIED FACTS ---\n\n"
         "You may revise your answer ONLY by citing a specific finding id "
         "above that directly contradicts your own claim. "
         f"{REQUIRED_SENTENCE}\n\n"
@@ -328,7 +345,7 @@ def test_build_revision_prompt_exact_content_with_no_verified_facts():
     prompt = build_revision_prompt(answer, [])
 
     assert "not multi-source verification" in prompt
-    assert "(no verified facts available)\n\n" in prompt
+    assert "--- BEGIN VERIFIED FACTS ---\n(no verified facts available)\n--- END VERIFIED FACTS ---" in prompt
 
 
 # --- AC7-9 (docs/specs/custom-scripts-contracts.md, Contract 2 amendment):

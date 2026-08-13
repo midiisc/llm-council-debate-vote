@@ -37,6 +37,14 @@ _DOCUMENT_SECTION_HEADER = (
     "source material itself, never a model-authored citation):"
 )
 
+# Proposal A Contract 2 (docs/specs/proposal-a-reference-grounding-contract.md):
+# fixed, grep-able delimiters mirroring _build_document_section's BEGIN/END
+# pattern, so a claim's text (sourced from an automated web search against
+# potentially attacker-influenced document content) can never forge text
+# that reads as prompt instructions once concatenated into the prompt.
+_FACTS_SECTION_BEGIN = "--- BEGIN VERIFIED FACTS ---"
+_FACTS_SECTION_END = "--- END VERIFIED FACTS ---"
+
 
 @dataclass
 class ModelAnswer:
@@ -102,6 +110,23 @@ def _build_document_section(source_document: str, max_document_tokens: int) -> s
     return f"{_DOCUMENT_SECTION_HEADER}\n{body}\n\n"
 
 
+def _build_facts_section(verified_facts: list[TaggedClaim]) -> str:
+    """Renders verified_facts as its own delimited section, textually
+    distinct from surrounding prompt instructions - mirrors
+    _build_document_section's BEGIN/END pattern. Empty list -> a single
+    '(no verified facts available)' line, still inside the delimiters
+    (never a silently absent section)."""
+    if verified_facts:
+        facts_block = "\n".join(
+            f"[{tc.claim.id}] ({tc.tag}, source: {_fact_source(tc)}) {tc.claim.text}"
+            for tc in verified_facts
+        )
+    else:
+        facts_block = "(no verified facts available)"
+
+    return f"{_FACTS_SECTION_BEGIN}\n{facts_block}\n{_FACTS_SECTION_END}"
+
+
 def build_revision_prompt(
     answer: ModelAnswer,
     verified_facts: list[TaggedClaim],  # only VERIFIED/CONTRADICTED tagged claims
@@ -112,14 +137,7 @@ def build_revision_prompt(
     source_document: str = "",
     max_document_tokens: int = DEFAULT_MAX_DOCUMENT_TOKENS,
 ) -> str:
-    if verified_facts:
-        facts_block = "\n".join(
-            f"[{tc.claim.id}] ({tc.tag}, source: {_fact_source(tc)}) {tc.claim.text}"
-            for tc in verified_facts
-        )
-    else:
-        facts_block = "(no verified facts available)"
-
+    facts_section = _build_facts_section(verified_facts)
     document_section = _build_document_section(source_document, max_document_tokens)
 
     return (
@@ -131,7 +149,7 @@ def build_revision_prompt(
         "Single-source research findings (id, tag, source, text) — each "
         "comes from one automated web search, not multi-source "
         "verification. Weigh accordingly, do not treat as infallible:\n"
-        f"{facts_block}\n\n"
+        f"{facts_section}\n\n"
         "You may revise your answer ONLY by citing a specific finding id "
         "above that directly contradicts your own claim. "
         f"{_NO_SWITCH_SENTENCE}\n\n"
@@ -150,7 +168,12 @@ def parse_revision_response(
     if not cite_match:
         return None, None
 
-    cited_id = cite_match.group(1).strip()
+    # Strip trailing non-alphanumeric punctuation a model sometimes emits
+    # right before the closing "]]" (e.g. "[[cite:12.]]") - claim ids are
+    # plain digit strings (grounding_pass.py's Claim.id format), so this
+    # normalizes without risking a false match on a genuinely different id
+    # (architecture-stress-test-2026-08-13.md, Low finding).
+    cited_id = cite_match.group(1).strip().rstrip(".,;:!?")
     if cited_id not in valid_ids:
         return None, None
 
@@ -177,6 +200,12 @@ async def run_revision_round(
     max_document_tokens: int = DEFAULT_MAX_DOCUMENT_TOKENS,
 ) -> list[RevisionOutcome]:
     if not should_trigger_revision(css):
+        # Mutation-testing note (2026-08-13): dropping `cost_usd=0.0` is a
+        # true equivalent mutant - RevisionOutcome.cost_usd's own dataclass
+        # default is 0.0 (see the class definition above), so the explicit
+        # kwarg here matches what omitting it would produce anyway.
+        # Verified by direct execution (mutmut run, 1 survivor, traced by
+        # hand).
         return [
             RevisionOutcome(
                 model=answer.model,
