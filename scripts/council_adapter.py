@@ -42,6 +42,7 @@ timeout-aware `council_fn` + wall-clock ceiling".
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -70,25 +71,54 @@ from scripts.revision_round import _build_facts_section
 
 
 # Uniform, format-neutral Stage 1 reference-reporting instruction (Proposal A
-# Contract 1, docs/specs/proposal-a-reference-grounding-contract.md). Never
-# varies by model or by query - appended verbatim to every Stage 1 prompt so
-# CSS's same-question precondition is preserved. Names exactly the two
-# checkable grounding classes this pipeline can actually verify: the input
-# document itself, and Stage 0.5's already-verified facts. General/background
-# knowledge may still be mentioned, but must be labeled unverified - model
-# confidence is uncorrelated with citation correctness (arXiv:2607.11127), so
-# this never instructs a model to fabricate or omit sourcing.
+# Contract 1, docs/specs/proposal-a-reference-grounding-contract.md; tag
+# format + strictness per docs/specs/grounding-annotation-enforcement-contract.md,
+# Contract 1). Never varies by model or by query - appended verbatim to
+# every Stage 1 prompt so CSS's same-question precondition is preserved.
+# Names exactly the two checkable grounding classes this pipeline can
+# actually verify: the input document itself, and facts already verified
+# earlier in this process. General/background knowledge may still be
+# mentioned, but must be tagged unverified - model confidence is
+# uncorrelated with citation correctness (arXiv:2607.11127), so this never
+# instructs a model to fabricate or omit sourcing.
+#
+# A real dry run (docs/upstream-deltas.md, 2026-08-13) found every Stage 2
+# peer reviewer penalizing one model's response for "leaked internal
+# 'Grounding note/Stage 0.5' scaffolding" - traced to this block itself
+# naming the internal stage number, which the model echoed verbatim into
+# its visible answer, plus no format guidance letting models improvise a
+# high-cost separate header instead of a lightweight inline tag. Fixed by
+# removing the internal name entirely (never given, never echoed) and
+# mandating an exact, compact, machine-checkable tag vocabulary - the
+# grounding REQUIREMENT is unchanged (in fact tightened to mandatory), only
+# the presentation that was costing peer-review score is fixed.
 _STAGE1_REFERENCE_INSTRUCTION_BLOCK = (
     "\n\n---\n"
-    "For each substantive claim above, note what grounds it. Only two "
-    "grounding classes are checkable here and may be reported as such: "
-    "(1) the input document / source material provided in this query, and "
-    "(2) verified facts already established for this query (Stage 0.5 "
-    "grounding). You may also mention general or background knowledge, but "
-    "any such claim must be explicitly labeled unverified - never present "
-    "it as a citable reference, and never fabricate a source or leave an "
-    "unverified claim unlabeled to make it look grounded."
+    "For each substantive claim above, you MUST append one of these exact "
+    "tags immediately after it - no substantive claim may be left "
+    'untagged: "[grounded: document]" if it comes from the input document '
+    '/ source material provided in this query; "[grounded: verified]" if '
+    "it comes from verified facts established earlier in this process; or "
+    '"[unverified]" if it is general or background knowledge with no '
+    "checkable source. Never present unverified knowledge as a citable "
+    "reference, and never fabricate a source to avoid using "
+    '"[unverified]". Keep these tags lightweight and inline - never a '
+    "separate labeled section, and never a reference to this process's "
+    "internal stage names or step numbers; those are implementation "
+    "details, not part of your answer."
 )
+
+# docs/specs/grounding-annotation-enforcement-contract.md, Contract 2. Pure,
+# deterministic - no model call. Used to catch a Stage 1 response that
+# skipped the mandatory tagging above entirely, so it can be surfaced
+# (never silently accepted) rather than repeating this project's own
+# already-documented "computed but never read" mistake (the dead safety
+# gate).
+_GROUNDING_TAG_PATTERN = re.compile(r"\[grounded: (?:document|verified)\]|\[unverified\]")
+
+
+def has_grounding_annotations(response_text: str) -> bool:
+    return bool(_GROUNDING_TAG_PATTERN.search(response_text))
 
 # docs/specs/human-debate-characteristics-contract.md, Contract 4. Never
 # varies by model, same reasoning as the reference-instruction block above.
@@ -274,6 +304,16 @@ async def run_council_with_timeouts(
                 "flagged_patterns": getattr(safety_check, "flagged_patterns", []),
             }
 
+    # docs/specs/grounding-annotation-enforcement-contract.md, Contract 2:
+    # a Stage 1 response with zero grounding tags must never pass through
+    # silently - collected here so it can be both surfaced in metadata
+    # (pipeline_runner.py's debug_log) and threaded into Stage 3 so the
+    # chairman actually weighs it during synthesis, not just logged for a
+    # human who might not read it.
+    ungrounded_models = [
+        r["model"] for r in stage1_results if not has_grounding_annotations(r.get("response", ""))
+    ]
+
     if num_responses == 0:
         return (
             [],
@@ -319,10 +359,19 @@ async def run_council_with_timeouts(
             for r in aggregate_rankings:
                 r["note"] = "Two-model council - rankings based on single vote"
 
+    stage3_query = user_query
     if verified_facts:
-        stage3_query = f"{user_query}\n\n{_build_facts_section(verified_facts)}"
-    else:
-        stage3_query = user_query
+        stage3_query += f"\n\n{_build_facts_section(verified_facts)}"
+    if ungrounded_models:
+        stage3_query += (
+            "\n\n--- BEGIN GROUNDING COMPLIANCE NOTE ---\n"
+            "The following model(s) did not include any grounding tags in "
+            "their Stage 1 draft, despite being instructed to tag every "
+            f"substantive claim: {', '.join(ungrounded_models)}. Weigh this "
+            "explicitly when synthesizing - an unlabeled draft's claims "
+            "cannot be distinguished from fabricated ones.\n"
+            "--- END GROUNDING COMPLIANCE NOTE ---"
+        )
 
     stage3_result, stage3_usage, _verdict_result = await stage3_synthesize_final(
         stage3_query,
@@ -344,6 +393,8 @@ async def run_council_with_timeouts(
     }
     if degraded_mode:
         metadata["degraded_mode"] = degraded_mode
+    if ungrounded_models:
+        metadata["ungrounded_models"] = ungrounded_models
     if resilient_result.substitutions:
         metadata["substitutions"] = [asdict(s) for s in resilient_result.substitutions]
     if resilient_result.shortfall_warning is not None:

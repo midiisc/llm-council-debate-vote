@@ -187,7 +187,7 @@ def _install_happy_path_fakes(
 
     async def default_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
         calls["query_models_parallel_timeout"] = timeout
-        return {m: {"response": f"answer-from-{m}"} for m in models_arg}
+        return {m: {"content": f"answer-from-{m} [unverified]"} for m in models_arg}
 
     def fake_check_response_safety(response):
         calls["check_response_safety"].append(response)
@@ -312,7 +312,7 @@ def test_ac12_timed_out_model_excluded_from_stage1_results_call_does_not_raise(m
     models = ["model-a", "model-b", "model-c", "model-d"]
 
     async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
-        result = {m: {"response": f"answer-from-{m}"} for m in models_arg}
+        result = {m: {"content": f"answer-from-{m} [unverified]"} for m in models_arg}
         result["model-d"] = None  # simulated timeout/failure
         return result
 
@@ -474,7 +474,7 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
         calls["query_models_parallel_timeout"] = timeout
         calls["query_models_parallel_messages"] = messages
-        return {m: {"content": f"content-from-{m}", "usage": per_model_usage[m]} for m in models_arg}
+        return {m: {"content": f"content-from-{m} [unverified]", "usage": per_model_usage[m]} for m in models_arg}
 
     def fake_check_response_safety(response):
         calls["check_response_safety"].append(response)
@@ -563,13 +563,13 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     by_model = {r["model"]: r for r in stage1_results}
     assert set(by_model) == set(models)
     for m in models:
-        assert by_model[m]["response"] == f"content-from-{m}"
+        assert by_model[m]["response"] == f"content-from-{m} [unverified]"
         assert by_model[m]["safety_check"] == {
             "passed": False,
             "reason": "flagged-reason",
             "flagged_patterns": ["p1", "p2"],
         }
-    assert set(calls["check_response_safety"]) == {f"content-from-{m}" for m in models}
+    assert set(calls["check_response_safety"]) == {f"content-from-{m} [unverified]" for m in models}
 
     # --- stage1 usage: real accumulation, no off-by-one, no wrong operator ---
     stage1_usage = metadata["usage"]["by_stage"]["stage1"]
@@ -620,7 +620,7 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
 
     # --- quality metrics: exact stage1_dict / rankings_tuples construction ---
     qm_call = calls["quality_metrics_call"]
-    assert qm_call["stage1_responses"] == {m: {"content": f"content-from-{m}"} for m in models}
+    assert qm_call["stage1_responses"] == {m: {"content": f"content-from-{m} [unverified]"} for m in models}
     assert qm_call["stage2_rankings"] == stage2_results
     assert qm_call["stage3_synthesis"] == stage3_result
     assert set(qm_call["aggregate_rankings"]) == {(m, 1.5) for m in models}
@@ -1001,3 +1001,79 @@ def test_empty_verified_facts_list_leaves_stage3_query_as_plain_user_query(monke
     asyncio.run(ca.run_council_with_timeouts("original query", verified_facts=[]))
 
     assert captured["stage3_query"] == "original query"
+
+
+# ---------------------------------------------------------------------------
+# docs/specs/grounding-annotation-enforcement-contract.md, Contract 2:
+# detect a Stage 1 response with no grounding tags at all, and surface it
+# both in metadata and in Stage 3's query - never silently accepted.
+# ---------------------------------------------------------------------------
+
+
+def test_has_grounding_annotations_true_for_each_tag_variant():
+    assert ca.has_grounding_annotations("some claim [grounded: document]") is True
+    assert ca.has_grounding_annotations("some claim [grounded: verified]") is True
+    assert ca.has_grounding_annotations("some claim [unverified]") is True
+
+
+def test_has_grounding_annotations_false_when_no_tag_present():
+    assert ca.has_grounding_annotations("a plain answer with no tags at all") is False
+
+
+def test_has_grounding_annotations_false_for_empty_string():
+    assert ca.has_grounding_annotations("") is False
+
+
+def test_ungrounded_model_surfaced_in_metadata_and_stage3_query(monkeypatch):
+    models = ["model-a", "model-b"]
+    captured = {}
+
+    async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
+        return {
+            "model-a": {"content": "grounded answer [unverified]"},
+            "model-b": {"content": "an answer with no tags at all"},
+        }
+
+    async def fake_stage3_synthesize_final(
+        user_query, stage1_results, stage2_results, aggregate_rankings=None,
+        verdict_type=None, timeout=120.0, dispositions_instruction=None,
+        on_synthesis_delta=None,
+    ):
+        captured["stage3_query"] = user_query
+        return {"model": stage1_results[0]["model"], "response": "final synthesis"}, {}, None
+
+    _install_happy_path_fakes(monkeypatch, models, query_models_parallel_fn=fake_query_models_parallel)
+    _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
+
+    _, _, _, metadata = asyncio.run(ca.run_council_with_timeouts("original query"))
+
+    assert metadata["ungrounded_models"] == ["model-b"]
+    assert "model-b" in captured["stage3_query"]
+    assert "GROUNDING COMPLIANCE NOTE" in captured["stage3_query"]
+    assert "model-a" not in captured["stage3_query"].split("GROUNDING COMPLIANCE NOTE")[1]
+    assert captured["stage3_query"].startswith("original query")
+
+
+def test_no_ungrounded_models_key_when_all_responses_tagged(monkeypatch):
+    models = ["model-a", "model-b"]
+    captured = {}
+
+    async def fake_query_models_parallel(models_arg, messages, disable_tools=False, timeout=120.0):
+        return {m: {"content": f"answer from {m} [unverified]"} for m in models_arg}
+
+    async def fake_stage3_synthesize_final(
+        user_query, stage1_results, stage2_results, aggregate_rankings=None,
+        verdict_type=None, timeout=120.0, dispositions_instruction=None,
+        on_synthesis_delta=None,
+    ):
+        captured["stage3_query"] = user_query
+        return {"model": stage1_results[0]["model"], "response": "final synthesis"}, {}, None
+
+    _install_happy_path_fakes(monkeypatch, models, query_models_parallel_fn=fake_query_models_parallel)
+    _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
+
+    _, _, _, metadata = asyncio.run(ca.run_council_with_timeouts("original query"))
+
+    assert "ungrounded_models" not in metadata
+    assert captured["stage3_query"] == "original query"
+    assert "GROUNDING COMPLIANCE NOTE" not in captured["stage3_query"]

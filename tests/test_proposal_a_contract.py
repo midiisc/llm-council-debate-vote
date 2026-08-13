@@ -263,7 +263,7 @@ ca_resilient_query_module = _import("resilient_query")
 
 
 def _ok_response(model: str) -> dict:
-    return {"status": "ok", "content": f"answer-from-{model}", "usage": {}}
+    return {"status": "ok", "content": f"answer-from-{model} [unverified]", "usage": {}}
 
 
 def test_c1_ac4_stage1_messages_built_from_build_stage1_prompt(monkeypatch):
