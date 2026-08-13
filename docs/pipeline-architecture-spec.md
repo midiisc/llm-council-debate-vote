@@ -284,9 +284,13 @@ conditional-debate-gating logic depends on CSS being real.
 **Where structured lens-checking actually belongs:** downstream, paired with
 a verifier — matches the pattern that *did* work in the cited research
 (devil's-advocate roles paired with a calibrated verifier/ground-truth, not
-free-floating). Concretely: **Stage 3.5 (post-synthesis) and the Stage 4
-premortem** are where lens questions go, answered by whichever model already
-runs that stage — never by reassigning the core models into role-play.
+free-floating). Concretely: **Stage 3.75 (post-synthesis — note: not "3.5",
+which is already `run_full_council`'s own internal aggregate-rankings step;
+see `docs/agent-model-reasoning-config.md` §6 and
+`scripts/completeness_check.py`'s docstring for why this project reserves
+"3.5" for the package's internal meaning) and the Stage 4 premortem** are
+where lens questions go, answered by whichever model already runs that
+stage — never by reassigning the core models into role-play.
 
 **Domain-neutrality requirement (added after a user catch — nothing had
 shipped yet, but an early illustrative example used fundraising-specific
