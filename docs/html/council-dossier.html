@@ -1258,9 +1258,9 @@ footer.provenance code { color: var(--text-dim); }
         <p class="lede">OpenRouter's unified reasoning contract lets a caller request an effort level per call — <code class="mono">none, minimal, low, medium, high, xhigh, max</code> — instead of paying frontier-depth reasoning for a task that doesn't need it.</p>
       </div>
 
-      <div class="callout callout--gap">
-        <span class="callout-label">Honest status, not the design intent</span>
-        The table below is the allocation this pipeline is <strong>designed</strong> to use. As of the last verified check, <strong>no stage actually sends a reasoning-effort parameter yet</strong> — the call paths for Stage&nbsp;1, Stage&nbsp;2, and Stage&nbsp;3 go through the installed package's own orchestration functions, which don't currently accept one, and the two stages whose call paths already could carry it (Stage&nbsp;2.75, Stage&nbsp;4) simply haven't had the parameter added. This is tracked as open work, not silently assumed done.
+      <div class="callout callout--note">
+        <span class="callout-label">Live, for the stages this repo controls directly</span>
+        Stage&nbsp;2.75, Stage&nbsp;3.75, and Stage&nbsp;4 now send a real top-level <code class="mono">reasoning_effort</code> field on every call — confirmed working in a real dry run, not just unit-tested. Grounding found the nested <code class="mono">reasoning: {effort, max_tokens}</code> object has real per-provider mutual-exclusivity quirks (Anthropic accepts <code class="mono">max_tokens</code> only, not <code class="mono">effort</code>); this project sidesteps that entirely by using OpenRouter's simpler top-level field instead, confirmed supported by all 4 core models via a live catalog fetch. Stage&nbsp;1, Stage&nbsp;2, and Stage&nbsp;3 remain unsent — their call paths go through the installed package's own orchestration functions, which don't accept a reasoning parameter at all today. That's an upstream gap, not something this repo can wire around without a bigger, separately-scoped call-path swap.
       </div>
 
       <div class="data-table-wrap">
@@ -1294,7 +1294,7 @@ footer.provenance code { color: var(--text-dim); }
               <td>2.75 — Revision</td>
               <td>Participating core seats</td>
               <td>High</td>
-              <td>No</td>
+              <td><strong>Yes</strong></td>
               <td>Same substantive-rewrite shape as Stage&nbsp;1 — under-provisioning would defeat the reason it triggered</td>
             </tr>
             <tr>
@@ -1308,14 +1308,14 @@ footer.provenance code { color: var(--text-dim); }
               <td>3.75 — Critique</td>
               <td>GPT-5.5 only</td>
               <td>High</td>
-              <td>n/a — stage not built</td>
+              <td><strong>Yes</strong> — confirmed in a real dry run</td>
               <td>One bounded call has to carry enough weight not to be steamrolled by majority framing</td>
             </tr>
             <tr>
               <td>4 — Completeness</td>
               <td>Whichever seat executes it</td>
               <td>Low / minimal</td>
-              <td>No</td>
+              <td><strong>Yes</strong></td>
               <td>Narrow yes/no classification against an already-provided fact list — no accuracy upside from more depth</td>
             </tr>
           </tbody>
@@ -1371,6 +1371,9 @@ footer.provenance code { color: var(--text-dim); }
           <li>Stage&nbsp;3.75 (devil's-advocate critique) and Stage&nbsp;5 (reasoning graph) are both now wired into the live pipeline sequence, each behind its own gate, rather than standalone-tested modules waiting to be called.</li>
           <li>The daily slug-freshness precheck now runs before every pipeline invocation and warns on drift — visibility only, never blocking.</li>
           <li>The safety-check result computed per Stage&nbsp;1 response is now surfaced as an explicit debug-log warning for any flagged model, rather than being computed and discarded — moved from the "still open" column to its own line above since it's partially, not fully, resolved.</li>
+          <li><strong>Reasoning-effort control is now live for Stage&nbsp;2.75, Stage&nbsp;3.75, and Stage&nbsp;4</strong> — see the reasoning-effort table above. Sidesteps a real mutual-exclusivity quirk in OpenRouter's nested reasoning object by using its simpler top-level field instead, confirmed supported by all 4 core models via a live catalog fetch. Stage&nbsp;1/2/3 remain blocked by the same upstream call-path gap as before.</li>
+          <li><strong>A real, live dry run confirmed the whole reasoning-effort/Stage&nbsp;3.75/Stage&nbsp;5 stack end to end</strong> — $0.4428 total cost, zero crashes. Stage&nbsp;3.75 fired for real via the outlier clause (not the CSS clause), the first live confirmation that gate catches a case CSS alone misses. Stage&nbsp;5 attempted extraction and failed gracefully on a malformed model response — the exception-isolation design working exactly as intended, not a crash. Zero grounding-tag-leakage of internal terminology found in the real transcript.</li>
+          <li>Two roster/design questions resolved by explicit decision rather than left open: Gemini&nbsp;3.6&nbsp;Flash's peer-review vote stays equal (no evidence a cheaper-tier model judges worse); and after a live catalog check, no swap to a "Gemini Pro" tier — the only pro-tier model available anywhere, even on Google's own native API, is <code class="mono">gemini-3.1-pro-preview</code>, an older generation than what's already in the roster.</li>
         </ul>
       </div>
     </section>
