@@ -865,6 +865,10 @@ footer.provenance code { color: var(--text-dim); }
               <h4>What it achieves</h4>
               <p>A <code>verified_facts</code> list every later stage can point to instead of re-deriving. Claim text reaching this stage is wrapped in fixed delimiters before it ever enters a prompt, so a hostile document can't forge instructions by pretending to be part of the fact list.</p>
             </div>
+            <div>
+              <h4>How it judges evidence quality</h4>
+              <p>The evidence-fetch instruction carries eight epistemic clauses, added and adversarially panel-reviewed across two later sessions — not just "find a source," but rules for weighing what's found: prefer a specific, dated, independently verifiable finding over a vague one, but score an <em>unverified</em> specific-sounding claim as <strong>lower</strong> trust than a hedged one, not higher; weight a finding that aggregates many independent sources (a systematic review, a meta-analysis) above a single anecdote; treat a verified action as at least as weighty as a stated forecast; credit convergence across independent spheres of activity; judge a source by whether it would be <em>unlikely if the claim were false</em> (diagnosticity), not just whether it sounds supportive; weight a costly or against-interest disclosure above an easy, self-serving one; refuse to treat a real proxy number as proof of a different, unconfirmed outcome unless the source itself states that link; and credit multiple sources only when they were genuinely produced by different methods, never reprints of one report. Every clause carries its own anti-fabrication guardrail defaulting to <code>unverifiable</code> — a self-reported citation with no real, resolvable URL behind it (checked by an actual HTTP request) never earns a verdict. Two individually-plausible techniques — weighing a source's historical base rate, and treating an unexplained silence as itself evidence — were deliberately <strong>not</strong> added: both reopen real fabrication risk for a signal that can barely move a verdict under this stage's one-search-per-claim design.</p>
+            </div>
           </div>
         </div>
       </article>
@@ -892,6 +896,10 @@ footer.provenance code { color: var(--text-dim); }
             <div>
               <h4>What it achieves</h4>
               <p>Each model is asked, identically, to weigh counterfactuals and potential weaknesses in its own reasoning while staying concise, and to note what grounded each substantive claim — restricted to two checkable sources, the input documents and Stage&nbsp;0.5's verified facts. Unverified background knowledge may be mentioned but is explicitly labeled as such and never treated as citable downstream, since a self-reported citation with no check behind it is closer to theater than grounding.</p>
+            </div>
+            <div>
+              <h4>Dialectic, not eristic</h4>
+              <p>Every seat also reads a shared line making the frame explicit: the goal is a shared, best-supported answer, not winning an argument against the other three models drafting alongside it. Ancient rhetoric drew this exact line — eristic argument optimizes for victory, dialectic argument optimizes for arriving at the best answer together — and it's the same distinction the peer-review restructuring at Stage&nbsp;2.75 leans on.</p>
             </div>
           </div>
         </div>
@@ -996,6 +1004,10 @@ footer.provenance code { color: var(--text-dim); }
             <div>
               <h4>What it achieves</h4>
               <p>Each participating seat rewrites its answer with the peer critique in hand, citing back to specific fact IDs so a revision can be checked against what it claims motivated it. Runs sequentially today rather than in parallel — a known, still-open cost on the one path most likely to already be under time pressure, since it only ever fires when consensus was weak to begin with.</p>
+            </div>
+            <div>
+              <h4>Rapoport's Rules, and a real fix underneath them</h4>
+              <p>Before a seat may accept or reject the critique, it must first restate the critique fairly enough that a reviewer would recognize it as its own point, and note anything it agrees with — the four-step discipline philosopher Daniel Dennett credits to game theorist Anatol Rapoport for arguing productively. Building this surfaced a real, previously invisible gap: the model doing this restating had only ever seen numeric peer scores, never the reviewers' actual written justifications, even though the underlying review call collects them. That free-text critique now reaches this stage for the first time. A seat that isn't revising must also say what specific finding would change its mind, rather than only restating its disagreement — reframing the question from "why are you against this" to "what would it take."</p>
             </div>
           </div>
         </div>
@@ -1192,6 +1204,16 @@ footer.provenance code { color: var(--text-dim); }
           <h3>Seat changes are evidence-gated</h3>
           <p>GLM-5.2's standing, and any future seat change, is tracked against 20+ recorded scorecard sessions — a graduation bar, not a discretionary swap.</p>
         </div>
+        <div class="mech-card">
+          <span class="mech-num">11</span>
+          <h3>Evidence is judged, not just found</h3>
+          <p>A source that would look identical whether the claim were true or false earns little credit even if it's real and well-sourced (diagnosticity). A verified action outweighs a stated forecast. A costly, against-interest disclosure outweighs an easy, self-serving one. Finding a source is necessary; it was never sufficient.</p>
+        </div>
+        <div class="mech-card">
+          <span class="mech-num">12</span>
+          <h3>Restate before you rebut</h3>
+          <p>Before declining to revise, a seat must restate the critique fairly enough that the reviewer who wrote it would recognize it as their own point. Borrowed from the same discipline philosopher Daniel Dennett credits to game theorist Anatol Rapoport — it only works because real peer critique text now actually reaches this stage, not just numeric scores.</p>
+        </div>
       </div>
 
       <div class="rejected-list" id="rejected-5th">
@@ -1212,6 +1234,14 @@ footer.provenance code { color: var(--text-dim); }
           <div class="rejected-row">
             <div class="what">Red-blue teaming, Socratic questioning, lateral thinking, brainstorming</div>
             <div class="why">Checked against the 2026 multi-agent-debate literature specifically. Red-blue teaming turned out to be a false cognate for AI-safety red-teaming; the others returned no applicable evidence in this context — absence of evidence, not disproof, so not shipped on a hunch.</div>
+          </div>
+          <div class="rejected-row">
+            <div class="what">Historical base-rate weighting and "absence of an expected signal"</div>
+            <div class="why">Both real, well-evidenced techniques from forecasting and warning-intelligence tradecraft — and both declined anyway. Each only fires safely under narrow conditions this pipeline's single-search-per-claim design rarely meets, and each reopens exactly the fabrication risk the "prefer a specific finding" clause already manages, for a signal that could barely move a verdict.</div>
+          </div>
+          <div class="rejected-row">
+            <div class="what">Iterative revision until a consensus threshold is met</div>
+            <div class="why">A real characteristic of successful human deliberation — but the opposite of what this pipeline's own cited literature found for LLM multi-agent debate specifically: repeated revision rounds tend to degrade answers, not improve them. Stays a single, CSS-gated pass. Human-deliberation best practice, applied uncritically, would have been the wrong call here.</div>
           </div>
         </div>
       </div>
@@ -1314,17 +1344,19 @@ footer.provenance code { color: var(--text-dim); }
             <li><strong>Mutation-testing coverage restored</strong> across all 13 implemented scripts, after 5 had silently stopped generating any mutants at all.</li>
             <li><strong>Prompt-injection delimiting completed</strong> everywhere untrusted document or claim text reaches a model prompt, closing the one case that had been left unguarded.</li>
             <li>Two dead OpenRouter slugs fixed (GLM, then Kimi) after each was independently caught by direct catalog verification rather than trusted from memory.</li>
+            <li><strong>Stage&nbsp;0.5 and Stage&nbsp;2.75's HTTP calls preempt cleanly.</strong> Both were synchronous <code>urllib</code> calls that blocked the event loop against the wall-clock deadline; wrapping them in <code>asyncio.to_thread</code> lets the outer <code>asyncio.wait_for</code> actually fire on schedule instead of waiting for the call to finish on its own. Verified by a direct regression test, not just by reading the diff.</li>
           </ul>
         </div>
         <div class="gap-col">
           <h3>Still open</h3>
           <ul>
             <li><strong>The safety gate is computed but never read.</strong> A regex scan runs against Stage&nbsp;1 drafts and produces a result nothing downstream consults — no score cap, no abort, no warning.</li>
-            <li><strong>The wall-clock ceiling can't preempt Stage&nbsp;0.5 or Stage&nbsp;2.75 mid-call.</strong> Both use synchronous HTTP, which blocks the event loop the deadline check depends on.</li>
             <li>Stage&nbsp;2.75 revision still queries models sequentially, multiplying wall-clock cost by seat count on the path most likely to already be under pressure.</li>
             <li>The daily slug-freshness precheck and the Stage&nbsp;5 reasoning graph are both built and tested as standalone modules but not yet called from the live pipeline sequence.</li>
             <li>Reasoning-effort parameters are designed (see above) but not implemented for any stage.</li>
             <li>Three lower-severity items are explicitly deferred, not silently dropped: a nine-element result tuple that should be a named dataclass, opaque numeric IDs in the Stage&nbsp;4 dropped-facts warning instead of readable claim text, and one remaining debug-log line still using the pre-rename "Stage 1&ndash;3.5" label.</li>
+            <li><strong>Stage&nbsp;0.5's evidence-weighting instruction has grown to eight epistemic clauses and has not yet been dry-run against a real model on a real decision.</strong> Every clause is unit-tested for exact wording and anti-fabrication guardrails, but whether a real retrieval model correctly applies eight distinct weighting principles in one pass — rather than a subset of them, or none — is untested behavior, not just untested code. This pipeline's own Real-money gate already requires a dry run before real use; that requirement now carries more weight than it did before this stage's instruction tripled in size.</li>
+            <li>Whether Gemini&nbsp;3.6&nbsp;Flash's peer-review vote should be weighted below the three frontier seats it's nominally an equal peer to remains an open, undecided question — on file since before this session, not resolved by anything built here.</li>
           </ul>
         </div>
       </div>
@@ -1341,6 +1373,8 @@ footer.provenance code { color: var(--text-dim); }
       <div><code>docs/pipeline-architecture-spec.md</code> — council composition contract and orchestration design</div>
       <div><code>docs/citation-and-structured-reasoning-decision-2026-08-13.md</code> — Proposal A/B and Stage 5 decisions</div>
       <div><code>docs/architecture-stress-test-2026-08-13.md</code> — full 42-finding audit this page's gaps section summarizes</div>
+      <div><code>docs/quantitative-evidence-weighting-decision-2026-08-13.md</code> and <code>docs/stage-0-5-epistemic-clauses-decision-2026-08-13.md</code> — the two adversarial panels behind Stage&nbsp;0.5's eight-clause evidence weighting</div>
+      <div><code>docs/specs/human-debate-characteristics-contract.md</code> — the dialectic-framing and Rapoport's-Rules additions at Stage&nbsp;1 and Stage&nbsp;2.75</div>
       <div><code>docs/upstream-deltas.md</code> — the dated ledger everything above traces back to</div>
     </div>
     <div>llm-council-debate-vote<br>council-runs are folder-scoped, never written to a shared home directory</div>
