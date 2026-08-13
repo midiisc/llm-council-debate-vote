@@ -687,7 +687,7 @@ footer.provenance code { color: var(--text-dim); }
         <div class="stat"><div class="n">4</div><div class="l">core council seats, ceiling never raised</div></div>
         <div class="stat"><div class="n">3</div><div class="l">ranked backup models, substitution-only</div></div>
         <div class="stat"><div class="n">11</div><div class="l">named stages, Stage&nbsp;0 to Stage&nbsp;5</div></div>
-        <div class="stat"><div class="n">2</div><div class="l">stages designed but not yet coded</div></div>
+        <div class="stat"><div class="n">0</div><div class="l">stages left unwired — all 11 now live, gated, or manual by design</div></div>
         <div class="stat"><div class="n">42</div><div class="l">findings from this session's own stress test</div></div>
       </div>
     </header>
@@ -895,7 +895,11 @@ footer.provenance code { color: var(--text-dim); }
             </div>
             <div>
               <h4>What it achieves</h4>
-              <p>Each model is asked, identically, to weigh counterfactuals and potential weaknesses in its own reasoning while staying concise, and to note what grounded each substantive claim — restricted to two checkable sources, the input documents and Stage&nbsp;0.5's verified facts. Unverified background knowledge may be mentioned but is explicitly labeled as such and never treated as citable downstream, since a self-reported citation with no check behind it is closer to theater than grounding.</p>
+              <p>Each model is asked, identically, to weigh counterfactuals and potential weaknesses in its own reasoning while staying concise, and to tag every substantive claim with exactly one of three fixed markers: <code>[grounded: document]</code> for the input documents, <code>[grounded: verified]</code> for Stage&nbsp;0.5's verified facts, or <code>[unverified]</code> for background knowledge with no checkable source. Unverified claims may still be mentioned, but never treated as citable downstream — a self-reported citation with no check behind it is closer to theater than grounding.</p>
+            </div>
+            <div>
+              <h4>Strict, and machine-checked</h4>
+              <p>An earlier version of this instruction leaked internal staging language into the prompt and left the tag format free-form; in a real dry run, all four peer reviewers penalized one model's answer for surfacing that scaffolding, not for its substance. The fix targeted presentation only — the grounding requirement itself got stricter, not weaker. Every Stage&nbsp;1 response is now scanned for at least one of the three exact tags; a model that comes back with none is named in a dedicated compliance note threaded straight into Stage&nbsp;3's chairman prompt, so a missing tag is actively questioned by the synthesizer rather than silently passed through.</p>
             </div>
             <div>
               <h4>Dialectic, not eristic</h4>
@@ -1048,11 +1052,11 @@ footer.provenance code { color: var(--text-dim); }
             <h3>Devil's-advocate critique</h3>
             <div class="stage-tag">Attacks the synthesis before a human sees it — gated, and never run by the chairman</div>
           </div>
-          <span class="pill pill--specced">Specced only</span>
+          <span class="pill pill--gated">Gated · live</span>
         </div>
         <div class="stage-body">
           <div class="stage-meta">
-            <div class="row"><div class="k">Would run on</div><div class="v"><span class="slug">openai/gpt-5.5</span> exclusively — never Opus, never the chairman</div></div>
+            <div class="row"><div class="k">Runs on</div><div class="v"><span class="slug">openai/gpt-5.5</span> exclusively — never Opus, never the chairman</div></div>
             <div class="row"><div class="k">Target effort</div><div class="v">High — one bounded call, not fanned across the roster</div></div>
             <div class="row"><div class="k">Gate</div><div class="v">CSS &lt; 0.50, or any seat flagged as an outlier</div></div>
           </div>
@@ -1062,8 +1066,8 @@ footer.provenance code { color: var(--text-dim); }
               <p>Having Opus critique its own synthesis would be the literal self-refine pattern the cited literature found reliably worse than doing nothing — the sharpest, most agreed-on finding to come out of designing this stage. GPT-5.5 was chosen specifically because it never wrote the thing it's attacking.</p>
             </div>
             <div>
-              <h4>What it's designed to achieve</h4>
-              <p>Only two of eight originally-considered stress-testing techniques survived evidence review — devil's-advocate critique and counterfactual/what-if framing, folded into one call. Red-blue teaming, Socratic questioning, lateral thinking, and brainstorming were each checked against the actual 2026 multi-agent-debate literature and dropped for lack of applicable evidence, not on a hunch. The output is a labeled critique memo attached to the synthesis for the human premortem to read — it never auto-triggers a re-synthesis, which would reopen the same revision failure mode Stage&nbsp;2.75 is careful to avoid.</p>
+              <h4>What it achieves</h4>
+              <p>Only two of eight originally-considered stress-testing techniques survived evidence review — devil's-advocate critique and counterfactual/what-if framing, folded into one call. Red-blue teaming, Socratic questioning, lateral thinking, and brainstorming were each checked against the actual 2026 multi-agent-debate literature and dropped for lack of applicable evidence, not on a hunch. The output is a labeled critique memo, persisted to <code>critique_memo.md</code> in the run folder, for the human premortem to read alongside the synthesis — it never auto-triggers a re-synthesis, which would reopen the same revision failure mode Stage&nbsp;2.75 is careful to avoid. A failed critique call never takes the run down; it's logged non-fatally and the rest of the pipeline completes.</p>
             </div>
           </div>
         </div>
@@ -1100,13 +1104,13 @@ footer.provenance code { color: var(--text-dim); }
             <h3>Reasoning graph</h3>
             <div class="stage-tag">Post-hoc, typed knowledge graph — for grounding later sessions, not for this one</div>
           </div>
-          <span class="pill pill--built">Built · not wired</span>
+          <span class="pill pill--gated">Gated · live</span>
         </div>
         <div class="stage-body">
           <div class="stage-meta">
             <div class="row"><div class="k">Runs on</div><div class="v">One LLM call over the synthesis, plus deterministic Python</div></div>
-            <div class="row"><div class="k">Effort</div><div class="v">Not yet specified — module untested in production</div></div>
-            <div class="row"><div class="k">Status</div><div class="v"><code>scripts/reasoning_graph.py</code> — tested, not called by <code>pipeline_runner.py</code></div></div>
+            <div class="row"><div class="k">Gate</div><div class="v">Skipped if it would exceed the cost ceiling or leave under 60s of wall-clock budget; any extraction exception is caught and logged, never fatal</div></div>
+            <div class="row"><div class="k">Status</div><div class="v"><code>scripts/reasoning_graph.py</code>, called from <code>pipeline_runner.py</code> after Stage&nbsp;4</div></div>
           </div>
           <div class="stage-prose">
             <div>
@@ -1114,8 +1118,8 @@ footer.provenance code { color: var(--text-dim); }
               <p>The user's own framing for this stage — concept graph, knowledge graph, reasoning chain, mind map, reference-grounding graph — already half-conceded the overlap between them. A three-judge design panel converged on building one typed graph instead of five redundant ones.</p>
             </div>
             <div>
-              <h4>What it's built to achieve</h4>
-              <p>Reference nodes and their <code>cites</code> edges are built deterministically in plain Python from the verified-facts list — zero LLM involvement, zero hallucination surface for roughly half the schema. Concept and claim nodes come from a single call over the Stage&nbsp;3 synthesis only, and every claim node or relationship edge must carry a verbatim source-text span, checked by a plain substring match. Anything that fails validation is dropped and counted, following the same never-flag-and-keep rule as Stage&nbsp;4. A separate design decision this session <strong>rejected</strong> replacing prose debate with structured graph reasoning outright — JSON-mode outputs measurably homogenize model answers, which would quietly inflate the Consensus Strength Score and disable the Stage&nbsp;2.75 gate exactly when it's needed most. This stage exists purely as an additive, after-the-fact artifact.</p>
+              <h4>What it achieves</h4>
+              <p>Reference nodes and their <code>cites</code> edges are built deterministically in plain Python from the verified-facts list — zero LLM involvement, zero hallucination surface for roughly half the schema. Concept and claim nodes come from a single call over the Stage&nbsp;3 synthesis only, and every claim node or relationship edge must carry a verbatim source-text span, checked by a plain substring match. Anything that fails validation is dropped and counted, following the same never-flag-and-keep rule as Stage&nbsp;4. A separate design decision this session <strong>rejected</strong> replacing prose debate with structured graph reasoning outright — JSON-mode outputs measurably homogenize model answers, which would quietly inflate the Consensus Strength Score and disable the Stage&nbsp;2.75 gate exactly when it's needed most. This stage exists purely as an additive, after-the-fact artifact, written to the run folder alongside the other transcripts.</p>
             </div>
           </div>
         </div>
@@ -1350,15 +1354,24 @@ footer.provenance code { color: var(--text-dim); }
         <div class="gap-col">
           <h3>Still open</h3>
           <ul>
-            <li><strong>The safety gate is computed but never read.</strong> A regex scan runs against Stage&nbsp;1 drafts and produces a result nothing downstream consults — no score cap, no abort, no warning.</li>
+            <li><strong>The safety gate is surfaced, not enforced.</strong> A regex scan runs against Stage&nbsp;1 drafts and now produces a debug-log warning for any flagged model — but still no score cap and no abort. A human reading the run log will see it; the pipeline itself doesn't act on it.</li>
             <li>Stage&nbsp;2.75 revision still queries models sequentially, multiplying wall-clock cost by seat count on the path most likely to already be under pressure.</li>
-            <li>The daily slug-freshness precheck and the Stage&nbsp;5 reasoning graph are both built and tested as standalone modules but not yet called from the live pipeline sequence.</li>
             <li>Reasoning-effort parameters are designed (see above) but not implemented for any stage.</li>
             <li>Three lower-severity items are explicitly deferred, not silently dropped: a nine-element result tuple that should be a named dataclass, opaque numeric IDs in the Stage&nbsp;4 dropped-facts warning instead of readable claim text, and one remaining debug-log line still using the pre-rename "Stage 1&ndash;3.5" label.</li>
             <li><strong>Stage&nbsp;0.5's evidence-weighting instruction has grown to eight epistemic clauses and has not yet been dry-run against a real model on a real decision.</strong> Every clause is unit-tested for exact wording and anti-fabrication guardrails, but whether a real retrieval model correctly applies eight distinct weighting principles in one pass — rather than a subset of them, or none — is untested behavior, not just untested code. This pipeline's own Real-money gate already requires a dry run before real use; that requirement now carries more weight than it did before this stage's instruction tripled in size.</li>
             <li>Whether Gemini&nbsp;3.6&nbsp;Flash's peer-review vote should be weighted below the three frontier seats it's nominally an equal peer to remains an open, undecided question — on file since before this session, not resolved by anything built here.</li>
           </ul>
         </div>
+      </div>
+
+      <div class="gap-col" style="margin-top: 1.5rem;">
+        <h3>Resolved in a later pass, same day (2026-08-13)</h3>
+        <ul>
+          <li>Grounding tags made mandatory and machine-checkable — three exact markers, a model with zero tags is now named in a compliance note threaded into Stage&nbsp;3. See Stage&nbsp;1 above.</li>
+          <li>Stage&nbsp;3.75 (devil's-advocate critique) and Stage&nbsp;5 (reasoning graph) are both now wired into the live pipeline sequence, each behind its own gate, rather than standalone-tested modules waiting to be called.</li>
+          <li>The daily slug-freshness precheck now runs before every pipeline invocation and warns on drift — visibility only, never blocking.</li>
+          <li>The safety-check result computed per Stage&nbsp;1 response is now surfaced as an explicit debug-log warning for any flagged model, rather than being computed and discarded — moved from the "still open" column to its own line above since it's partially, not fully, resolved.</li>
+        </ul>
       </div>
     </section>
 
@@ -1375,6 +1388,8 @@ footer.provenance code { color: var(--text-dim); }
       <div><code>docs/architecture-stress-test-2026-08-13.md</code> — full 42-finding audit this page's gaps section summarizes</div>
       <div><code>docs/quantitative-evidence-weighting-decision-2026-08-13.md</code> and <code>docs/stage-0-5-epistemic-clauses-decision-2026-08-13.md</code> — the two adversarial panels behind Stage&nbsp;0.5's eight-clause evidence weighting</div>
       <div><code>docs/specs/human-debate-characteristics-contract.md</code> — the dialectic-framing and Rapoport's-Rules additions at Stage&nbsp;1 and Stage&nbsp;2.75</div>
+      <div><code>docs/specs/grounding-annotation-enforcement-contract.md</code> — the mandatory grounding-tag format and Stage&nbsp;3 compliance note</div>
+      <div><code>docs/specs/stage-3-75-critique-contract.md</code> and <code>docs/specs/pending-stage-wiring-contract.md</code> — Stage&nbsp;3.75, Stage&nbsp;5, slug-freshness, and safety-gate wiring</div>
       <div><code>docs/upstream-deltas.md</code> — the dated ledger everything above traces back to</div>
     </div>
     <div>llm-council-debate-vote<br>council-runs are folder-scoped, never written to a shared home directory</div>
