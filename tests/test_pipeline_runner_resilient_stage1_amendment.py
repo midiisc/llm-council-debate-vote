@@ -126,7 +126,7 @@ def _council_result_fixture(css=0.9, extra_metadata=None):
 
 
 def _make_council_fn(result):
-    async def council_fn(query: str):
+    async def council_fn(query: str, verified_facts=None):
         return result
 
     return council_fn

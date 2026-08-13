@@ -25,6 +25,12 @@ from scripts.grounding_pass import (
 from scripts.audition_tracking import default_audition_path, record_session_for_all_models
 from scripts.revision_round import ModelAnswer, run_revision_round, should_trigger_revision
 from scripts.scorecard import ScorecardRecord, append_record, default_scorecard_path
+from scripts.transcript_writer import (
+    write_revision_outcomes,
+    write_stage1_transcripts,
+    write_stage2_summary,
+    write_synthesis,
+)
 
 RUBRIC_DIMENSIONS = ("accuracy", "relevance", "completeness", "conciseness", "clarity")
 
@@ -36,7 +42,12 @@ RUBRIC_DIMENSIONS = ("accuracy", "relevance", "completeness", "conciseness", "cl
 DEFAULT_MAX_WALL_CLOCK_SECONDS = 1200.0
 
 FetchEvidenceFn = Callable[[list[Claim]], Awaitable[dict[str, list[Evidence]]]]
-CouncilFn = Callable[[str], Awaitable[tuple[list, list, dict, dict]]]
+# (user_query, verified_facts) -> (stage1_results, stage2_results, stage3_result,
+# metadata) - Proposal A Contract 3 (docs/specs/proposal-a-reference-grounding-
+# contract.md): verified_facts is threaded through so Stage 3's synthesis call
+# can see Stage 0.5's already-verified facts, reusing the grounding-pass
+# result computed earlier in _run_stages(), no re-computation.
+CouncilFn = Callable[[str, list[TaggedClaim]], Awaitable[tuple[list, list, dict, dict]]]
 QueryModelFn = Callable[[str, str], Awaitable[tuple[str, float]]]
 
 
@@ -92,6 +103,12 @@ class PipelineResult:
 def slugify(topic_label: str) -> str:
     lowered = topic_label.strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "-", lowered)
+    # Mutation-testing note (2026-08-13): `strip("-")` vs `strip("XX-XX")`
+    # (i.e. stripping the char set {'X', '-'}) is a true equivalent mutant -
+    # `slug` can never contain an uppercase 'X' at this point: `.lower()`
+    # above removes all uppercase, and the regex substitution above it
+    # replaces every character outside [a-z0-9] with '-'. Verified by
+    # direct execution (mutmut run, 1 survivor, traced by hand).
     return slug.strip("-")
 
 
@@ -151,6 +168,14 @@ def build_critique_from_rubric(
 
     weakest_dim = min(averages, key=lambda d: averages[d])
     parts = [f"{dim}: {averages[dim]:.1f}/10" for dim in RUBRIC_DIMENSIONS if dim in averages]
+    # Mutation-testing note (2026-08-13): `default=0`'s value (0, 1, None,
+    # or omitted) is a true equivalent mutant here - `if not averages:
+    # return ...` above already guarantees `averages` is non-empty, and
+    # `averages`'s keys come from `per_dim.items() if values` (the SAME
+    # truthiness condition as this genexpr's `if v`), so at least one `v`
+    # is always truthy and the genexpr is never empty - `max()`'s default
+    # is unreachable dead code. Verified by direct execution (mutmut run,
+    # 3 survivors on this line, traced by hand).
     n_reviewers = max((len(v) for v in per_dim.values() if v), default=0)
     return (
         f"Reviewers scored your response ({n_reviewers} reviewer(s)) — "
@@ -177,14 +202,21 @@ def _compute_ranks(aggregate_rankings: list[dict]) -> dict[str, int]:
 
 
 def _compute_outliers(aggregate_rankings: list[dict]) -> dict[str, bool]:
-    scores = [entry["borda_score"] for entry in aggregate_rankings]
+    # Critical (architecture-stress-test-2026-08-13.md #2): the real
+    # single-model degraded_mode shape from council_adapter.py has keys
+    # model/rank/average_score/average_position/vote_count/note and NO
+    # "borda_score" key - .get() with a 0.0 default matches the same
+    # defensive pattern audition_tracking.py's quality_percentile_from_rankings
+    # already uses for this exact shape.
+    scores = [entry.get("borda_score", 0.0) for entry in aggregate_rankings]
     if len(scores) < 2:
         return {entry["model"]: False for entry in aggregate_rankings}
     median = statistics.median(scores)
     stdev = statistics.pstdev(scores)
     threshold = median - 1.5 * stdev
     return {
-        entry["model"]: entry["borda_score"] < threshold for entry in aggregate_rankings
+        entry["model"]: entry.get("borda_score", 0.0) < threshold
+        for entry in aggregate_rankings
     }
 
 
@@ -216,10 +248,22 @@ async def run_pipeline(
         if config.raw_claims_text.strip():
             claims = parse_claims(config.raw_claims_text)
             evidence_map = await fetch_evidence(claims)
+            # Contract 2 (docs/specs/wallclock-cost-budget-contract.md):
+            # real_fetch_evidence returns an EvidenceMap carrying real cost
+            # and a truncation flag; a plain-dict fake (every pre-existing
+            # test) has neither, so this must default via getattr, never
+            # assume the attributes exist.
+            stage05_cost = getattr(evidence_map, "cost_usd", 0.0)
+            cost_so_far += stage05_cost
             input_path = output_dir / "_raw_claims.txt"
             input_path.write_text(config.raw_claims_text)
-            run_grounding_pass(input_path, evidence_map, output_dir)
-            input_path.unlink()
+            try:
+                run_grounding_pass(input_path, evidence_map, output_dir)
+            finally:
+                # Medium finding (architecture-stress-test-2026-08-13.md):
+                # the temp file must be cleaned up even if run_grounding_pass
+                # raises, not just on the success path.
+                input_path.unlink()
             tagged = [tag_claim(c, evidence_map.get(c.id, [])) for c in claims]
             verified_facts = [tc for tc in tagged if tc.tag in ("VERIFIED", "CONTRADICTED")]
             n_verified = sum(1 for tc in tagged if tc.tag == "VERIFIED")
@@ -228,19 +272,44 @@ async def run_pipeline(
             debug_log.append(
                 f"Stage 0.5: grounding ran, {len(claims)} claim(s) "
                 f"({n_verified} verified, {n_contradicted} contradicted, "
-                f"{n_unverifiable} unverifiable)"
+                f"{n_unverifiable} unverifiable), cost=${stage05_cost:.4f}"
             )
+            if getattr(evidence_map, "truncated", False):
+                debug_log.append(
+                    f"Stage 0.5: WARNING - claims truncated by max_claims cap, "
+                    f"only the first {len(claims)} claim(s) were fetched"
+                )
         else:
             debug_log.append("Stage 0.5: skipped (no raw_claims_text)")
 
-        stage1_results, stage2_results, stage3_result, metadata = await council_fn(config.query)
+        stage1_results, stage2_results, stage3_result, metadata = await council_fn(
+            config.query, verified_facts
+        )
 
         debug_log.append(f"Stage 1-3.5: council returned {len(stage1_results)} model response(s)")
+        if len(stage1_results) == 0:
+            # Critical (architecture-stress-test-2026-08-13.md #1): the real
+            # all-models-failed shape from council_adapter.py has no
+            # "quality_metrics" key at all - reading metadata["quality_metrics"]
+            # unconditionally below would raise a bare, uninformative KeyError.
+            # Short-circuit into a clean, named failure instead, reusing the
+            # same failure path (_write_run_status + re-raise) every other
+            # exception in this function already goes through.
+            raise RuntimeError("Stage 1: no models responded - cannot proceed")
         if len(stage1_results) < 2:
             debug_log.append(
                 f"WARNING: only {len(stage1_results)} model(s) participated - "
                 "this is not multi-agent debate"
             )
+
+        # Durable persistence (docs/specs/durable-persistence-contract.md) -
+        # best-effort, a disk-write failure must never crash an otherwise-
+        # successful pipeline run (mirrors the audition-tracking try/except
+        # idiom below).
+        try:
+            write_stage1_transcripts(output_dir, stage1_results)
+        except Exception as e:
+            debug_log.append(f"Transcript write (stage1_transcripts.md): failed non-fatally ({e})")
 
         for sub in metadata.get("substitutions") or []:
             debug_log.append(
@@ -257,13 +326,29 @@ async def run_pipeline(
         label_to_model = metadata["label_to_model"]
         usage = metadata["usage"]
         stage1to3_cost = usage["total"]["cost_usd"]
-        cost_so_far = stage1to3_cost
+        cost_so_far += stage1to3_cost
         debug_log.append(f"Stage 2.5: CSS={css:.3f}")
+
+        # Computed here (not just at scorecard time below) so the durable
+        # write below can reuse it rather than recomputing.
+        is_outlier = _compute_outliers(aggregate_rankings)
+        try:
+            write_stage2_summary(output_dir, stage2_results, aggregate_rankings, css, is_outlier)
+        except Exception as e:
+            debug_log.append(f"Transcript write (stage2_summary.md): failed non-fatally ({e})")
 
         revision_triggered = False
         revision_skipped_for_cost = False
         revision_cost = 0.0
         synthesis = stage3_result["response"]
+
+        # write_synthesis runs unconditionally right after Stage 3 - not
+        # gated on Stage 5 (reasoning-graph, when wired in) also writing
+        # synthesis.md later; an identical overwrite there is harmless.
+        try:
+            write_synthesis(output_dir, synthesis, stage3_result.get("model", "unknown"))
+        except Exception as e:
+            debug_log.append(f"Transcript write (synthesis.md): failed non-fatally ({e})")
 
         if should_trigger_revision(css):
             if config.max_cost_usd is not None and stage1to3_cost >= config.max_cost_usd:
@@ -291,6 +376,12 @@ async def run_pipeline(
                     f"Stage 2.75: revision triggered, {len(outcomes)} model(s) "
                     f"responded, {n_accepted} accepted"
                 )
+                try:
+                    write_revision_outcomes(output_dir, outcomes)
+                except Exception as e:
+                    debug_log.append(
+                        f"Transcript write (revision_outcomes.md): failed non-fatally ({e})"
+                    )
         else:
             debug_log.append(f"Stage 2.75: skipped (CSS {css:.3f} >= threshold)")
 
@@ -320,7 +411,8 @@ async def run_pipeline(
 
         rubric_scores = extract_rubric_scores_for_scorecard(stage2_results, label_to_model)
         ranks = _compute_ranks(aggregate_rankings)
-        is_outlier = _compute_outliers(aggregate_rankings)
+        # is_outlier was already computed above, right before write_stage2_summary -
+        # reused here rather than recomputed.
         cost_usd = {model: bucket["cost_usd"] for model, bucket in usage["by_model"].items()}
 
         record = ScorecardRecord(
@@ -357,7 +449,7 @@ async def run_pipeline(
             except Exception as e:
                 debug_log.append(f"Audition tracking: failed non-fatally ({e})")
 
-        total_cost_usd = stage1to3_cost + revision_cost + completeness_check_cost
+        total_cost_usd = cost_so_far
         cost_ceiling_exceeded = (
             config.max_cost_usd is not None and total_cost_usd > config.max_cost_usd
         )
@@ -391,10 +483,19 @@ async def run_pipeline(
         # two names are aliased) - main() catches plain TimeoutError to map
         # this to its own exit code (4), distinct from the generic exit(1).
         error_msg = f"exceeded max_wall_clock_seconds ({config.max_wall_clock_seconds}s)"
-        _write_run_status(output_dir, "failed", error=error_msg, cost_so_far_usd=cost_so_far)
+        _write_run_status(
+            output_dir, "failed", error=error_msg, cost_so_far_usd=cost_so_far, debug_log=debug_log
+        )
         raise TimeoutError(error_msg) from None
     except Exception as e:
-        _write_run_status(output_dir, "failed", error=str(e), cost_so_far_usd=cost_so_far)
+        # High finding (architecture-stress-test-2026-08-13.md): the
+        # accumulated debug_log must survive into the failure record - it's
+        # the accumulated diagnostic trail this project's own "no silent
+        # failing of any step" hardening pass exists to preserve, and it was
+        # previously dropped on exactly the path where it matters most.
+        _write_run_status(
+            output_dir, "failed", error=str(e), cost_so_far_usd=cost_so_far, debug_log=debug_log
+        )
         raise
 
     _write_run_status(output_dir, "complete", total_cost_usd=total_cost_usd)
@@ -435,6 +536,10 @@ def _build_arg_parser():
     )
     parser.add_argument("--topic-label", required=True)
     parser.add_argument("--query", required=True)
+    # Mutation-testing note (2026-08-13): `default=None` is argparse's own
+    # implicit default for `add_argument`, so dropping it is a true
+    # equivalent mutant on all three lines below. Verified by direct
+    # execution (mutmut run, 3 survivors, traced by hand).
     parser.add_argument("--claims-file", type=Path, default=None)
     parser.add_argument("--max-cost-usd", type=float, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
@@ -454,8 +559,12 @@ def main() -> None:
 
     args = _build_arg_parser().parse_args()
 
-    async def council_fn(query: str):
-        return await run_council_with_timeouts(query)
+    async def council_fn(query: str, verified_facts: list[TaggedClaim]):
+        return await run_council_with_timeouts(
+            query,
+            verified_facts,
+            overall_wall_clock_seconds=args.max_wall_clock_seconds,
+        )
 
     council_models = get_config().council.models
 

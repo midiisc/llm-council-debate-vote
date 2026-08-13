@@ -902,4 +902,324 @@ def test_property_attempt_and_backoff_counts_scale_with_max_attempts(max_attempt
     )
     assert len(sleep_log) == max_attempts - 1
     assert sleep_log == list(backoff)
-    assert "model-a" not in result.responses
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock deadline (docs/specs/wallclock-cost-budget-contract.md,
+# Contract 1) -- an absolute time_fn()-based cutoff after which no further
+# retry/backup attempts are issued for any unresolved slot, so Stage 1 can
+# no longer alone exhaust the overall wall-clock ceiling
+# (architecture-stress-test-2026-08-13.md, Critical #3). Uses a fake,
+# hand-advanced clock (never real time.monotonic) so these tests are
+# hermetic and deterministic.
+# ---------------------------------------------------------------------------
+
+
+def _make_clock(start: float = 0.0):
+    """A fake monotonic clock: time_fn() returns `now`; call clock.advance(n)
+    to move it forward deterministically from within a test or a fake
+    query_fn/sleep_fn."""
+
+    class _Clock:
+        def __init__(self):
+            self.now = start
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    return _Clock()
+
+
+def test_deadline_none_behaves_identically_to_no_deadline():
+    query_fn, call_log = _make_scripted_query_fn({"model-a": ["ok"], "model-b": ["ok"]})
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a", "model-b"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=2,
+            deadline=None,
+        )
+    )
+    assert set(result.responses) == {"model-a", "model-b"}
+    assert result.shortfall_warning is None
+    assert len(call_log) == 2
+
+
+def test_deadline_far_in_the_future_behaves_identically_to_no_deadline():
+    clock = _make_clock(start=0.0)
+    query_fn, call_log = _make_scripted_query_fn({"model-a": ["ok"]})
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=1,
+            deadline=10_000.0,
+            time_fn=clock,
+        )
+    )
+    assert set(result.responses) == {"model-a"}
+    assert len(call_log) == 1
+
+
+def test_deadline_exactly_equal_to_now_does_not_consume_a_backup():
+    # Boundary case for _resolve_slot's own check specifically: at exactly
+    # time_fn() == deadline, _attempt_with_retries's own (separate) check
+    # would ALSO stop the primary's first attempt either way, so the two
+    # checks are only distinguishable by whether a backup gets consumed
+    # afterward - _resolve_slot's check must return before ever reaching
+    # the backup-substitution logic. Traced by hand from a real mutmut
+    # survivor (>= mutated to > in _resolve_slot).
+    clock = _make_clock(start=50.0)
+    query_fn, call_log = _make_scripted_query_fn({"model-a": ["ok"], "backup-1": ["ok"]})
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a"],
+            backup_models=["backup-1"],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=1,
+            deadline=50.0,  # exactly equal to clock.now, not past it
+            time_fn=clock,
+        )
+    )
+
+    assert call_log == []
+    assert result.substitutions == []  # backup-1 was never even attempted
+    assert "model-a" in result.unreachable_models
+    assert "backup-1" not in result.unreachable_models  # never attempted at all
+
+
+def test_deadline_exactly_equal_to_now_mid_retry_skips_the_next_attempt():
+    # Boundary case for _attempt_with_retries's own check specifically:
+    # the deadline is reached (not yet passed) exactly as attempt 1
+    # finishes - attempt 2 must still be skipped. Traced by hand from a
+    # real mutmut survivor (>= mutated to > in _attempt_with_retries).
+    clock = _make_clock(start=0.0)
+
+    async def query_fn(model, messages, timeout):
+        clock.advance(60.0)  # lands EXACTLY on the deadline, not past it
+        return {"status": "timeout"}
+
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    sleep_fn, sleep_log = _make_sleep_fn()
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            retry_policy=policy,
+            minimum_council_size=1,
+            sleep_fn=sleep_fn,
+            deadline=60.0,
+            time_fn=clock,
+        )
+    )
+
+    model_a_attempts = [a for a in result.attempts if a.model == "model-a"]
+    assert len(model_a_attempts) == 1  # only attempt 1 - attempt 2 skipped at the exact boundary
+    assert result.responses == {}
+
+
+def test_deadline_already_passed_before_first_attempt_gets_zero_attempts():
+    clock = _make_clock(start=100.0)  # already past the deadline of 50.0
+    query_fn, call_log = _make_scripted_query_fn({"model-a": ["ok"]})  # would succeed if ever called
+    sleep_fn, sleep_log = _make_sleep_fn()
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=1,
+            sleep_fn=sleep_fn,
+            deadline=50.0,
+            time_fn=clock,
+        )
+    )
+
+    assert call_log == []  # zero attempts -- never even called query_fn once
+    assert sleep_log == []
+    assert result.responses == {}
+    assert "model-a" in result.unreachable_models
+    assert result.shortfall_warning is not None
+
+
+def test_deadline_already_passed_does_not_consume_a_backup():
+    clock = _make_clock(start=100.0)
+    query_fn, call_log = _make_scripted_query_fn({"model-a": ["ok"], "backup-1": ["ok"]})
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a"],
+            backup_models=["backup-1"],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=1,
+            deadline=50.0,
+            time_fn=clock,
+        )
+    )
+
+    assert call_log == []  # neither the primary nor the backup was ever attempted
+    assert result.substitutions == []  # no substitution event for an attempt that never happened
+    assert result.responses == {}
+
+
+def test_deadline_passes_between_attempt_1_and_attempt_2_skips_attempt_2():
+    clock = _make_clock(start=0.0)
+    call_log: list[str] = []
+
+    async def query_fn(model, messages, timeout):
+        call_log.append(model)
+        clock.advance(60.0)  # this call itself consumes enough time to blow the deadline
+        return {"status": "timeout"}
+
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    sleep_fn, sleep_log = _make_sleep_fn()
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            retry_policy=policy,
+            minimum_council_size=1,
+            sleep_fn=sleep_fn,
+            deadline=50.0,  # first call advances clock past this
+            time_fn=clock,
+        )
+    )
+
+    assert call_log == ["model-a"]  # only attempt 1 happened, attempt 2 was skipped
+    assert result.responses == {}
+    assert "model-a" in result.unreachable_models
+
+
+def test_deadline_triggered_shortfall_warning_is_exactly_as_loud_as_backups_exhausted():
+    clock = _make_clock(start=100.0)
+    query_fn, _ = _make_scripted_query_fn({"model-a": ["ok"], "model-b": ["ok"]})
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a", "model-b"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=2,
+            deadline=50.0,  # already passed -- neither model gets attempted
+            time_fn=clock,
+        )
+    )
+
+    assert result.shortfall_warning is not None
+    assert "0 of the required minimum 2" in result.shortfall_warning
+    assert "model-a" in result.shortfall_warning
+    assert "model-b" in result.shortfall_warning
+
+
+def test_retry_policy_raises_at_construction_if_backoff_seconds_too_short():
+    # architecture-stress-test-2026-08-13.md, High finding: max_attempts=4
+    # needs 3 backoff entries (between each pair of attempts) but only 2
+    # are given here - must fail loudly and immediately at construction,
+    # not with a mid-debate IndexError deep in the retry loop.
+    with pytest.raises(ValueError):
+        rq.RetryPolicy(max_attempts=4, backoff_seconds=(5.0, 15.0))
+
+
+def test_retry_policy_accepts_exactly_matching_backoff_length():
+    # max_attempts=3 needs exactly 2 backoff entries - the boundary case,
+    # must NOT raise.
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    assert policy.max_attempts == 3
+
+
+def test_retry_policy_accepts_more_backoff_entries_than_strictly_needed():
+    # Extra, unused backoff entries are harmless - only too FEW is an error.
+    policy = rq.RetryPolicy(max_attempts=2, backoff_seconds=(5.0, 15.0, 25.0))
+    assert policy.max_attempts == 2
+
+
+def test_retry_policy_max_attempts_one_needs_zero_backoff_entries():
+    policy = rq.RetryPolicy(max_attempts=1, backoff_seconds=())
+    assert policy.max_attempts == 1
+
+
+def test_backup_model_that_duplicates_a_primary_is_never_attempted_as_a_backup():
+    # architecture-stress-test-2026-08-13.md, Low finding: if a
+    # debate_resilience.backup_models entry is also a primary model, using
+    # it as a backup for a DIFFERENT slot doesn't add real resilience (if
+    # that model is down, it's down for both roles) and risks a silent
+    # responses-dict collision keyed by bare model name.
+    query_fn, call_log = _make_scripted_query_fn(
+        {"model-a": ["timeout", "timeout", "timeout"], "model-b": ["ok"]}
+    )
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    sleep_fn, _ = _make_sleep_fn()
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a", "model-b"],
+            backup_models=["model-b"],  # duplicates the OTHER primary
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            retry_policy=policy,
+            minimum_council_size=1,
+            sleep_fn=sleep_fn,
+        )
+    )
+
+    # model-b was never attempted a second time as model-a's backup - the
+    # duplicate entry is filtered out of the backup pool entirely.
+    model_b_calls = [c for c in call_log if c[0] == "model-b"]
+    assert len(model_b_calls) == 1
+    assert result.substitutions == []
+    assert "model-a" in result.unreachable_models
+
+
+def test_deadline_lets_some_slots_succeed_before_it_passes_and_returns_partial_results():
+    clock = _make_clock(start=0.0)
+
+    async def query_fn(model, messages, timeout):
+        if model == "model-a":
+            return {"status": "ok", "text": "resp-a"}
+        # model-b's very first attempt burns past the deadline
+        clock.advance(1000.0)
+        return {"status": "timeout"}
+
+    result = _run(
+        rq.query_models_resilient(
+            primary_models=["model-a", "model-b"],
+            backup_models=[],
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            minimum_council_size=2,
+            deadline=500.0,
+            time_fn=clock,
+        )
+    )
+
+    assert result.responses == {"model-a": {"status": "ok", "text": "resp-a"}}
+    assert "model-b" in result.unreachable_models
+    assert result.shortfall_warning is not None

@@ -15,8 +15,11 @@ Contract: docs/specs/debate-resilience-contract.md.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
+
+TimeFn = Callable[[], float]  # default: time.monotonic
 
 QueryFn = Callable[[str, list[dict], float], Awaitable[dict]]
 # matches llm_council.openrouter.query_model_with_status(model, messages, timeout)
@@ -34,6 +37,20 @@ class RetryPolicy:
     )
     # Any status NOT in retryable_statuses (e.g. "auth_error") is terminal:
     # stop retrying that model immediately, no separate "terminal" list needed.
+
+    def __post_init__(self) -> None:
+        # A misconfigured llm_council.yaml (e.g. max_attempts raised without
+        # adding a matching backoff_seconds entry) must fail loudly and
+        # immediately here - not with a mid-debate IndexError deep inside
+        # _attempt_with_retries's retry loop
+        # (architecture-stress-test-2026-08-13.md, High finding).
+        needed = self.max_attempts - 1
+        if len(self.backoff_seconds) < needed:
+            raise ValueError(
+                f"RetryPolicy.backoff_seconds has {len(self.backoff_seconds)} "
+                f"entries but max_attempts={self.max_attempts} needs at least "
+                f"{needed} (one between each pair of attempts)"
+            )
 
 
 @dataclass
@@ -66,13 +83,24 @@ async def _attempt_with_retries(
     query_fn: QueryFn,
     retry_policy: RetryPolicy,
     sleep_fn: SleepFn,
+    deadline: Optional[float] = None,
+    time_fn: TimeFn = time.monotonic,
 ) -> tuple[list[ModelAttempt], Optional[dict]]:
     """Run `candidate` through its own retry sequence (independent of any
     other candidate). Returns every ModelAttempt recorded plus the
     successful response dict, or None if it never reached status="ok".
+
+    `deadline` (an absolute `time_fn()`-based cutoff) stops the sequence
+    before any attempt whose start would be at or past it - including the
+    very first attempt, and including one that would start mid-sequence
+    after a backoff sleep (docs/specs/wallclock-cost-budget-contract.md,
+    Contract 1, AC2/AC3). `deadline=None` (default) never stops anything -
+    identical to the pre-deadline behavior.
     """
     attempts: list[ModelAttempt] = []
     for attempt_number in range(1, retry_policy.max_attempts + 1):
+        if deadline is not None and time_fn() >= deadline:
+            break
         response = await query_fn(candidate, messages, timeout)
         status = response.get("status")
         attempts.append(ModelAttempt(model=candidate, attempt_number=attempt_number, status=status))
@@ -97,11 +125,19 @@ async def _resolve_slot(
     query_fn: QueryFn,
     retry_policy: RetryPolicy,
     sleep_fn: SleepFn,
+    deadline: Optional[float] = None,
+    time_fn: TimeFn = time.monotonic,
 ) -> tuple[Optional[str], Optional[dict], list[ModelAttempt], list[SubstitutionEvent], list[str]]:
     """Resolve one primary model's slot: the primary itself, then as many
     unused backups (in `backup_queue` order) as needed until one succeeds or
     the backup pool is exhausted. Returns (winning_model_or_None,
     response_or_None, attempts, substitutions, unreachable_candidates).
+
+    `deadline`: checked before each new candidate (primary or backup) is
+    even tried - if already past, that candidate gets zero attempts and no
+    backup is consumed for it (docs/specs/wallclock-cost-budget-contract.md,
+    Contract 1, AC2/AC4) - this proceeds-degraded-not-hard-fail behavior
+    mirrors what already happens when the backup pool is simply exhausted.
     """
     attempts: list[ModelAttempt] = []
     substitutions: list[SubstitutionEvent] = []
@@ -109,8 +145,13 @@ async def _resolve_slot(
 
     candidate = primary_model
     while True:
+        if deadline is not None and time_fn() >= deadline:
+            unreachable.append(candidate)
+            return None, None, attempts, substitutions, unreachable
+
         candidate_attempts, response = await _attempt_with_retries(
-            candidate, messages, timeout, query_fn, retry_policy, sleep_fn
+            candidate, messages, timeout, query_fn, retry_policy, sleep_fn,
+            deadline=deadline, time_fn=time_fn,
         )
         attempts.extend(candidate_attempts)
 
@@ -147,16 +188,27 @@ async def query_models_resilient(
     retry_policy: RetryPolicy = RetryPolicy(),
     minimum_council_size: int = 4,
     sleep_fn: SleepFn = asyncio.sleep,
+    deadline: Optional[float] = None,
+    time_fn: TimeFn = time.monotonic,
 ) -> ResilientQueryResult:
     # Shared, mutable queue: each backup is consumed by at most one slot
     # across the whole call. Independent per-slot resolution runs
     # concurrently (matches query_models_parallel's "parallel" framing);
     # queue consumption itself never spans an await, so it stays race-free.
-    backup_queue = list(backup_models)
+    # A backup entry that duplicates a primary model is filtered out here -
+    # substituting it for a DIFFERENT slot adds no real resilience (if that
+    # model is down, it's down for both roles) and would otherwise risk a
+    # silent responses-dict collision keyed by bare model name
+    # (architecture-stress-test-2026-08-13.md, Low finding).
+    primary_set = set(primary_models)
+    backup_queue = [m for m in backup_models if m not in primary_set]
 
     slot_results = await asyncio.gather(
         *(
-            _resolve_slot(primary, backup_queue, messages, timeout, query_fn, retry_policy, sleep_fn)
+            _resolve_slot(
+                primary, backup_queue, messages, timeout, query_fn, retry_policy, sleep_fn,
+                deadline=deadline, time_fn=time_fn,
+            )
             for primary in primary_models
         )
     )

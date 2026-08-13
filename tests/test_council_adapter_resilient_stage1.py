@@ -261,12 +261,15 @@ def test_ac18_loads_real_schema_debate_resilience_block_exactly(tmp_path):
 
 def test_ac18_loads_this_projects_actual_llm_council_yaml_debate_resilience_block():
     # Cross-check against the real, checked-in config (re-confirmed live,
-    # 2026-08-12, to carry a debate_resilience: block with backup_models
-    # ["moonshotai/kimi-k3-20260715", "qwen/qwen3.8-max", "x-ai/grok-4.6"]
+    # 2026-08-13, to carry a debate_resilience: block with backup_models
+    # ["moonshotai/kimi-k3", "qwen/qwen3.8-max", "x-ai/grok-4.6"]
     # (updated from the original 2-model pool after this test was first
     # authored -- moonshotai/kimi-k3-20260715 was added as the panel's
-    # diversity-optimized top backup pick), minimum_council_size: 4,
-    # retry.max_attempts: 3, retry.backoff_seconds: [5, 15],
+    # diversity-optimized top backup pick, then 2026-08-13 the dated slug
+    # went dead on live OpenRouter and was fixed to the undated
+    # moonshotai/kimi-k3 -- see docs/upstream-deltas.md, "Kimi K3 slug
+    # drift" entry), minimum_council_size: 4, retry.max_attempts: 3,
+    # retry.backoff_seconds: [5, 15],
     # retry.retryable_statuses: [timeout, rate_limited, error].
     real_config_path = REPO_ROOT / "llm_council.yaml"
     assert real_config_path.exists(), "expected llm_council.yaml at repo root"
@@ -274,7 +277,7 @@ def test_ac18_loads_this_projects_actual_llm_council_yaml_debate_resilience_bloc
     result = ca._load_debate_resilience_config(config_path=real_config_path)
 
     assert result.backup_models == [
-        "moonshotai/kimi-k3-20260715",
+        "moonshotai/kimi-k3",
         "qwen/qwen3.8-max",
         "x-ai/grok-4.6",
     ]
@@ -620,7 +623,11 @@ def test_query_models_resilient_receives_correct_messages_and_timeout(monkeypatc
 
     _run(ca.run_council_with_timeouts("the exact query text", stage1_timeout=77.0))
 
-    assert captured["messages"] == [{"role": "user", "content": "the exact query text"}]
+    # Proposal A Contract 1 (docs/specs/proposal-a-reference-grounding-contract.md):
+    # messages carry the query plus the uniform reference-reporting instruction.
+    assert captured["messages"] == [
+        {"role": "user", "content": ca.build_stage1_prompt("the exact query text")}
+    ]
     assert captured["timeout"] == 77.0
 
 

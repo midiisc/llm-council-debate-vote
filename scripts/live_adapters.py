@@ -8,6 +8,7 @@ docs/specs/pipeline-runner-contract.md's design note.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import urllib.error
@@ -55,6 +56,21 @@ def _is_retryable_error(exc: BaseException) -> bool:
     return False
 
 
+class EvidenceMap(dict):
+    """dict[str, list[Evidence]] subclass carrying cost/truncation metadata
+    alongside the evidence itself (docs/specs/wallclock-cost-budget-contract.md,
+    Contract 2). Preserves FetchEvidenceFn's existing dict-shaped contract
+    exactly - isinstance(x, dict) is True, every dict operation works
+    identically - so no existing FetchEvidenceFn fake across this repo's
+    test suite needs to change. Callers must read via
+    getattr(x, "cost_usd", 0.0) / getattr(x, "truncated", False), never
+    assume these attributes exist (a plain dict, e.g. any test fake, won't
+    have them)."""
+
+    cost_usd: float = 0.0
+    truncated: bool = False
+
+
 def _post_chat_completion(
     model: str,
     prompt: str,
@@ -89,6 +105,22 @@ def _post_chat_completion(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+async def _post_chat_completion_async(
+    model: str, prompt: str, max_tokens: int = 2000, max_retries: int = MAX_RETRIES,
+) -> dict[str, Any]:
+    """Runs the existing synchronous _post_chat_completion (urllib +
+    blocking time.sleep backoff) in a worker thread via asyncio.to_thread,
+    so the event loop stays responsive to asyncio.wait_for cancellation
+    during the call (docs/specs/wallclock-cost-budget-contract.md,
+    Contract 2 - architecture-stress-test-2026-08-13.md's "the always-on
+    wall-clock ceiling cannot actually preempt Stage 0.5/Stage 2.75 network
+    calls" finding). No migration off urllib, minimal-diff fix - the
+    synchronous _post_chat_completion itself is unchanged."""
+    return await asyncio.to_thread(
+        _post_chat_completion, model, prompt, max_tokens=max_tokens, max_retries=max_retries
+    )
+
+
 async def real_query_model(model: str, prompt: str) -> tuple[str, float]:
     """query_model for revision_round.run_revision_round.
 
@@ -97,20 +129,33 @@ async def real_query_model(model: str, prompt: str) -> tuple[str, float]:
     than raising, since a missing cost figure shouldn't crash a revision
     round that otherwise succeeded.
     """
-    data = _post_chat_completion(model, prompt)
+    data = await _post_chat_completion_async(model, prompt)
     text = data["choices"][0]["message"]["content"]
     cost_usd = data.get("usage", {}).get("cost") or 0.0
     return text, cost_usd
 
 
+_CLAIM_SECTION_BEGIN = "--- BEGIN CLAIM ---"
+_CLAIM_SECTION_END = "--- END CLAIM ---"
+
+
 def build_evidence_prompt(claim: Claim) -> str:
+    # Delimited (docs/specs/proposal-a-reference-grounding-contract.md,
+    # Contract 2 completion) - the highest-risk of the three unguarded
+    # sites the stress test found: claim.text goes directly to a live
+    # web-search-enabled model (EVIDENCE_MODEL, :online), so a crafted
+    # claim could otherwise forge text that reads as prompt instructions
+    # to that model, opening an indirect-prompt-injection chain into live
+    # external search.
     return (
         "Research this claim using web search and respond with ONLY a JSON "
         "object (no markdown fences, no other text), in exactly this shape:\n"
         '{"verdict": "supports"|"contradicts"|"unverifiable", '
         '"source": "<url of your best source, or empty string if unverifiable>", '
         '"date": "<retrieval date YYYY-MM-DD, or empty string if unverifiable>"}\n\n'
-        f"Claim: {claim.text}"
+        f"{_CLAIM_SECTION_BEGIN}\n"
+        f"{claim.text}\n"
+        f"{_CLAIM_SECTION_END}"
     )
 
 
@@ -143,16 +188,43 @@ def parse_evidence_response(raw_content: str, retrieval_date: str) -> list[Evide
     return [Evidence(source=source, date=date, supports=(verdict == "supports"))]
 
 
-async def real_fetch_evidence(claims: list[Claim]) -> dict[str, list[Evidence]]:
+async def real_fetch_evidence(
+    claims: list[Claim], max_claims: int = 50, max_concurrency: int = 5,
+) -> EvidenceMap:
     """fetch_evidence for pipeline_runner.run_pipeline - one OpenRouter
-    web-search call per claim via the :online plugin."""
+    web-search call per claim via the :online plugin.
+
+    docs/specs/wallclock-cost-budget-contract.md, Contract 2 (closes
+    architecture-stress-test-2026-08-13.md's Critical #5 + the "fully
+    sequential, no cap" High finding): claims are fetched CONCURRENTLY
+    (bounded by max_concurrency, not one-at-a-time), real cost is tracked
+    and returned via EvidenceMap.cost_usd, and total claims are capped at
+    max_claims with EvidenceMap.truncated=True set - never a silent drop.
+    """
     from datetime import datetime, timezone
 
     retrieval_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    evidence: dict[str, list[Evidence]] = {}
-    for claim in claims:
-        prompt = build_evidence_prompt(claim)
-        data = _post_chat_completion(EVIDENCE_MODEL, prompt, max_tokens=500)
+    truncated = len(claims) > max_claims
+    claims_to_fetch = claims[:max_claims]
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _fetch_one(claim: Claim) -> tuple[str, list[Evidence], float]:
+        async with semaphore:
+            prompt = build_evidence_prompt(claim)
+            data = await _post_chat_completion_async(EVIDENCE_MODEL, prompt, max_tokens=500)
         content = data["choices"][0]["message"]["content"]
-        evidence[claim.id] = parse_evidence_response(content, retrieval_date)
+        cost = data.get("usage", {}).get("cost") or 0.0
+        return claim.id, parse_evidence_response(content, retrieval_date), cost
+
+    results = await asyncio.gather(*(_fetch_one(claim) for claim in claims_to_fetch))
+
+    evidence = EvidenceMap()
+    total_cost = 0.0
+    for claim_id, claim_evidence, cost in results:
+        evidence[claim_id] = claim_evidence
+        total_cost += cost
+
+    evidence.cost_usd = total_cost
+    evidence.truncated = truncated
     return evidence

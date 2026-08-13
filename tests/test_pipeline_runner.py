@@ -119,7 +119,7 @@ class FakeQueryModel:
 def _make_council_fn(result):
     calls = []
 
-    async def council_fn(query: str):
+    async def council_fn(query: str, verified_facts=None):
         calls.append(query)
         return result
 
@@ -135,6 +135,23 @@ def _make_fetch_evidence(evidence_by_claim_id=None):
         return evidence_by_claim_id or {}
 
     fetch_evidence.calls = calls
+    return fetch_evidence
+
+
+def _make_fetch_evidence_with_cost(evidence_by_claim_id, cost_usd, truncated=False):
+    # docs/specs/wallclock-cost-budget-contract.md, Contract 2: a REAL
+    # EvidenceMap (not a plain dict), matching what live_adapters.py's
+    # real_fetch_evidence actually returns - _make_fetch_evidence above
+    # deliberately stays a plain-dict fake (the common case every other
+    # existing test needs, mirroring getattr(x, "cost_usd", 0.0)'s default).
+    from scripts.live_adapters import EvidenceMap
+
+    async def fetch_evidence(claims):
+        result = EvidenceMap(evidence_by_claim_id)
+        result.cost_usd = cost_usd
+        result.truncated = truncated
+        return result
+
     return fetch_evidence
 
 
@@ -186,6 +203,83 @@ def test_ac2_nonempty_claims_text_writes_grounding_md(tmp_path):
     grounding_path = result.output_dir / "grounding.md"
     assert grounding_path.exists()
     assert "VERIFIED" in grounding_path.read_text()
+
+
+# --- Contract 2 (docs/specs/wallclock-cost-budget-contract.md): Stage 0.5
+# cost tracking + truncation warning, closes Critical #5 ---
+
+
+def test_stage05_real_cost_is_added_to_total_cost_usd(tmp_path):
+    evidence = {"1": [Evidence(source="http://example.com", date="2026-08-09", supports=True)]}
+    fetch_evidence = _make_fetch_evidence_with_cost(evidence, cost_usd=0.42)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="test topic",
+        query="a question",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.total_cost_usd >= 0.42
+
+
+def test_stage05_truncation_produces_a_debug_log_line(tmp_path):
+    evidence = {"1": [Evidence(source="http://example.com", date="2026-08-09", supports=True)]}
+    fetch_evidence = _make_fetch_evidence_with_cost(evidence, cost_usd=0.0, truncated=True)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="test topic",
+        query="a question",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert any(
+        "Stage 0.5" in line and ("truncat" in line.lower() or "cap" in line.lower())
+        for line in result.debug_log
+    )
+
+
+def test_stage05_no_truncation_produces_no_truncation_debug_line(tmp_path):
+    evidence = {"1": [Evidence(source="http://example.com", date="2026-08-09", supports=True)]}
+    fetch_evidence = _make_fetch_evidence_with_cost(evidence, cost_usd=0.0, truncated=False)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="test topic",
+        query="a question",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert not any("truncat" in line.lower() for line in result.debug_log)
+
+
+def test_stage05_plain_dict_fetch_evidence_costs_nothing(tmp_path):
+    # A plain-dict FetchEvidenceFn (every pre-existing fake in this file)
+    # must still work exactly as before - getattr defaults to 0.0/False.
+    evidence = {"1": [Evidence(source="http://example.com", date="2026-08-09", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="test topic",
+        query="a question",
+        raw_claims_text="1. Some claim.",
+        output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert not any("truncat" in line.lower() for line in result.debug_log)
 
 
 def test_raw_claims_temp_input_file_uses_exact_expected_filename(tmp_path, monkeypatch):
@@ -320,6 +414,45 @@ def test_council_models_given_records_every_configured_model_including_absent_on
     assert z_record["consecutive_failures"] == 1  # did not participate this session
     x_record = next(rec for rec in lines if rec["model_id"] == "model-x")
     assert x_record["consecutive_failures"] == 0  # participated
+
+
+def test_output_root_none_resolves_audition_path_via_cwd_and_threads_real_rankings(
+    monkeypatch, tmp_path
+):
+    """output_root=None must resolve the audition path via
+    default_audition_path(Path.cwd()) (never a hardcoded/omitted cwd
+    argument), and record_session_for_all_models must receive the run's
+    own real aggregate_rankings (never a placeholder) - both silently
+    unobserved by every other audition test above, which always sets
+    output_root=tmp_path and never inspects quality_percentile."""
+    monkeypatch.chdir(tmp_path)
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=None)
+    result = asyncio.run(
+        run_pipeline(
+            config,
+            fetch_evidence,
+            council_fn,
+            query_model,
+            council_models=["model-x", "model-y"],
+        )
+    )
+
+    assert "Audition tracking: recorded" in result.debug_log
+    audition_path = tmp_path / "council-runs" / "audition.jsonl"
+    assert audition_path.exists()
+    lines = [json.loads(l) for l in audition_path.read_text().splitlines() if l.strip()]
+    x_record = next(rec for rec in lines if rec["model_id"] == "model-x")
+    y_record = next(rec for rec in lines if rec["model_id"] == "model-y")
+    # _council_result_fixture's aggregate_rankings gives model-x the
+    # highest borda_score (1.0) and model-y the lowest (0.0) - real
+    # rankings produce distinct, non-None percentiles; a None/omitted
+    # aggregate_rankings argument collapses both to None instead.
+    assert x_record["quality_percentile"] == 1.0
+    assert y_record["quality_percentile"] == 0.5
 
 
 def test_audition_tracking_write_failure_is_non_fatal_to_the_run(tmp_path, monkeypatch):
@@ -635,10 +768,44 @@ def test_grounding_leaves_no_stray_intermediate_file(tmp_path):
     )
     result = _run(config, fetch_evidence, council_fn, query_model)
 
-    assert sorted(p.name for p in result.output_dir.iterdir()) == [
-        "grounding.md",
-        "run_status.json",
-    ]
+    # The actual invariant this test protects: the grounding pass's own
+    # temp input file (_raw_claims.txt) must never linger after the run.
+    # It does NOT enumerate every legitimate output file - that set grows
+    # as durable-persistence writes land (docs/specs/durable-persistence-
+    # contract.md) - so this checks for the specific stray file's absence
+    # plus the two files this test always expected to exist, rather than
+    # an exhaustive allowlist that would go stale on every new legitimate
+    # output.
+    names = {p.name for p in result.output_dir.iterdir()}
+    assert "_raw_claims.txt" not in names
+    assert {"grounding.md", "run_status.json"} <= names
+
+
+def test_raw_claims_temp_file_cleaned_up_even_when_grounding_pass_raises(tmp_path, monkeypatch):
+    # architecture-stress-test-2026-08-13.md, Medium finding: the temp file
+    # write -> run_grounding_pass -> unlink sequence assumed the middle call
+    # never raises. If it does, the file must still be cleaned up (a
+    # try/finally around the unlink), not orphaned.
+    import scripts.pipeline_runner as pr_module
+
+    def exploding_grounding_pass(input_path, evidence_map, output_dir):
+        raise RuntimeError("grounding pass blew up")
+
+    monkeypatch.setattr(pr_module, "run_grounding_pass", exploding_grounding_pass)
+
+    fetch_evidence = _make_fetch_evidence({"1": []})
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    with pytest.raises(RuntimeError):
+        _run(config, fetch_evidence, council_fn, query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    assert len(run_dirs) == 1
+    assert not (run_dirs[0] / "_raw_claims.txt").exists()
 
 
 def test_ac8_make_output_dir_creates_full_path(tmp_path):
@@ -863,7 +1030,8 @@ def test_debug_log_records_grounding_and_revision_when_they_run(tmp_path):
     result = _run(config, fetch_evidence, council_fn, query_model)
 
     assert (
-        "Stage 0.5: grounding ran, 1 claim(s) (1 verified, 0 contradicted, 0 unverifiable)"
+        "Stage 0.5: grounding ran, 1 claim(s) (1 verified, 0 contradicted, 0 unverifiable), "
+        "cost=$0.0000"
         in result.debug_log
     )
     assert "Stage 2.75: revision triggered, 2 model(s) responded, 0 accepted" in result.debug_log
@@ -892,7 +1060,8 @@ def test_debug_log_grounding_counts_each_tag_correctly(tmp_path):
     result = _run(config, fetch_evidence, council_fn, query_model)
 
     assert (
-        "Stage 0.5: grounding ran, 3 claim(s) (1 verified, 1 contradicted, 1 unverifiable)"
+        "Stage 0.5: grounding ran, 3 claim(s) (1 verified, 1 contradicted, 1 unverifiable), "
+        "cost=$0.0000"
         in result.debug_log
     )
 
@@ -900,7 +1069,7 @@ def test_debug_log_grounding_counts_each_tag_correctly(tmp_path):
 def test_debug_log_flags_single_model_as_not_mad(tmp_path):
     fetch_evidence = _make_fetch_evidence()
 
-    async def single_model_council_fn(query):
+    async def single_model_council_fn(query, verified_facts=None):
         stage1_results = [{"model": "model-x", "response": "Answer from X"}]
         stage2_results = []
         aggregate_rankings = [{"model": "model-x", "borda_score": 1.0, "rank": 1}]
@@ -1233,7 +1402,7 @@ def test_ac11_running_status_written_before_expensive_work(tmp_path):
     # A council_fn that raises immediately still leaves a "running" marker,
     # proving the status is written BEFORE council_fn is even called, not
     # only recorded retroactively on success.
-    async def failing_council_fn(query):
+    async def failing_council_fn(query, verified_facts=None):
         raise RuntimeError("network down")
 
     fetch_evidence = _make_fetch_evidence()
@@ -1255,7 +1424,7 @@ def test_ac11_running_status_literal_string_correct(tmp_path):
     # status string content independently of the final complete/failed state.
     seen_status = {}
 
-    async def peeking_council_fn(query):
+    async def peeking_council_fn(query, verified_facts=None):
         result = _council_result_fixture(css=0.9)
         # output_dir isn't available here directly; reconstruct via closure
         # over the known tmp_path root (single run in this test).
@@ -1305,11 +1474,33 @@ def test_ac13_failed_status_includes_error_and_cost_so_far_after_council_succeed
     status = _read_run_status(run_dirs[0])
     assert status["status"] == "failed"
     assert "revision call failed" in status["error"]
+
+
+def test_debug_log_is_persisted_on_failure_not_dropped(tmp_path):
+    # architecture-stress-test-2026-08-13.md, High finding: the accumulated
+    # debug_log lines (e.g. "Stage 1-3.5: council returned...") must survive
+    # into the written failure record - losing them on the exact path where
+    # diagnosing a failure matters most defeats the whole point of
+    # debug_log existing.
+    async def exploding_query_model(model, prompt):
+        raise ConnectionError("revision call failed")
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=0.01, cost_y=0.02))
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    with pytest.raises(ConnectionError):
+        _run(config, fetch_evidence, council_fn, exploding_query_model)
+
+    run_dirs = list(tmp_path.iterdir())
+    status = _read_run_status(run_dirs[0])
+    assert "debug_log" in status
+    assert any("Stage 1-3.5" in line for line in status["debug_log"])
     assert status["cost_so_far_usd"] == pytest.approx(0.03)
 
 
 def test_ac13_failed_status_cost_so_far_is_zero_when_council_never_returns(tmp_path):
-    async def failing_council_fn(query):
+    async def failing_council_fn(query, verified_facts=None):
         raise RuntimeError("boom")
 
     fetch_evidence = _make_fetch_evidence()
@@ -1366,7 +1557,7 @@ def test_ac15_original_exception_type_and_message_preserved_not_swallowed(tmp_pa
     class CustomError(ValueError):
         pass
 
-    async def failing_council_fn(query):
+    async def failing_council_fn(query, verified_facts=None):
         raise CustomError("very specific message")
 
     fetch_evidence = _make_fetch_evidence()
@@ -1526,8 +1717,10 @@ def _run_main(monkeypatch, capsys, argv_tail, result=None, exc=None):
             raise exc
         return result
 
-    async def fake_run_council_with_timeouts(query):
+    async def fake_run_council_with_timeouts(query, verified_facts=None, overall_wall_clock_seconds=None):
         calls["council_fn_query"] = query
+        calls["council_fn_verified_facts"] = verified_facts
+        calls["council_fn_overall_wall_clock_seconds"] = overall_wall_clock_seconds
         return ([], [], {}, {})
 
     monkeypatch.setattr(_pr_module, "run_pipeline", fake_run_pipeline)
@@ -1621,9 +1814,64 @@ def test_main_council_fn_wraps_run_council_with_timeouts(monkeypatch, capsys):
     )
 
     council_fn = calls["run_pipeline_args"][2]
-    ret = asyncio.run(council_fn("probe-query"))
+    ret = asyncio.run(council_fn("probe-query", []))
     assert calls["council_fn_query"] == "probe-query"
     assert ret == ([], [], {}, {})
+
+
+def test_main_council_fn_threads_verified_facts_through_unchanged(monkeypatch, capsys):
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    council_fn = calls["run_pipeline_args"][2]
+    # A genuinely non-empty, non-None sentinel - distinguishes "threaded
+    # through unchanged" from both a None-replaced and an omitted
+    # (default-valued) verified_facts argument.
+    sentinel_facts = ["not-empty-verified-facts-marker"]
+    asyncio.run(council_fn("probe-query", sentinel_facts))
+    assert calls["council_fn_verified_facts"] == sentinel_facts
+
+
+def test_main_council_fn_threads_max_wall_clock_seconds_to_council_adapter(monkeypatch, capsys):
+    # docs/specs/wallclock-cost-budget-contract.md, Contract 1, AC7: the
+    # real, configured ceiling must reach Stage 1's deadline computation,
+    # not a hardcoded default.
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch,
+        capsys,
+        ["--topic-label", "T", "--query", "Q", "--max-wall-clock-seconds", "77.0"],
+        result=result,
+    )
+
+    council_fn = calls["run_pipeline_args"][2]
+    asyncio.run(council_fn("probe-query", []))
+    assert calls["council_fn_overall_wall_clock_seconds"] == 77.0
+
+
+def test_main_council_models_sourced_from_config_and_threaded_to_run_pipeline(
+    monkeypatch, capsys
+):
+    import llm_council.unified_config as _uc_module
+    from types import SimpleNamespace
+
+    fake_models = ["config-model-a", "config-model-b"]
+    monkeypatch.setattr(
+        _uc_module,
+        "get_config",
+        lambda: SimpleNamespace(council=SimpleNamespace(models=fake_models)),
+    )
+    result = _make_pipeline_result()
+
+    code, calls, out = _run_main(
+        monkeypatch, capsys, ["--topic-label", "T", "--query", "Q"], result=result
+    )
+
+    assert calls["council_models"] == fake_models
 
 
 def test_main_passes_the_real_fetch_evidence_and_query_model_adapters(monkeypatch, capsys):
@@ -1772,3 +2020,158 @@ def test_main_generic_exception_exits_1_with_exact_message(monkeypatch, capsys):
 
     assert code == 1
     assert "Pipeline run failed: boom" in out.err
+
+
+# ---------------------------------------------------------------------------
+# Durable persistence integration (docs/specs/durable-persistence-contract.md)
+# - transcript_writer.py's own rendering is covered directly by
+# tests/test_transcript_writer.py; these tests cover only the *wiring*:
+# each write_* call fires at the right point in _run_stages, real files
+# land in the real output_dir, and a write failure is non-fatal.
+# ---------------------------------------------------------------------------
+
+
+def test_durable_writes_land_in_the_real_output_dir_with_real_content(tmp_path):
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1))  # triggers revision
+    query_model = FakeQueryModel(
+        response_by_model={"model-x": "[[cite:1]] revised text", "model-y": "no citation"}
+    )
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    names = {p.name for p in result.output_dir.iterdir()}
+    assert {
+        "stage1_transcripts.md",
+        "stage2_summary.md",
+        "synthesis.md",
+        "revision_outcomes.md",
+    } <= names
+
+    stage1_text = (result.output_dir / "stage1_transcripts.md").read_text()
+    assert "Answer from X" in stage1_text and "Answer from Y" in stage1_text
+
+    # css=0.1 (the real value threaded through, not a placeholder/None) and
+    # the real chairman model name from stage3_result - not omitted/default.
+    stage2_text = (result.output_dir / "stage2_summary.md").read_text()
+    assert "0.100" in stage2_text
+
+    synthesis_text = (result.output_dir / "synthesis.md").read_text()
+    assert "Final synthesis text" in synthesis_text
+    assert "model-x" in synthesis_text  # _council_result_fixture's chairman
+
+    revision_text = (result.output_dir / "revision_outcomes.md").read_text()
+    assert "not revising" in revision_text  # model-y didn't cite
+
+
+def test_write_synthesis_uses_exactly_unknown_when_stage3_result_lacks_model_key(tmp_path):
+    # stage3_result.get("model", "unknown") - the "model" key genuinely
+    # absent (not just falsy) is the only scenario where this default
+    # fallback is ever exercised; every other fixture always sets "model".
+    fetch_evidence = _make_fetch_evidence()
+
+    async def council_fn_no_model_key(query, verified_facts=None):
+        stage1_results, stage2_results, _stage3_result, metadata = _council_result_fixture(
+            css=0.9
+        )
+        stage3_result = {"response": "Final synthesis text"}  # no "model" key
+        return stage1_results, stage2_results, stage3_result, metadata
+
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn_no_model_key, query_model)
+
+    synthesis_text = (result.output_dir / "synthesis.md").read_text()
+    assert synthesis_text == "# Synthesis (chairman: unknown)\n\nFinal synthesis text\n"
+
+
+def test_write_synthesis_runs_even_when_revision_is_not_triggered(tmp_path):
+    # write_synthesis fires unconditionally right after Stage 3, not gated
+    # on Stage 2.75 having run at all.
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))  # no revision
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.revision_triggered is False
+    assert (result.output_dir / "synthesis.md").exists()
+    # revision never ran, so there is nothing to write - no stray file.
+    assert not (result.output_dir / "revision_outcomes.md").exists()
+
+
+def test_revision_outcomes_file_absent_when_revision_skipped_for_cost(tmp_path):
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1, cost_x=0.05, cost_y=0.05))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=0.05)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert result.revision_skipped_for_cost is True
+    assert not (result.output_dir / "revision_outcomes.md").exists()
+
+
+@pytest.mark.parametrize(
+    "target_name,filename",
+    [
+        ("write_stage1_transcripts", "stage1_transcripts.md"),
+        ("write_stage2_summary", "stage2_summary.md"),
+        ("write_synthesis", "synthesis.md"),
+    ],
+)
+def test_transcript_write_failure_is_non_fatal_and_logged(monkeypatch, tmp_path, target_name, filename):
+    def _raise(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_pr_module, target_name, _raise)
+
+    fetch_evidence = _make_fetch_evidence()
+    council_fn = _make_council_fn(_council_result_fixture(css=0.9))
+    query_model = FakeQueryModel()
+
+    config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    # The run as a whole must still succeed - a transcript-write failure
+    # must never crash an otherwise-successful pipeline run.
+    assert _read_run_status(result.output_dir)["status"] == "complete"
+    assert any(
+        f"Transcript write ({filename}): failed non-fatally" in line and "disk full" in line
+        for line in result.debug_log
+    )
+    assert not (result.output_dir / filename).exists()
+
+
+def test_revision_outcomes_write_failure_is_non_fatal_and_logged(monkeypatch, tmp_path):
+    def _raise(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_pr_module, "write_revision_outcomes", _raise)
+
+    evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
+    fetch_evidence = _make_fetch_evidence(evidence)
+    council_fn = _make_council_fn(_council_result_fixture(css=0.1))  # triggers revision
+    query_model = FakeQueryModel(
+        response_by_model={"model-x": "[[cite:1]] revised text", "model-y": "no citation"}
+    )
+
+    config = PipelineConfig(
+        topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
+    )
+    result = _run(config, fetch_evidence, council_fn, query_model)
+
+    assert _read_run_status(result.output_dir)["status"] == "complete"
+    assert result.revision_triggered is True
+    assert any(
+        "Transcript write (revision_outcomes.md): failed non-fatally" in line
+        and "disk full" in line
+        for line in result.debug_log
+    )
+    assert not (result.output_dir / "revision_outcomes.md").exists()

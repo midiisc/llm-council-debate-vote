@@ -117,7 +117,17 @@ def _as_resilient(query_models_parallel_like):
         query_fn,
         retry_policy=None,
         minimum_council_size=4,
+        sleep_fn=None,
+        deadline=None,
+        time_fn=None,
     ):
+        # deadline/time_fn (docs/specs/wallclock-cost-budget-contract.md,
+        # Contract 1) are accepted-and-ignored here - every test funneling
+        # through this adapter predates the deadline mechanism and asserts
+        # on stage1 response resolution, not on deadline plumbing (that's
+        # covered directly in test_council_adapter_deadline.py); this
+        # signature just needs to not reject the new kwargs council_adapter
+        # now always passes.
         raw = await query_models_parallel_like(primary_models, messages, timeout=timeout)
         return ResilientQueryResult(
             responses={m: r for m, r in raw.items() if r is not None},
@@ -538,7 +548,15 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     )
 
     # --- Stage 1 call: messages shape + timeout threaded correctly ---
-    assert calls["query_models_parallel_messages"] == [{"role": "user", "content": "the exact query"}]
+    # Proposal A Contract 1 (docs/specs/proposal-a-reference-grounding-contract.md):
+    # Stage 1's messages carry the original query verbatim plus a uniform,
+    # byte-identical reference-reporting instruction appended via
+    # build_stage1_prompt - never the raw query alone.
+    stage1_messages = calls["query_models_parallel_messages"]
+    assert len(stage1_messages) == 1
+    assert stage1_messages[0]["role"] == "user"
+    assert stage1_messages[0]["content"] == ca.build_stage1_prompt("the exact query")
+    assert stage1_messages[0]["content"].startswith("the exact query")
     assert calls["query_models_parallel_timeout"] == 11.0
 
     # --- stage1_results: exact "content" extraction + safety_check shape ---
@@ -918,3 +936,68 @@ def test_normal_branch_threads_real_stage2_results_into_calculate_aggregate_rank
 
     assert captured["stage2_results"] is not None
     assert captured["stage2_results"] == stage2_results
+
+
+def test_verified_facts_are_threaded_into_stage3_query_via_build_facts_section(monkeypatch):
+    # Proposal A Contract 3 (docs/specs/proposal-a-reference-grounding-
+    # contract.md): a non-empty verified_facts list must reach Stage 3's
+    # query as user_query + the REAL _build_facts_section(verified_facts)
+    # rendering - not a stub, not None, and not built from a different
+    # (e.g. empty) list. _build_facts_section is deliberately left
+    # UNPATCHED here (it's pure/hermetic) so the composed string is pinned
+    # exactly against production code, not a test double's guess.
+    from scripts.grounding_pass import Claim, TaggedClaim
+    from scripts.revision_round import _build_facts_section
+
+    models = ["model-a", "model-b"]
+    captured = {}
+
+    async def fake_stage3_synthesize_final(
+        user_query, stage1_results, stage2_results, aggregate_rankings=None,
+        verdict_type=None, timeout=120.0, dispositions_instruction=None,
+        on_synthesis_delta=None,
+    ):
+        captured["stage3_query"] = user_query
+        return {"model": stage1_results[0]["model"], "response": "final synthesis"}, {}, None
+
+    _install_happy_path_fakes(monkeypatch, models)
+    _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
+
+    facts = [
+        TaggedClaim(claim=Claim(id="1", text="the sky is blue"), tag="VERIFIED", evidence=[]),
+        TaggedClaim(claim=Claim(id="2", text="water is wet"), tag="UNVERIFIABLE", evidence=[]),
+    ]
+
+    asyncio.run(ca.run_council_with_timeouts("original query", verified_facts=facts))
+
+    expected = f"original query\n\n{_build_facts_section(facts)}"
+    assert captured["stage3_query"] == expected
+    # Guards specifically against a mutant that swaps the real facts list
+    # for an empty/None one when building the facts section: the rendered
+    # facts section must actually mention the claim text, not fall back to
+    # "(no verified facts available)".
+    assert "the sky is blue" in captured["stage3_query"]
+    assert "(no verified facts available)" not in captured["stage3_query"]
+
+
+def test_empty_verified_facts_list_leaves_stage3_query_as_plain_user_query(monkeypatch):
+    # The default-empty-list / falsy branch: no facts section at all, byte-
+    # identical to the plain user_query (never routed through
+    # _build_facts_section for the else branch).
+    models = ["model-a"]
+    captured = {}
+
+    async def fake_stage3_synthesize_final(
+        user_query, stage1_results, stage2_results, aggregate_rankings=None,
+        verdict_type=None, timeout=120.0, dispositions_instruction=None,
+        on_synthesis_delta=None,
+    ):
+        captured["stage3_query"] = user_query
+        return {"model": stage1_results[0]["model"], "response": "final synthesis"}, {}, None
+
+    _install_happy_path_fakes(monkeypatch, models)
+    _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
+
+    asyncio.run(ca.run_council_with_timeouts("original query", verified_facts=[]))
+
+    assert captured["stage3_query"] == "original query"

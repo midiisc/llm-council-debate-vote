@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 
 def _build_arg_parser():
@@ -39,6 +40,24 @@ def _build_arg_parser():
     parser.add_argument("--stage1-timeout", type=float, default=300.0)
     parser.add_argument("--stage2-timeout", type=float, default=300.0)
     parser.add_argument("--stage3-timeout", type=float, default=300.0)
+    # Parity with pipeline_runner.py's PipelineConfig.max_wall_clock_seconds
+    # (docs/architecture-stress-test-2026-08-13.md, High: debate.py had no
+    # overall ceiling at all) - same 1200.0 default, always-on backstop.
+    parser.add_argument("--max-wall-clock-seconds", type=float, default=1200.0)
+    # Parity with pipeline_runner.py's PipelineConfig.max_cost_usd (Medium
+    # finding: debate.py had zero cost-ceiling enforcement) - optional,
+    # None means no ceiling, matching PipelineConfig's own semantics.
+    # Mutation-testing note (2026-08-13): `default=None` is argparse's own
+    # implicit default for `add_argument`, so dropping it is a true
+    # equivalent mutant (mirrors pipeline_runner.py's `_build_arg_parser`,
+    # same reasoning). Verified by direct execution (mutmut run, 1 survivor,
+    # traced by hand).
+    parser.add_argument("--max-cost-usd", type=float, default=None)
+    # Durable persistence (docs/specs/durable-persistence-contract.md) - a
+    # one-shot debate previously wrote nothing anywhere, so the answer was
+    # only ever visible in a terminal that might get closed. Folder-scoped,
+    # timestamped, mirroring pipeline_runner.py's make_output_dir pattern.
+    parser.add_argument("--output-root", type=Path, default=Path("./council-runs"))
     return parser
 
 
@@ -49,18 +68,44 @@ def main() -> None:
 
     try:
         _, _, stage3_result, metadata = asyncio.run(
-            run_council_with_timeouts(
-                args.query,
-                stage1_timeout=args.stage1_timeout,
-                stage2_timeout=args.stage2_timeout,
-                stage3_timeout=args.stage3_timeout,
+            asyncio.wait_for(
+                run_council_with_timeouts(
+                    args.query,
+                    stage1_timeout=args.stage1_timeout,
+                    stage2_timeout=args.stage2_timeout,
+                    stage3_timeout=args.stage3_timeout,
+                    overall_wall_clock_seconds=args.max_wall_clock_seconds,
+                ),
+                timeout=args.max_wall_clock_seconds,
             )
         )
+    except asyncio.TimeoutError:
+        print(
+            f"Debate failed: exceeded max_wall_clock_seconds "
+            f"({args.max_wall_clock_seconds}s)",
+            file=sys.stderr,
+        )
+        sys.exit(4)
     except Exception as e:
         print(f"Debate failed: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(stage3_result.get("response", ""))
+
+    if stage3_result.get("model") != "error":
+        from datetime import datetime, timezone
+
+        from scripts.pipeline_runner import make_output_dir
+        from scripts.transcript_writer import write_synthesis
+
+        try:
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+            output_dir = make_output_dir(args.output_root, args.query[:60], timestamp)
+            write_synthesis(
+                output_dir, stage3_result.get("response", ""), stage3_result.get("model", "unknown")
+            )
+        except Exception as e:
+            print(f"WARNING: failed to persist synthesis.md ({e})", file=sys.stderr)
 
     for sub in metadata.get("substitutions") or []:
         print(
@@ -73,8 +118,20 @@ def main() -> None:
     if shortfall:
         print(f"WARNING: {shortfall}", file=sys.stderr)
 
+    total_cost_usd = metadata.get("usage", {}).get("total", {}).get("cost_usd", 0.0)
+    print(f"Total cost: ${total_cost_usd:.4f}", file=sys.stderr)
+
     if stage3_result.get("model") == "error":
         sys.exit(1)
+
+    if args.max_cost_usd is not None and total_cost_usd > args.max_cost_usd:
+        print(
+            f"WARNING: total cost ${total_cost_usd:.4f} exceeded "
+            f"max_cost_usd (${args.max_cost_usd:.4f})",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
     sys.exit(0)
 
 

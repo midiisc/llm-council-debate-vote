@@ -90,7 +90,7 @@ def test_pipelineconfig_max_wall_clock_seconds_is_overridable():
 
 
 def test_ac15_wall_clock_ceiling_exceeded_writes_failed_status_naming_the_ceiling(tmp_path):
-    async def slow_council_fn(query):
+    async def slow_council_fn(query, verified_facts=None):
         await asyncio.sleep(0.5)
         raise AssertionError("must never actually complete - the ceiling must fire first")
 
@@ -127,7 +127,7 @@ def test_ac15_wall_clock_ceiling_exceeded_writes_failed_status_naming_the_ceilin
 
 
 def test_ac15_wall_clock_ceiling_message_names_the_configured_value(tmp_path):
-    async def slow_council_fn(query):
+    async def slow_council_fn(query, verified_facts=None):
         await asyncio.sleep(0.5)
 
     config = PipelineConfig(
@@ -155,7 +155,7 @@ def test_ac15_raised_exception_itself_carries_the_ceiling_message_not_just_run_s
     # that only ever fakes run_pipeline when testing main() never connects
     # "run_pipeline constructs message X" to "main() prints message X" with
     # the REAL run_pipeline, so this checks that link explicitly.
-    async def slow_council_fn(query):
+    async def slow_council_fn(query, verified_facts=None):
         await asyncio.sleep(0.5)
 
     config = PipelineConfig(
@@ -206,7 +206,7 @@ def _council_result_fixture(css=0.9):
 
 
 def test_ac16_fast_run_within_ceiling_completes_normally_regardless_of_ceiling_value(tmp_path):
-    async def fast_council_fn(query):
+    async def fast_council_fn(query, verified_facts=None):
         return _council_result_fixture(css=0.9)
 
     config = PipelineConfig(
@@ -222,7 +222,7 @@ def test_ac16_fast_run_within_ceiling_completes_normally_regardless_of_ceiling_v
 
 
 def test_ac16_default_max_wall_clock_seconds_does_not_interfere_with_a_normal_fast_run(tmp_path):
-    async def fast_council_fn(query):
+    async def fast_council_fn(query, verified_facts=None):
         return _council_result_fixture(css=0.9)
 
     # Rely on the dataclass default (1200.0) entirely - not passed explicitly.
