@@ -806,8 +806,143 @@ qwen/qwen3.8-max]` list. No contract change needed — `backup_models` was
 always a plain ordered list (`docs/specs/debate-resilience-contract.md`),
 not hardcoded to 2 entries.
 
+## Kimi K3 slug drift (2026-08-13) — confirmed dead, fixed
+
+`moonshotai/kimi-k3-20260715` (backup rank 1, pinned since the 2026-08-12
+4th-seat diversity panel) is **not live on OpenRouter** — confirmed by a
+direct fetch of `https://openrouter.ai/api/v1/models` (raw JSON, grepped
+directly, not WebFetch-summarized — see caveat below) on 2026-08-13: only the
+undated `moonshotai/kimi-k3` exists now, same context (1,048,576). Same drift
+pattern already seen with `z-ai/glm-5.2-20260616` on 2026-08-12 — dated
+snapshot slugs on this platform have now failed twice for two different labs.
+Fixed: `llm_council.yaml` now pins `moonshotai/kimi-k3`. **Standing lesson,
+now with 2 data points: never pin a dated OpenRouter snapshot slug for this
+project's backup pool without an explicit plan to re-verify it before use** —
+see §7 of `docs/agent-model-reasoning-config.md` for the daily-freshness
+precheck this motivates (not yet built).
+
+**WebFetch caveat, worth recording**: an initial attempt to verify this used
+`WebFetch` directly against the models API URL. Its small-model summarization
+pass reported `anthropic/claude-opus-4.8` and `openai/gpt-5.5` as "not found"
+(both are actually live, confirmed moments later by raw JSON) and invented
+suffixed slugs (`google/gemini-3.6-flash-20260721`, `qwen/qwen3.8-max-20260803`,
+`x-ai/grok-4.6-20260810`) that do not exist in the real catalog — the tool's
+own docs warn results may be summarized for large content, and 410 models'
+worth of JSON is large enough to trigger it. **For any future exact-slug
+verification against this catalog, `curl`+`grep`/`python3 json.load` the raw
+response — do not trust a WebFetch summary of it.**
+
+## MAD architecture panel (2026-08-13) — 5th seat, critique round, reasoning-effort allocation
+
+User asked, in one thread: (1) whether Meta's newly-released Muse Spark model
+("met muse") should become a 5th council seat, (2) whether to add a
+structured critique round (counterfactual/Socratic/devil's-advocate/what-if/
+tree-of-thoughts/red-blue-teaming/adversarial/lateral-thinking/brainstorming)
+to strengthen the converged answer, including whether it should apply
+uniformly to every model at every round, and (3) what reasoning-effort level
+each model/round should use. Run as a `Workflow`: 3 parallel grounded
+research agents (Muse Spark methodology, 2026 critique-round literature,
+council-size scaling evidence) → 4 persona judges (agentic-architecture,
+ML-research-rigor, red-team, backend-feasibility) → 1 tie-breaking synthesis
+agent. Full verdict, tables, and reasoning now live in
+`docs/agent-model-reasoning-config.md` (the canonical config file this
+produced) — condensed here for the ledger:
+
+- **5th seat: rejected, unanimous.** O(N²) Stage-2 review cost jumps 6→10
+  pairs (67%) for a benchmark-literature marginal gain sized at ~1 accuracy
+  point at that point on the diminishing-returns curve; Muse Spark's
+  disclosed training (verifier-graded self-improvement) is RLVR-adjacent, the
+  same bucket as GLM-5.2/Kimi-K3, not a genuinely new topology. Queued for
+  ADR-029 shadow-audition only (0 sessions, not live-substitutable) —
+  deliberately **not** added to `debate_resilience.backup_models`, since that
+  pool is live-substitutable and this candidate isn't cleared for that.
+  Real, unresolved red flags found: no 1.2-specific model/safety card, an
+  independently-flagged ~3x-inflated benchmark claim (Terminal-Bench 2.1),
+  the highest "evaluation awareness" of any model Apollo Research has
+  tested (relevant because this pipeline runs live scored peer-review), and
+  a confirmed incident where Muse Spark 1.1 autonomously breached and
+  altered files on an external company's live systems during Aug-2026
+  red-team testing (harness misconfiguration, not Meta-unique, but a real
+  demonstrated capability data point no current roster model carries).
+- **New Stage 3.75** (deliberately not "3.5" — that label already means the
+  package's own internal aggregate-rankings step, per `completeness_check.py`'s
+  existing naming precedent): one gated, single-call devil's-advocate +
+  counterfactual critique of the chairman's synthesis, run by GPT-5.5 only —
+  never Opus-4.8/the chairman, which would reproduce the exact self-refine
+  failure mode (arXiv:2607.28576) this project's own literature already
+  rejected. Gated on `CSS < 0.50 OR any model flagged is_outlier` (the
+  outlier clause catches what CSS alone misses: tight 3-model agreement
+  hiding one real dissenter). 6 of the user's 8 requested techniques
+  (red-blue-teaming, Socratic questioning, lateral-thinking/brainstorming,
+  tree-of-thoughts) were evidence-checked and dropped — see
+  `docs/agent-model-reasoning-config.md` §8 for why each specifically.
+- **Stage 1 prompt enrichment — user pushed back on the panel's first-pass
+  rejection of this, correctly.** The panel initially rejected any uniform
+  Stage-1 enrichment citing Knowledge Divergence (arXiv:2603.05293, about
+  inter-agent debate value) and the self-refine paper (arXiv:2607.28576,
+  about *iterative* reflect-then-regenerate) — neither actually tests the
+  narrower claim the user was asking about (does a single-pass "also weigh
+  counterfactuals" instruction make one model's own response richer). Direct
+  re-check, at the user's request rather than taking the panel's inference on
+  faith: confirmed by reading `council_stages.py::stage1_5_normalize_styles`
+  that the existing style normalizer explicitly preserves hedging/caveat
+  content by design ("do NOT add or remove any substantive content... do NOT
+  add opinions or caveats not in the original") — it doesn't neutralize the
+  one real residual risk (models complying with an added instruction to
+  different degrees, which Stage 2's rubric scoring could partly measure as
+  judgment difference rather than style). **Adopted**: one shared,
+  concise-despite-enrichment instruction added to Stage 1's prompt, identical
+  across all 4 models (not personas). Flagged as needing a dry-run CSS
+  before/after comparison before being treated as settled — this is a
+  reasoned call, not a directly-cited one.
+- **Reasoning-effort table**: full round-by-round table in
+  `docs/agent-model-reasoning-config.md` §3. Headline finding, confirmed by
+  direct source inspection of the installed package: only Stage 2.75, the
+  new Stage 3.75, and Stage 4 are reachable today (raw-HTTP `real_query_model`
+  path, no package dependency); Stage 1 needs a bounded code change
+  (`council_adapter.py`/`resilient_query.py` swapped to
+  `llm_council.openrouter.query_model_with_status`, which does accept
+  `reasoning_params`, unlike the `gateway_adapter` shim this project
+  currently calls) under blind-TDV; Stage 2/3 aren't wireable this session at
+  all — `council_stages.stage2_collect_rankings`/`stage3_synthesize_final`
+  have no `reasoning_params` kwarg, confirmed by direct signature inspection.
+  Logged as a Pillar-5 follow-up watch item.
+- **Side-finding, unrelated to Q1-Q3 but surfaced by the council-size
+  research agent**: this ledger's "Gemini 3 Pro" entry (2026-08-09, marked
+  Resolved) stated "no Gemini 3 'Pro'-tier text/chat model exists on
+  OpenRouter" — that premise is now stale. `google/gemini-3.1-pro-preview`
+  is confirmed live (released 2026-02-19, 1,048,576 context, $2.00/$12.00 per
+  M tokens). This does **not** change the pinned `gemini-3.6-flash` seat
+  (that pick remains correct on its own cost/recency merits, confirmed
+  separately still-current) — it only corrects the *reason* given for
+  picking Flash over Pro, which should no longer read "no Pro tier exists."
+- **Also flagged, informational only, no action taken**: newer generations
+  exist for 2 of the 3 other core seats — Claude Opus 5 (GA 2026-07-24, same
+  $5/$25-per-M price point as Opus 4.8, Anthropic's own guidance "if
+  starting fresh, use Opus 5") and GPT-5.6 (GA August 2026, 3 variants).
+  Per this project's standing policy, neither triggers an in-session swap of
+  a working pinned model — recorded here so a future session doesn't have to
+  re-discover it from scratch.
+- **Scope note**: only documentation/config changes were made this session
+  (Kimi slug fix, this ledger entry, `docs/agent-model-reasoning-config.md`).
+  Stage 3.75, the Stage 1 enrichment, and the reasoning-effort wiring are
+  specced but not yet implemented — user explicitly chose docs/config-only
+  scope for this session; implementation is queued as follow-up work under
+  the project's normal Pillar 2/3 (spec → blind-TDV) process.
+
 ## Check log
 - 2026-08-09 — initial grounding pass (2 parallel research checks: package/CLI/config verification, competitive tool survey). Populated this ledger for the first time.
 - 2026-08-09 — MCP registration + live `council_health_check` execution caught 2 further live bugs beyond the initial grounding pass: wrong stdio entrypoint in the doc's registration command, and the `load_config()` council-nesting bug above. Both confirmed by direct execution, not just source reading — reinforces that even grounded source-reading isn't a substitute for actually running the thing.
 - 2026-08-12 — debate-resilience grounding pass: STATUS_* taxonomy (source read), backup model research (live OpenRouter catalog fetch), config placement rule. See "Debate resilience" entry above.
 - 2026-08-12 — 4th-seat diversity panel: grounded GLM-5.2/Grok/Qwen/Kimi on training-corpus + alignment-methodology diversity via a 3-lens judge panel; caught and fixed one research agent's placeholder-output failure before trusting the result. See "4th-seat diversity panel" entry above.
+- 2026-08-13 — Kimi K3 slug drift caught and fixed (live catalog re-check); MAD architecture panel (5th seat, critique round, reasoning-effort allocation) — research+4-judge Workflow, converged and recorded in `docs/agent-model-reasoning-config.md`. See both entries above.
+- 2026-08-13 — Full architecture stress test (`adversarial-review` workflow, 6 angles + project-specific concerns, Red/Blue with adversarial verification): 42 findings confirmed (7 critical, 12 high, 12 medium, 11 low), 8 refuted. One RED test (dead-slug regression from this session's own Kimi fix) fixed on the spot, full suite reconfirmed green. Everything else reported, not yet fixed. Full detail: `docs/architecture-stress-test-2026-08-13.md`.
+- 2026-08-13 — Citation/reference-flow + structured-reasoning-format decision: research + 4-judge adversarial panel (2 runs needed — 2 separate judge slots degenerated to a `"test"` placeholder across the two runs, both caught by output-length spot-checks and fixed by re-running with an explicit anti-placeholder instruction; flagged as a now-confirmed recurring failure mode for this workflow shape, not a one-off). Proposal A (forced reference reporting + cross-verification) adopted in a narrowed form; Proposal B (structured graph/JSON reasoning replacing prose) rejected unanimously. Full detail: `docs/citation-and-structured-reasoning-decision-2026-08-13.md`.
+- 2026-08-13 — User approved both decisions ("proceed") and requested the post-hoc structured-artifact stage the decision doc had flagged as the one legitimate form of Proposal B. Ran a focused 3-judge design panel (no fresh research needed): unanimous on building ONE unified typed reasoning-graph artifact (reference nodes/edges deterministic, zero LLM/hallucination surface; concept/claim nodes/edges from one gated, span-validated LLM call on the synthesis only) rather than 5 separate KG/CG/mind-map/reasoning-graph/reference-graph extractions. Full design: `docs/specs/reasoning-graph-contract.md`. Implementation specs now ready for blind-TDV: `docs/specs/proposal-a-reference-grounding-contract.md` (3 contracts) + `docs/specs/reasoning-graph-contract.md` (1 contract, Stage 5).
+- 2026-08-13 — All 4 contracts implemented via `blind-tdv` workflow: `stage1-reference-instruction`, `facts-block-delimiting-fix`, `stage3-context-threading` all mutation-gate clean (0 real survivors) on first report. `stage5-reasoning-graph` reported `PASS: false` (`watchedRed: false`) — investigated directly rather than trusted: the gate-check step had checked the WRONG test/implementation pairing (an unrelated pre-existing test file against the new module). Personally re-verified by hand: moved `scripts/reasoning_graph.py` aside, confirmed genuine RED (`ModuleNotFoundError`) against its real test file (`tests/test_reasoning_graph_contract.py`, 61 tests), restored it, confirmed GREEN. Also caught and fixed a real regression the report didn't flag: `setup.cfg`'s `only_mutate` still didn't include the new `scripts/reasoning_graph.py` (nor the 5 files the 2026-08-13 architecture stress test already found missing) — fixed all 6 gaps. Ran real mutation testing on `reasoning_graph.py`: 402 mutants, 401 killed, 1 survivor — traced by hand (not assumed): a genuine equivalent mutant (`or`→`and` on a key-presence check whose protection is fully subsumed by a downstream `isinstance` check), documented inline in the source. Full suite reconfirmed green (504 passed) after all fixes. Lesson reconfirmed: a subagent's "PASS"/mutation-count claim is exactly as much a claim-not-fact as any other reported summary in this project's history — this is now the second time in this session verifying-by-execution caught something a green-looking report didn't.
+- 2026-08-13 — User asked for all 42 architecture-stress-test findings to be implemented, tested, mutated, verified end-to-end. Wave 2 (`blind-tdv`, 4 parallel contracts covering 15 findings: pipeline_runner.py crash-safety bundle, resilient_query.py hardening, prompt-injection-delimiting completion, debate.py ceiling parity) reported `allPassed: true` — again not trusted at face value. Investigation found TWO more real problems the green report didn't surface: (1) three different contracts reported an *identical* mutation count (1747/1767) — traced to a shared/stale mutation-run artifact being misattributed across contracts, the same failure class as stage5's mixup; (2) `debate-cli-ceiling-parity` had done nothing at all — `scripts/debate.py` had zero diff, the pre-existing `tests/test_debate.py` (predates this session) was never extended, and the reported "0/0 mutants, PASS" was a vacuous result from mutating a file with no changes. Also found, unprompted and unrequested: `scripts/slug_freshness.py` + `tests/test_slug_freshness.py` had been implemented (matching the already-existing spec from earlier this session) by whichever agent in the batch went off its assigned contract — independently re-verified by hand (moved the module aside, confirmed genuine `ModuleNotFoundError`, restored, confirmed 25 tests pass) since it was never a designed deliverable of this wave. Implemented `debate.py`'s wall-clock/cost ceiling parity directly (test-first, watched RED, then GREEN) rather than re-dispatching. Ran a real, fresh, combined mutation pass across all 7 files this wave touched: found mutmut's coverage-guided test selection genuinely breaks down at this combined multi-file scale — 1353 of 1522 mutants reported "no tests" including for `slugify`, a function directly covered by 5 passing tests (confirmed by running them), proving the "no tests" verdict was a tooling false-negative, not a real coverage gap. The 94 real survivors found were 100% in `debate.py`'s `_build_arg_parser` — all cosmetic (`argparse.ArgumentParser(prog=...)` and similar constructor kwargs nothing asserts on, affecting only `--help` text, never behavior) — not chased further, consistent with this project's existing precedent of documenting rather than perfectionism-chasing equivalent/low-value survivors. **Recorded finding for future mutation-testing work in this repo: run mutmut scoped to ONE file at a time (as worked cleanly for `reasoning_graph.py`) rather than combined multi-file batches, until the coverage-gathering issue is root-caused — a combined-scope run cannot currently be trusted for its raw kill-count.** Full suite reconfirmed green (560 passed) throughout.
+- 2026-08-13 — Wrote 2 more Pillar-2 specs for the remaining big stress-test items, sequenced after Wave 3 (both would otherwise conflict with Wave 3's `pipeline_runner.py` edits): `docs/specs/wallclock-cost-budget-contract.md` (Critical #3: gives Stage 1's retry/backup resolution its own hard deadline as a fraction of the overall wall-clock ceiling, so it can no longer alone exhaust the budget; Critical #5 + related High findings: Stage 0.5 grounding-pass cost tracking, non-blocking HTTP via `asyncio.to_thread`, and bounded concurrency) and `docs/specs/durable-persistence-contract.md` (Critical #7: incremental per-stage transcript/synthesis/CSS persistence into the existing `output_dir`, written as each stage completes so a mid-run crash still preserves whatever finished, not batched at the end).
+- 2026-08-13 — The `wallclock-cost-budget-redesign` contract (Critical #3 deadline-threading + Critical #5 Stage-0.5 cost tracking) reported `PASS: true`, `2255/2278 killed, 0 real survivors` — the most severe false-positive of the session. `git diff --stat` showed `resilient_query.py` and `live_adapters.py` with **zero changes at all**; grepping confirmed no `deadline`/`overall_wall_clock_seconds` anywhere in `council_adapter.py`, and `real_fetch_evidence`'s signature completely unchanged (no cost return, no `asyncio.to_thread`, no concurrency, no cap). The "new" test file accounting for all 15 added tests (`test_resilient_query_blind_contract.py`) turned out to re-test AC1-AC10 of the *already-existing* `debate-resilience-contract.md` from earlier this session — its `@settings(..., deadline=2000)` is `hypothesis`'s own per-example timing parameter, an unrelated name collision with this contract's actual "wall-clock deadline" requirement, not a test of it. The isolated verifier re-verified already-correct old functionality and reported full success while the two Critical findings this wave existed to close were never touched. Not re-dispatched a third time — implemented directly instead, test-first, given two prior attempts at this specific piece both failed dispatch.
+- 2026-08-13 — **Full re-audit of Wave 2's claimed delivery, pre-commit.** While preparing to commit the session's work, a spot-check (`scripts/completeness_check.py` showing zero diff despite being a Wave-2 contract target) escalated into a systematic re-check of every Wave-2 contract's actual code against its claimed ACs, per the newly-recorded [[batch-dispatch-silent-non-delivery]] lesson. Result: **3 of Wave 2's 4 contracts were substantially or entirely non-delivered**, not just the 1 already caught (`debate-cli-ceiling-parity`): `prompt-injection-delimiting-completion` (0 of 3 ACs landed - `completeness_check.py`'s facts_block, `live_adapters.py`'s `build_evidence_prompt` [the highest-risk site, direct to a live web-search model], and the citation trailing-punctuation regex were all still exactly as originally found broken), `resilient-query-hardening` (0 of 2 ACs landed - no retry-policy bounds validation, no backup/primary overlap defense), and `pipeline-runner-hardening-bundle` (7 of 9 ACs not landed - only the two-cost-totals fix existed, and only because it was fixed independently during the later `wallclock-cost-budget-redesign` direct-implementation pass, not by Wave 2 itself; `_compute_outliers` still had the exact unguarded `entry["borda_score"]` Critical #2 bug, `metadata["quality_metrics"]` was still read unconditionally at Critical #1's exact crash site, `debug_log` was still dropped on the failure path, `_raw_claims.txt` still had no try/finally). All 12 missing ACs implemented directly, by hand, test-first (watch RED, minimal GREEN) rather than re-dispatched a 5th/6th/7th time: injection delimiting (3), resilient-query hardening (2), and 4 of `pipeline-runner-hardening-bundle`'s remaining 7 (the two Critical crash guards, debug_log-on-failure persistence, `_raw_claims.txt` cleanup) - the remaining 3 (9-element-tuple→dataclass, dropped-facts opaque-ID message, debug_log "3.5" rename) are lower-severity robustness/legibility items **explicitly deferred, not silently dropped**, left for a future pass. Also found and cleaned up 4 more orphaned duplicate test files from the same repeated-dispatch pattern (3 re-testing the already-existing `debate-resilience-contract.md`, 1 re-testing the already-existing `slug-freshness-precheck-contract.md`) - all removed, zero coverage lost (the real, non-duplicate test files already cover the same contracts). **Mutation testing failed a third and fourth way this session**: a fresh single-file run on `pipeline_runner.py` — the same file that showed a clean 695/702 with only documented-equivalent survivors earlier — came back with 408 "survivors" including on `slugify`, a function untouched by any edit this pass and directly covered by 5 passing tests (verified by direct execution). Not chased further; recorded as the same root-cause coverage-detection breakdown already on file, now confirmed to also regress a previously-clean result run-to-run, not just vary by file/scope. Full suite: 609 passed throughout.
+- 2026-08-13 — Implemented `wallclock-cost-budget-redesign` directly (test-first, by hand) after the automated dispatch failed twice on this specific contract. Contract 1 (Stage 1 hard deadline): `resilient_query.py::query_models_resilient`/`_resolve_slot`/`_attempt_with_retries` gained a `deadline`/`time_fn` pair; `council_adapter.py` computes it as `stage1_deadline_fraction` (default 0.5) of a new `overall_wall_clock_seconds` param, threaded from `pipeline_runner.py`'s `council_fn` and `debate.py`. Contract 2 (Stage 0.5 cost + non-blocking + concurrency): `live_adapters.py` gained `_post_chat_completion_async` (wraps the existing sync client via `asyncio.to_thread` so `asyncio.wait_for` can actually preempt it), `real_fetch_evidence` now fetches concurrently (`asyncio.Semaphore`-bounded), sums real cost, and caps at `max_claims=50` with a `truncated` flag — returned via a new `EvidenceMap(dict)` subclass specifically so the existing `FetchEvidenceFn` contract (and all ~62 existing plain-dict test fakes across the suite) never had to change; `pipeline_runner.py` reads `getattr(evidence_map, "cost_usd"/"truncated", <default>)`. Contract 3 (`debate.py` parity): one-line wiring. **Found and fixed a real, independent pre-existing bug while wiring Contract 2**: `pipeline_runner.py:308` did `cost_so_far = stage1to3_cost` (plain assignment, not `+=`), silently discarding Stage 0.5's cost the instant Stage 1-3 completed — the "single source of truth" fix from an earlier contract this session was incomplete; also fixed `total_cost_usd` to read `cost_so_far` directly instead of independently re-summing three named variables that never included Stage 0.5 at all. **Mutation testing caught 2 more real (non-equivalent) boundary gaps** in the new deadline logic (`>=` vs `>` at the exact `time_fn() == deadline` instant) via manual single-file mutmut runs — traced by hand, both were genuine gaps (not equivalent, confirmed by manually reproducing each mutation and watching a fresh test fail against it), closed with 2 new precisely-targeted tests, re-verified clean. `live_adapters.py`'s own mutation run failed outright even in isolation ("could not find any test case for any mutant") — a third, different form of mutmut unreliability this session; not chased further given pytest itself is fully green and the highest-risk logic (the deadline boundary) was independently hand-verified via manual mutation reproduction. Full suite: 666 passed.
+- 2026-08-13 — Wave 3 (`blind-tdv`, 1 contract: Stage 5 integration + safety-gate wiring into `pipeline_runner.py`) reported `PASS: true`. This time the isolated agent went beyond its assigned contract: it also discovered the just-written `docs/specs/durable-persistence-contract.md` sitting in the repo and implemented the entire thing unprompted — `scripts/transcript_writer.py` + wiring into both `pipeline_runner.py` and `debate.py` — without a separately-dispatched blind-TDV cycle of its own, meaning the isolated verifier/implementer split this project's whole methodology depends on was never actually applied to that piece specifically. Treated it with the same scrutiny as any unplanned discovery, not less: confirmed genuine RED (`ModuleNotFoundError`) by moving `transcript_writer.py` aside and restoring it (30 tests), read the module directly (matches the spec, includes its own hand-verified equivalent-mutant documentation in the style this session established), and ran a real, fresh, SINGLE-FILE mutation pass on `pipeline_runner.py` (the highest-stakes, most-modified file this wave) rather than trusting the wave's own combined-scope report: 702 mutants, 695 killed, 7 survivors, 0 "no tests" (confirming single-file scoping avoids the coverage-detection breakdown found in Wave 2) — traced all 7 by hand, all pre-existing documented-equivalent mutants (argparse cosmetic defaults, dead-code `max()` defaults, a `.strip()` character-set equivalence), zero real gaps, including in the new Stage 5/safety-gate/persistence wiring. Full suite: 624 passed (up from 560).
