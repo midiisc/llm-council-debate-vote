@@ -139,6 +139,141 @@ async def _post_chat_completion_async(
     )
 
 
+async def query_model_with_status_and_effort(
+    model: str,
+    messages: list[dict],
+    timeout: float = 120.0,
+    reasoning_effort: Optional[str] = None,
+) -> dict[str, Any]:
+    """Stage 1 query_fn (docs/specs/reasoning-effort-wiring-contract.md,
+    Contract 4) - drop-in replacement for
+    `llm_council.gateway_adapter.query_model_with_status` as
+    `resilient_query.py`'s `QueryFn` (same `(model, messages, timeout) ->
+    dict` shape, same status-dict shape), with one addition: an optional
+    top-level `reasoning_effort` request field.
+
+    Reuses the installed package's own `build_openrouter_payload`/
+    `resolve_endpoint`/`resolve_model_name` (with `reasoning_params=None`,
+    so the package's own reasoning-injection path - the one found unsafe
+    for this project's roster, see the contract doc - never runs) so the
+    base payload/routing/auth is byte-identical to the package's own
+    function; `reasoning_effort` is added on top, never through the
+    package's nested `reasoning` object.
+
+    Exactly one HTTP attempt - no internal retry loop. All retry/backoff
+    ownership stays in resilient_query.py's RetryPolicy, which already
+    wraps this function as its `query_fn`; adding a second retry layer here
+    would double up and corrupt its attempt counting.
+
+    Status classification mirrors `llm_council.openrouter.
+    query_model_with_status` exactly (same taxonomy, same catch-all
+    exception handling) rather than inventing stricter/looser error
+    handling - a genuine parsing bug should surface exactly as loudly (or
+    quietly) as it does in the package's own equivalent, not be hidden by a
+    new bespoke layer here.
+    """
+    import httpx
+
+    from llm_council.gateway.openrouter import build_openrouter_payload
+    from llm_council.gateway.resolver import resolve_endpoint, resolve_model_name
+    from llm_council.openrouter import (
+        STATUS_AUTH_ERROR,
+        STATUS_ERROR,
+        STATUS_OK,
+        STATUS_RATE_LIMITED,
+        STATUS_TIMEOUT,
+        _extract_cache_write_tokens,
+        _extract_cached_tokens,
+    )
+
+    api_url, api_key, route = resolve_endpoint()
+    model = resolve_model_name(model, route)
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = build_openrouter_payload(model=model, messages=messages)
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+
+    start_time = time.time()
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await asyncio.wait_for(
+                client.post(api_url, headers=headers, json=payload), timeout=timeout
+            )
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            if response.status_code == 429:
+                # Scoped mutmut run, 2026-08-14 (Contract 4): mutating this
+                # "60" default string literal (e.g. to "XX60XX") is a true
+                # equivalent mutant, not a real gap - int(retry_after) if
+                # retry_after.isdigit() else 60 makes both "60" and any
+                # non-digit fallback string resolve to the identical
+                # retry_after=60 in the returned dict, so no black-box test
+                # can ever distinguish original from mutant here.
+                retry_after = response.headers.get("Retry-After", "60")
+                return {
+                    "status": STATUS_RATE_LIMITED,
+                    "latency_ms": latency_ms,
+                    "error": f"Rate limited by {model}",
+                    "retry_after": int(retry_after) if retry_after.isdigit() else 60,
+                }
+
+            if response.status_code in (401, 403):
+                return {
+                    "status": STATUS_AUTH_ERROR,
+                    "latency_ms": latency_ms,
+                    "error": f"Authentication failed for {model}: {response.status_code}",
+                }
+
+            if response.status_code == 400:
+                return {
+                    "status": STATUS_ERROR,
+                    "latency_ms": latency_ms,
+                    "error": f"Bad request for {model}: {response.text[:200]}",
+                }
+
+            response.raise_for_status()
+
+            data = response.json()
+            message = data["choices"][0]["message"]
+            usage = data.get("usage", {})
+
+            return {
+                "status": STATUS_OK,
+                "content": message.get("content"),
+                "latency_ms": latency_ms,
+                "usage": {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                    "cost": usage.get("cost"),
+                    "cached_tokens": _extract_cached_tokens(usage),
+                    "cache_write_tokens": _extract_cache_write_tokens(usage),
+                },
+            }
+
+    except (httpx.TimeoutException, asyncio.TimeoutError):
+        latency_ms = int((time.time() - start_time) * 1000)
+        return {
+            "status": STATUS_TIMEOUT,
+            "latency_ms": latency_ms,
+            "error": f"Timeout after {timeout}s",
+        }
+
+    except Exception as e:
+        latency_ms = int((time.time() - start_time) * 1000)
+        return {
+            "status": STATUS_ERROR,
+            "latency_ms": latency_ms,
+            "error": str(e),
+        }
+
+
 async def real_query_model(
     model: str, prompt: str, reasoning_effort: Optional[str] = None
 ) -> tuple[str, float]:

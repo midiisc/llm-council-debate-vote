@@ -94,6 +94,7 @@ ca = _import("council_adapter")
 import llm_council.council as _council_module
 import llm_council.gateway_adapter as _gateway_adapter_module
 import llm_council.openrouter as _openrouter_module
+import scripts.live_adapters as _live_adapters_module
 from scripts.resilient_query import (
     ModelAttempt,
     ResilientQueryResult,
@@ -552,12 +553,32 @@ def test_ac23_happy_path_calls_query_fn_exactly_once_per_primary_no_backups(monk
 
     stage1_calls = []
     stage2_calls = []
+    stage1_reasoning_effort_kwargs = {}
 
     async def fake_query_model_with_status(model, messages, timeout, *a, **kw):
         if _is_stage2_call(messages):
             stage2_calls.append(model)
+            # Stage 2 still goes through the old query_model_with_status
+            # signature - it must NOT receive reasoning_effort (Contract 4
+            # is Stage-1-only, AC19's "every other argument unchanged").
+            assert "reasoning_effort" not in kw
         else:
             stage1_calls.append(model)
+            # Contract 4, AC19: Stage 1's query_fn is now
+            # query_model_with_status_and_effort, which _stage1_query_fn
+            # ALWAYS calls with an explicit reasoning_effort= kwarg (None
+            # for an unmapped model, per its fallback) - a plain
+            # query_model_with_status(model, messages, timeout) call from
+            # the OLD wiring can never produce this kwarg at all, so its
+            # presence is a real discriminator between old and new wiring,
+            # not just a shape check. Regression-caught 2026-08-14: the
+            # original **kw-tolerant fake here silently passed even with
+            # the Contract 4 implementation files reverted to pre-feature
+            # HEAD, because it never inspected kw - watch-RED could not be
+            # established. This assertion is what makes that revert fail.
+            assert "reasoning_effort" in kw
+            stage1_reasoning_effort_kwargs[model] = kw["reasoning_effort"]
+            assert kw["reasoning_effort"] == ca._STAGE1_REASONING_EFFORT.get(model)
         return {"status": "ok", "content": f"answer-from-{model}", "usage": {}}
 
     _patch(
@@ -566,6 +587,14 @@ def test_ac23_happy_path_calls_query_fn_exactly_once_per_primary_no_backups(monk
         "query_model_with_status",
         fake_query_model_with_status,
     )
+    # Stage 1's query_fn is now query_model_with_status_and_effort
+    # (docs/specs/reasoning-effort-wiring-contract.md, Contract 4) - same
+    # (model, messages, timeout, **kw) shape, so the existing fake above
+    # (already **kw-tolerant) doubles as its fake too.
+    monkeypatch.setattr(
+        _live_adapters_module, "query_model_with_status_and_effort", fake_query_model_with_status, raising=False
+    )
+    monkeypatch.setattr(ca, "query_model_with_status_and_effort", fake_query_model_with_status, raising=False)
 
     stage1_results, _, _, metadata = _run(ca.run_council_with_timeouts("some query"))
 
@@ -582,6 +611,13 @@ def test_ac23_happy_path_calls_query_fn_exactly_once_per_primary_no_backups(monk
     assert "substitutions" not in metadata
     assert "shortfall_warning" not in metadata
     assert {r["model"] for r in stage1_results} == set(models)
+    # Every Stage 1 call went through the new effort-aware path with the
+    # correct per-model lookup (all 4 test models are unmapped in
+    # _STAGE1_REASONING_EFFORT, so None is the contractually-correct value
+    # here - the map's real-slug values are covered directly in
+    # tests/test_reasoning_effort_stage1_contract.py).
+    assert set(stage1_reasoning_effort_kwargs) == set(models)
+    assert all(v is None for v in stage1_reasoning_effort_kwargs.values())
 
 
 # ---------------------------------------------------------------------------

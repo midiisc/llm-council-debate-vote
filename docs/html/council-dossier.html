@@ -1260,7 +1260,12 @@ footer.provenance code { color: var(--text-dim); }
 
       <div class="callout callout--note">
         <span class="callout-label">Live, for the stages this repo controls directly</span>
-        Stage&nbsp;2.75, Stage&nbsp;3.75, and Stage&nbsp;4 now send a real top-level <code class="mono">reasoning_effort</code> field on every call — confirmed working in a real dry run, not just unit-tested. Grounding found the nested <code class="mono">reasoning: {effort, max_tokens}</code> object has real per-provider mutual-exclusivity quirks (Anthropic accepts <code class="mono">max_tokens</code> only, not <code class="mono">effort</code>); this project sidesteps that entirely by using OpenRouter's simpler top-level field instead, confirmed supported by all 4 core models via a live catalog fetch. Stage&nbsp;1, Stage&nbsp;2, and Stage&nbsp;3 remain unsent — their call paths go through the installed package's own orchestration functions, which don't accept a reasoning parameter at all today. That's an upstream gap, not something this repo can wire around without a bigger, separately-scoped call-path swap.
+        Stage&nbsp;1, Stage&nbsp;2.75, Stage&nbsp;3.75, and Stage&nbsp;4 now send a real top-level <code class="mono">reasoning_effort</code> field on every call — confirmed working in a real dry run, not just unit-tested. Grounding found the nested <code class="mono">reasoning: {effort, max_tokens}</code> object has real per-provider mutual-exclusivity quirks (Anthropic accepts <code class="mono">max_tokens</code> only, not <code class="mono">effort</code>); this project sidesteps that entirely by using OpenRouter's simpler top-level field instead, confirmed supported by all 4 core models via a live catalog fetch. Stage&nbsp;1's wiring needed its own new function rather than reusing the installed package's <code class="mono">reasoning_params</code> mechanism — that mechanism turned out to always send the unsafe nested object, hitting the exact Anthropic mutual-exclusivity bug above, plus silently no-op for 2 of the 4 seats via a stale package capability check. Stage&nbsp;2 and Stage&nbsp;3 remain unsent — their call paths go through the installed package's own orchestration functions, which don't accept a reasoning parameter at all today. That's a genuine upstream gap.
+      </div>
+
+      <div class="callout callout--note">
+        <span class="callout-label">Rollout-gate finding, worth reading before trusting the "Design target" column</span>
+        Shipping Stage&nbsp;1's <code class="mono">high</code> effort for Opus&nbsp;4.8/GPT-5.5 was gated on a real dry run per this project's Real-money-gate discipline. That dry run found Consensus Strength Score dropped 0.721&nbsp;&rarr;&nbsp;0.572 under <code class="mono">high</code> effort — initially misread as a quality regression and briefly reverted to <code class="mono">medium</code>. On direct challenge, the reading was corrected: CSS measures cross-model <em>ranking agreement</em>, not correctness, and both values sit inside this pipeline's normal, already-handled operating bands (neither crossed the &lt;0.50 threshold that actually triggers extra deliberation). A follow-up blinded read of the actual Stage&nbsp;1 draft text — judged against the Stage&nbsp;2 rubric before the effort labels were revealed — came back split 1-1 between the two seats, no real signal either direction. <code class="mono">high</code> was kept as the final default by explicit decision, made with full knowledge the data doesn't clearly support it — not because either dry run proved it superior. Full arc: <code>docs/upstream-deltas.md</code>'s 2026-08-14 entries; the CSS-interpretation explainer lives in <code>docs/pipeline-architecture-spec.md</code>&nbsp;§9.
       </div>
 
       <div class="data-table-wrap">
@@ -1273,14 +1278,14 @@ footer.provenance code { color: var(--text-dim); }
               <td>1 — Draft</td>
               <td>Opus 4.8, GPT-5.5</td>
               <td>High</td>
-              <td>No</td>
-              <td>Substantive generation, the highest-stakes writing task in the pipeline</td>
+              <td><strong>Yes</strong> — see rollout-gate note above</td>
+              <td>Substantive generation, the highest-stakes writing task in the pipeline — kept by judgment call, not proven by either dry run</td>
             </tr>
             <tr>
               <td>1 — Draft</td>
               <td>Gemini Flash, GLM-5.2</td>
               <td>Medium</td>
-              <td>No</td>
+              <td><strong>Yes</strong></td>
               <td>Flash is a deliberate cost-tier pick and GLM hasn't graduated probation — neither should be silently run at frontier effort</td>
             </tr>
             <tr>
@@ -1356,7 +1361,7 @@ footer.provenance code { color: var(--text-dim); }
           <ul>
             <li><strong>The safety gate is surfaced, not enforced.</strong> A regex scan runs against Stage&nbsp;1 drafts and now produces a debug-log warning for any flagged model — but still no score cap and no abort. A human reading the run log will see it; the pipeline itself doesn't act on it.</li>
             <li>Stage&nbsp;2.75 revision still queries models sequentially, multiplying wall-clock cost by seat count on the path most likely to already be under pressure.</li>
-            <li>Reasoning-effort parameters are designed (see above) but not implemented for any stage.</li>
+            <li>Reasoning-effort parameters remain unimplementable for Stage&nbsp;2 (peer review) and Stage&nbsp;3 (synthesis) — both call paths run through installed-package functions with no reasoning parameter at all, an upstream gap. Stage&nbsp;1, 2.75, 3.75, and 4 are all live (see above).</li>
             <li>Three lower-severity items are explicitly deferred, not silently dropped: a nine-element result tuple that should be a named dataclass, opaque numeric IDs in the Stage&nbsp;4 dropped-facts warning instead of readable claim text, and one remaining debug-log line still using the pre-rename "Stage 1&ndash;3.5" label.</li>
             <li><strong>Stage&nbsp;0.5's evidence-weighting instruction has grown to eight epistemic clauses and has not yet been dry-run against a real model on a real decision.</strong> Every clause is unit-tested for exact wording and anti-fabrication guardrails, but whether a real retrieval model correctly applies eight distinct weighting principles in one pass — rather than a subset of them, or none — is untested behavior, not just untested code. This pipeline's own Real-money gate already requires a dry run before real use; that requirement now carries more weight than it did before this stage's instruction tripled in size.</li>
             <li>Whether Gemini&nbsp;3.6&nbsp;Flash's peer-review vote should be weighted below the three frontier seats it's nominally an equal peer to remains an open, undecided question — on file since before this session, not resolved by anything built here.</li>
@@ -1376,6 +1381,16 @@ footer.provenance code { color: var(--text-dim); }
           <li>Two roster/design questions resolved by explicit decision rather than left open: Gemini&nbsp;3.6&nbsp;Flash's peer-review vote stays equal (no evidence a cheaper-tier model judges worse); and after a live catalog check, no swap to a "Gemini Pro" tier — the only pro-tier model available anywhere, even on Google's own native API, is <code class="mono">gemini-3.1-pro-preview</code>, an older generation than what's already in the roster.</li>
         </ul>
       </div>
+
+      <div class="gap-col" style="margin-top: 1.5rem;">
+        <h3>Resolved in a later pass, same day (2026-08-14)</h3>
+        <ul>
+          <li><strong>Stage&nbsp;1 reasoning-effort wiring landed via blind-TDV</strong> (Contract&nbsp;4, isolated test author from the acceptance criteria alone, blind implementer, then watch-RED&nbsp;&rarr;&nbsp;GREEN&nbsp;&rarr;&nbsp;scoped mutation gate). 177/178 targeted mutants killed, the 1 survivor a documented true equivalent (an unreachable fallback-string difference); full 824-test suite green, independently re-run rather than taken on the workflow's own report. The blind-TDV process itself caught and fixed a real isolation gap mid-run — an integration test's tolerant fake couldn't originally distinguish the new call path from the old one, so watch-RED wasn't real until a discriminating assertion was added; documented in <code>tests/test_council_adapter_resilient_stage1.py</code> rather than papered over.</li>
+          <li><strong>The obvious implementation path was rejected before it shipped, not after.</strong> The installed package's own <code class="mono">reasoning_params</code> mechanism looked like a drop-in fix for Stage&nbsp;1 but direct source reading found it always sends the nested <code class="mono">reasoning</code> object with both <code class="mono">effort</code> and <code class="mono">max_tokens</code> together — violating Anthropic's own mutual-exclusivity rule on the exact seat (Opus&nbsp;4.8) that needed it most — and gates injection on a capability check already known stale for 2 of the 4 core models. A new project-owned function was built instead, reusing the same top-level-field pattern already proven for Stage&nbsp;2.75/3.75/4.</li>
+          <li><strong>A real rollout-gating dry run produced a genuine misread, caught and corrected in the open.</strong> Consensus Strength Score dropping under <code class="mono">high</code> effort was first reported as evidence the change was harmful. Direct challenge and a source read of the package's own CSS interpretation bands showed that reading didn't hold up — CSS measures cross-model ranking agreement, not correctness, and this pipeline already treats low CSS as an expected trigger for more deliberation (Stage&nbsp;2.75/3.75 exist precisely to act on it), not a failure state. A permanent reference section was added, <code>docs/pipeline-architecture-spec.md</code>&nbsp;§9, specifically so a future session doesn't repeat the same misread against any of this pipeline's quality metrics.</li>
+          <li><strong>A follow-up content-quality comparison — reading the actual Stage&nbsp;1 draft text blind, not inferring from CSS — came back genuinely split</strong> (1 of 2 seats favored <code class="mono">medium</code>, the other favored <code class="mono">high</code>, both differences modest and subjective). <code class="mono">high</code> was kept as the shipped default by explicit decision under acknowledged uncertainty, not because either check proved it superior — recorded as such rather than dressed up as a data-backed conclusion.</li>
+        </ul>
+      </div>
     </section>
 
   </main>
@@ -1393,6 +1408,8 @@ footer.provenance code { color: var(--text-dim); }
       <div><code>docs/specs/human-debate-characteristics-contract.md</code> — the dialectic-framing and Rapoport's-Rules additions at Stage&nbsp;1 and Stage&nbsp;2.75</div>
       <div><code>docs/specs/grounding-annotation-enforcement-contract.md</code> — the mandatory grounding-tag format and Stage&nbsp;3 compliance note</div>
       <div><code>docs/specs/stage-3-75-critique-contract.md</code> and <code>docs/specs/pending-stage-wiring-contract.md</code> — Stage&nbsp;3.75, Stage&nbsp;5, slug-freshness, and safety-gate wiring</div>
+      <div><code>docs/specs/reasoning-effort-wiring-contract.md</code> — Contract&nbsp;4, Stage&nbsp;1's reasoning-effort wiring and the rollout-gate dry-run result</div>
+      <div><code>docs/pipeline-architecture-spec.md</code>&nbsp;§9 — what Consensus Strength Score actually measures, and the 2026-08-14 misread this section exists to prevent from recurring</div>
       <div><code>docs/upstream-deltas.md</code> — the dated ledger everything above traces back to</div>
     </div>
     <div>llm-council-debate-vote<br>council-runs are folder-scoped, never written to a shared home directory</div>

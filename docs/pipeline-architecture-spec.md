@@ -417,3 +417,55 @@ runtime lockfile for reproducibility, trading off against §1's "don't pin
 possibly-stale slugs" reasoning. Worth revisiting once the pipeline_runner
 spec exists (it's a natural place to snapshot the resolved config per run
 anyway, folder-scoped per §7) — not a standalone action now.
+
+## 9. Quality-metric interpretation reference — read before citing CSS as evidence
+
+Added 2026-08-14 after a real mistake this session: a dry-run comparing
+Stage 1 `reasoning_effort` settings (docs/specs/reasoning-effort-wiring-
+contract.md, Contract 4) showed CSS drop from 0.721 to 0.572, and that was
+initially reported as "a real signal against shipping high effort" — a
+quality claim CSS cannot actually support. Corrected same session on user
+challenge. **Before treating any CSS number as a quality signal, re-read
+this section.**
+
+**What CSS actually measures** (`llm_council.quality.consensus.
+consensus_strength_score`'s own docstring, direct source read): how
+strongly Stage 2 reviewers AGREE on the ranking of Stage 1 answers — clear
+rank separation and a clear winner = high CSS; ties and scattered rankings
+= low CSS. **It is a ranking-agreement metric, not a correctness or
+quality metric.** A high-CSS run is not necessarily "the answers were
+better" — it's "the reviewers converged on an ordering." A low-CSS run is
+not necessarily "the answers were worse" — it could equally mean the
+models reasoned about the question in genuinely different, defensible
+ways and reviewers split on which was best.
+
+**The package's own interpretation bands** (`get_consensus_interpretation`):
+
+| CSS range | Label | What this pipeline does about it |
+|---|---|---|
+| 0.85–1.0 | strong_consensus | proceeds straight to Stage 3 synthesis |
+| 0.70–0.84 | moderate_consensus | proceeds; synthesis notes minority views |
+| 0.50–0.69 | weak_consensus | still proceeds; still a normal operating band |
+| <0.50 | significant_disagreement | **triggers** Stage 2.75 revision and (with an outlier flag) Stage 3.75 critique |
+
+**The point most likely to be misread**: low CSS is not this pipeline's
+failure state — it's the pipeline's own TRIGGER for more deliberation
+(Stage 2.75/3.75 exist specifically to act on low CSS productively). A
+debate/MAD architecture whose whole premise is independent reasoning
+should not be judged by how *little* the panelists disagree. Both 0.721
+and 0.572 from the Contract 4 dry-run landed in the two middle,
+fully-normal bands above — neither was "significant disagreement," and
+the drop between them was never valid standalone evidence about answer
+quality.
+
+**What a CSS comparison CAN legitimately support**: an operational/cost
+claim — a setting that pushes CSS lower more often will trigger Stage
+2.75/2.75-adjacent stages more often, which is a real latency/cost
+consequence worth knowing, separate from any quality claim. If a real
+quality comparison is needed (e.g. "does effort X actually produce better
+Stage 1 drafts"), it requires reading the actual draft content against
+this project's own Stage 2 rubric (accuracy/relevance/completeness/
+conciseness/clarity, `llm_council.yaml`'s `evaluation.rubric.weights`) —
+CSS alone cannot answer that question, no matter which direction it moves.
+See `docs/upstream-deltas.md`'s 2026-08-14 "CSS correction" entry for the
+full incident this section is grounded in.

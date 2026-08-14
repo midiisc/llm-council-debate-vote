@@ -68,6 +68,7 @@ from llm_council.unified_config import _find_config_file, get_config
 from llm_council.verdict import VerdictType
 
 from scripts.grounding_pass import TaggedClaim
+from scripts.live_adapters import query_model_with_status_and_effort
 from scripts.resilient_query import RetryPolicy, SubstitutionEvent, query_models_resilient
 from scripts.revision_round import _build_facts_section
 
@@ -600,6 +601,49 @@ async def _normalize_stage2_for_stage3(
 
 DEFAULT_STAGE1_DEADLINE_FRACTION = 0.5
 
+# docs/specs/reasoning-effort-wiring-contract.md, Contract 4: hardcoded
+# per-model effort map for Stage 1's independent-draft round, matching this
+# project's existing style of hardcoding exact model->role assignments
+# (e.g. Stage 3.75 = gpt-5.5-only) rather than a new config schema. A model
+# not in this map (a backup substitute outside the primary roster) gets
+# reasoning_effort=None - unchanged/no-override behavior, never a KeyError.
+#
+# 2026-08-14: Pillar 6 rollout-gating dry-run (same query, real OpenRouter,
+# opus-4.8/gpt-5.5 medium-baseline vs high) found "high" for those two seats
+# dropped Stage 2 CSS 0.721->0.572. CORRECTED same day, on user challenge:
+# CSS (`llm_council.quality.consensus.consensus_strength_score`) measures
+# cross-model RANKING AGREEMENT, not correctness - the package's own
+# interpretation bands both values as normal/handled (0.721="moderate
+# consensus", 0.572="weak consensus", neither hit the <0.50 "significant
+# disagreement" band). This pipeline already treats low CSS as an expected,
+# ACTED-ON signal (it's literally what triggers Stage 2.75 revision /
+# Stage 3.75 critique), not a failure state to avoid - lower agreement can
+# reflect the 2 seats reasoning more independently, which is not obviously
+# bad for a debate architecture. The CSS drop was never valid standalone
+# evidence that "high" made Stage 1 worse; reverting to medium on that
+# basis alone was a mistake, corrected same session. Restored to high for
+# opus-4.8/gpt-5.5 pending a direct content-quality comparison (not a CSS
+# proxy) - see docs/upstream-deltas.md's 2026-08-14 "Contract 4 dry-run"
+# and "CSS correction" entries for the full history and current status.
+_STAGE1_REASONING_EFFORT: Dict[str, str] = {
+    "anthropic/claude-opus-4.8": "high",
+    "openai/gpt-5.5": "high",
+    "google/gemini-3.6-flash": "medium",
+    "z-ai/glm-5.2": "medium",
+}
+
+
+async def _stage1_query_fn(model: str, messages: List[Dict[str, str]], timeout: float) -> Dict[str, Any]:
+    """`query_models_resilient`'s `QueryFn` for Stage 1 - a per-model-aware
+    closure over `query_model_with_status_and_effort` (Contract 4). Every
+    other `query_models_resilient` argument (primary_models, backup_models,
+    retry_policy, minimum_council_size, deadline) is unchanged by this
+    wiring."""
+    effort = _STAGE1_REASONING_EFFORT.get(model)
+    return await query_model_with_status_and_effort(
+        model, messages, timeout, reasoning_effort=effort
+    )
+
 
 async def run_council_with_timeouts(
     user_query: str,
@@ -651,7 +695,7 @@ async def run_council_with_timeouts(
         backup_models=resilience_config.backup_models,
         messages=messages,
         timeout=stage1_timeout,
-        query_fn=query_model_with_status,
+        query_fn=_stage1_query_fn,
         retry_policy=resilience_config.retry_policy,
         minimum_council_size=resilience_config.minimum_council_size,
         deadline=stage1_deadline,

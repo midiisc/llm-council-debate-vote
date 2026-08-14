@@ -1559,11 +1559,30 @@ def test_stage2_excludes_a_backup_already_consumed_by_stage1(monkeypatch):
 
     calls = []
     stage2_messages_seen = []
+    stage1_reasoning_effort_kwargs = {}
 
     async def fake_query_model_with_status(model, messages, timeout, *a, **kw):
         calls.append(model)
-        if messages and "<responses_to_evaluate>" in messages[0]["content"]:
+        is_stage2 = bool(messages and "<responses_to_evaluate>" in messages[0]["content"])
+        if is_stage2:
             stage2_messages_seen.append(messages)
+            # Stage 2 still goes through the old query_model_with_status
+            # signature - must NOT receive reasoning_effort (Contract 4 is
+            # Stage-1-only).
+            assert "reasoning_effort" not in kw
+        else:
+            # Contract 4, AC19: Stage 1's query_fn is now
+            # query_model_with_status_and_effort, which _stage1_query_fn
+            # ALWAYS calls with an explicit reasoning_effort= kwarg. A
+            # plain query_model_with_status(model, messages, timeout) call
+            # from the OLD wiring can never produce this kwarg, so its
+            # presence discriminates old vs new wiring - the original
+            # **kw-tolerant version of this fake passed identically with
+            # the Contract 4 implementation reverted, so watch-RED could
+            # not be established; this assertion fixes that.
+            assert "reasoning_effort" in kw
+            stage1_reasoning_effort_kwargs[model] = kw["reasoning_effort"]
+            assert kw["reasoning_effort"] == ca._STAGE1_REASONING_EFFORT.get(model)
         # model-a is permanently unreachable (terminal status) in BOTH
         # stages - Stage 1 must substitute backup-1 for it; Stage 2 must
         # NOT be able to reuse backup-1 for the same reason (AC3), leaving
@@ -1575,6 +1594,16 @@ def test_stage2_excludes_a_backup_already_consumed_by_stage1(monkeypatch):
     monkeypatch.setattr(_gateway_adapter_module, "query_model_with_status", fake_query_model_with_status, raising=False)
     monkeypatch.setattr(_openrouter_module, "query_model_with_status", fake_query_model_with_status, raising=False)
     monkeypatch.setattr(ca, "query_model_with_status", fake_query_model_with_status, raising=False)
+    # Stage 1's query_fn is now query_model_with_status_and_effort
+    # (docs/specs/reasoning-effort-wiring-contract.md, Contract 4) - same
+    # (model, messages, timeout, **kw) shape, so the existing fake above
+    # (already **kw-tolerant) doubles as its fake too.
+    import scripts.live_adapters as _live_adapters_module
+
+    monkeypatch.setattr(
+        _live_adapters_module, "query_model_with_status_and_effort", fake_query_model_with_status, raising=False
+    )
+    monkeypatch.setattr(ca, "query_model_with_status_and_effort", fake_query_model_with_status, raising=False)
 
     stage1_results, stage2_results, _, metadata = asyncio.run(ca.run_council_with_timeouts("some query"))
 
@@ -1610,6 +1639,14 @@ def test_stage2_excludes_a_backup_already_consumed_by_stage1(monkeypatch):
         assert messages == [{"role": "user", "content": messages[0]["content"]}]
         assert set(messages[0].keys()) == {"role", "content"}
         assert messages[0]["role"] == "user"
+
+    # Every Stage 1 call (model-a, model-b, model-c, backup-1) went through
+    # the new effort-aware path - none of these placeholder names are in
+    # _STAGE1_REASONING_EFFORT, so None is the contractually-correct
+    # per-model value here (real-slug values covered directly in
+    # tests/test_reasoning_effort_stage1_contract.py).
+    assert set(stage1_reasoning_effort_kwargs) == {"model-a", "model-b", "model-c", "backup-1"}
+    assert all(v is None for v in stage1_reasoning_effort_kwargs.values())
 
 
 
