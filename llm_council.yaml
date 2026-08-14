@@ -37,6 +37,47 @@ council:
     synthesis_mode: debate
     exclude_self_votes: true
     style_normalization: true
+    # Pinned 2026-08-14 (was left unset, inheriting the package's own
+    # hardcoded default). Two independent reasons, both grounded live this
+    # session:
+    # 1. REAL BREAKAGE, not just a quality question - the inherited default
+    #    (`google/gemini-3.1-flash-lite-preview`) is DEAD on live OpenRouter
+    #    (confirmed via direct /api/v1/models fetch, 2026-08-14) - leaving
+    #    this unset would fail Stage 1.5/the Stage 2 commentary-
+    #    normalization extension (docs/upstream-deltas.md, "Known residual
+    #    limitation" correction entry) the next time either actually runs.
+    # 2. Rewriter-model choice measurably affects anonymization quality:
+    #    "Voice Under Revision" (Tom van Nuenen, arXiv:2604.22142v1, April
+    #    2026) measured residual re-identification accuracy after a single
+    #    style-rewrite pass across 300 personal narratives, nearest-
+    #    neighbor stylometric matching - GPT-5.4: 14.3% matched (worst),
+    #    Claude Sonnet 4.6: 1.7%, Gemini 3.1 Pro: 1.0% (best, vs. a 0.3%
+    #    chance baseline). Neither the exact Gemini 3.1 Pro tier tested
+    #    (no Gemini Pro-tier text model exists on OpenRouter at all,
+    #    confirmed live 2026-08-14, matching the same gap already recorded
+    #    in pipeline-architecture-spec.md Gap 1) nor Claude Sonnet 4.6
+    #    (superseded; live catalog only has anthropic/claude-sonnet-5, a
+    #    different, untested generation) is available today - this is a
+    #    reasoned choice under real uncertainty, not a re-run of the paper.
+    #    google/gemini-3.6-flash chosen over google/gemini-3.7-flash
+    #    (newer, cheaper, but zero operational track record in this
+    #    project) and google/gemini-3.5-flash-lite (cheapest, but a lower
+    #    capability tier on a task where preserving content while
+    #    genuinely rewriting style matters) because it's the SAME model
+    #    already trusted as this pipeline's own 3rd core council seat -
+    #    same vendor/family as the paper's single best-evidenced
+    #    performer, plus an already-proven, live-verified integration
+    #    rather than a new untested dependency (Resource & Stability
+    #    Gate's stability-over-novelty preference). Not claimed to
+    #    replicate the paper's exact 1.0% figure - that number is Pro-tier
+    #    specific and this pipeline's task (analytical/technical debate
+    #    responses, not personal narratives) was never tested by that
+    #    paper. Real-money gate (Pillar 6): this changes Stage 1.5's/the
+    #    new Stage 2 normalization's actual runtime behavior for the first
+    #    time (previously silently broken) - a fresh dry run showing the
+    #    Cost & Tokens summary is required before the next real-decision
+    #    use, not yet performed this session. See docs/upstream-deltas.md.
+    normalizer_model: google/gemini-3.6-flash
   gateways:
     default: openrouter
     fallback:

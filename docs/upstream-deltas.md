@@ -124,6 +124,227 @@ never receive a real citable fact in any prior run — see Contract 4's
 response/rubric-order randomization — `amiable-dev/llm-council#592` (see
 the known-limitation entry above).
 
+**2026-08-14: Stage 3 chairman identity leak — found during a full-pipeline
+bias/isolation audit, locally fixable, fix in progress.** Direct source
+read of the installed `llm-council-core==0.40.1` package
+(`llm_council/council_stages.py::stage3_synthesize_final`, lines 904-922)
+shows the chairman-synthesis prompt is built with **full, real model
+identity** — `f"Model: {result['model']}\nResponse: ..."` for every Stage 1
+draft, `f"Model: {result['model']}\nRanking: ..."` for every Stage 2
+reviewer, and real model slugs in the aggregate-rankings block. This
+repo's own `scripts/council_adapter.py::_stage3_query_fn` calls that
+function directly (confirmed by grep, no wrapping/anonymization applied),
+inheriting the leak unmodified. Unlike the shuffle-order limitation above,
+this one is **not** a vendor-internals problem needing an upstream fix —
+Stage 2 already proves this repo can locally reproduce a package prompt-
+builder with anonymization applied (`_build_stage2_real_ranking_prompt`,
+same "reproduce, not vendor" pattern this module's own docstring
+documents), so the same technique applies to Stage 3. Real, not
+hypothetical: since **Claude Opus 4.8 is both a Stage 1 drafter and the
+chairman**, it can recognize and potentially favor its own earlier draft
+during synthesis — exactly the self-preference/brand-halo bias class
+Stage 2's anonymization exists to prevent, left open one stage later.
+Fix: `docs/specs/stage3-chairman-anonymization-contract.md` — anonymize
+Stage 1/Stage 2/aggregate-rankings identity in the copy passed to the
+chairman using the same `Response A/B/C` labels Stage 2 already assigns,
+then resolve labels back to real model names in the synthesis text before
+it becomes the human-facing answer (never expose a raw internal label to
+a human reader).
+
+**Fixed, 2026-08-14.** Three pure functions landed in
+`scripts/council_adapter.py` via this repo's standard blind-TDV process
+(isolated `ws-verifier` authored 23 ACs from the contract only, `ws-builder`
+implemented blind in a worktree, watch-RED → GREEN → mutation gate):
+`_build_stage3_identity_map` (inverts Stage 2's `label_to_model` and mints a
+fresh continuing label for any Stage-2-only reviewer with no Stage 1 draft
+of its own), `_anonymize_for_stage3` (returns anonymized copies of
+`stage1_results`/`stage2_results`/`aggregate_rankings` with only `"model"`
+swapped for its label, never mutating the real-named originals), and
+`_resolve_response_labels` (reverse substitution, longest-label-first, so
+the final synthesis text is never left with a raw internal label). Blind-TDV
+mutation gate: 760/781 mutants killed, 0 real survivors (21 pre-existing
+equivalents, documented inline). Wired into `_stage3_query_fn` immediately
+after landing: `stage3_synthesize_final` now receives the anonymized copies
+instead of the real-named lists, and the returned synthesis text is resolved
+back to real model names before becoming `stage3_result["response"]` — the
+value written to `synthesis.md` and returned to the caller. Chairman
+identity/cost/usage accounting is unaffected (`_get_chairman_model()` never
+reads these lists). A follow-up scoped mutmut pass on the wiring itself
+(811 mutants, `only_mutate` temporarily narrowed to `council_adapter.py`
+alone, then restored) found 2 new genuine equivalents beyond the blind-TDV
+gate's own — both documented inline with the same "verified by direct
+execution, traced by hand" convention as this file's other equivalents:
+`stage1_results` is an unused parameter in the `_build_stage3_identity_map`
+call site (every Stage 1 drafter's label is already fully recoverable from
+`label_to_model`, kept in the signature only for shape-symmetry with
+`_anonymize_for_stage3`), and `.get("response", "")`'s default at the
+label-resolution call site is unreachable dead code (the same
+always-present-key invariant already established for every other
+`.get("response", ...)` site in this function). Three existing tests that
+pinned the old leaky behavior as correct were updated to assert the new
+anonymized-copy behavior instead — not silenced —
+(`tests/test_council_adapter.py::test_ac_comprehensive_normal_path_exact_field_values`,
+`tests/test_council_adapter.py::test_single_model_branch_degraded_mode_and_untouched_stage1_5_stage2_usage`,
+`tests/test_council_adapter_resilient_stage1.py::test_stage3_synthesize_final_receives_correct_aggregate_rankings`).
+Full suite: 781 passed.
+
+**2026-08-14 follow-up: label anonymization alone left a stylistic-
+fingerprint side channel open, found and fixed same day.** User question
+("what about the response having a model's identity traces, and a model
+able to understand this — is this true?") prompted a re-check of exactly
+what text the chairman reads, not just how it's labeled. Direct read of
+the wiring found `_anonymize_for_stage3` was being called with the raw
+`stage1_results` (each draft's original, un-normalized text) rather than
+`responses_for_review` (the output of Stage 1.5's `stage1_5_normalize_styles`,
+which exists specifically "to reduce stylistic fingerprinting... making it
+harder for reviewers to identify which model produced each response" —
+`llm_council/council_stages.py::stage1_5_normalize_styles` docstring,
+`style_normalization: true` in `llm_council.yaml`). Stage 2 reviewers
+already read the normalized text; Stage 3's chairman did not — so even
+after the label fix above, the chairman could still infer authorship from
+each draft's un-scrubbed prose style (word choice, formatting habits,
+hedging patterns), the same identity-adjacent bias channel Stage 1.5
+exists to close for Stage 2. Confirmed real by writing a regression test
+with a style-transforming fake (an identity-passthrough fake, which is
+what every existing test used, can't distinguish "chairman sees raw text"
+from "chairman sees normalized text" since they're equal in those fixtures)
+and watching it fail (RED) against the pre-fix code.
+**Fixed** by introducing `stage1_for_stage3` in `run_council_with_timeouts`:
+`responses_for_review` when Stage 1.5 ran (num_responses >= 2), the raw
+`stage1_results` only in single-model degraded mode (Stage 1.5 never runs
+there — nothing to normalize against with no peer review). Regression test:
+`tests/test_council_adapter_resilient_stage1.py::test_stage3_receives_style_normalized_stage1_text_not_raw_draft`.
+Scoped mutmut re-run on `council_adapter.py` (813 mutants): 788 killed, 25
+survived, all 25 re-confirmed as the same already-documented equivalents
+(renumbered by the 2 added lines) — 0 new real gaps. Full suite: 782 passed.
+
+**Correction, 2026-08-14 (same day): the "not fixed" note above was wrong —
+fixed, on user follow-up ("check and correct").** Re-examined the cost/
+quality tradeoff originally cited for not fixing this and found it didn't
+actually hold: normalization only ever applies to the COPY built for
+Stage 3's chairman prompt (matching `stage1_for_stage3`'s own pattern
+above) — the real `stage2_results` used earlier for
+`parse_ranking_from_text`/`calculate_aggregate_rankings`, and returned to
+the caller for the human-facing transcript, is never touched. So "risks
+flattening the reasoning a human wants to audit" was a non-issue (the
+human-facing copy is unaffected); the only real cost is the extra model
+call itself. Fixed by adding `_normalize_stage2_for_stage3` (new function,
+`scripts/council_adapter.py`): reuses the exact same `stage1_5_normalize_
+styles` call Stage 1 drafts already go through (same config gate, same
+`normalizer_model`) by mapping Stage 2's `"ranking"` field to `"response"`
+and back — no second mechanism invented. Wired in alongside
+`stage1_for_stage3`, feeding `stage2_for_stage3` (not raw `stage2_results`)
+into `_anonymize_for_stage3`. Cost tracked in a new `total_usage["stage2_
+normalize"]` bucket, summed into `metadata["usage"]["total"]["cost_usd"]`
+like every other bucket — visible to the Real-Money-gate cost ceiling, not
+a hidden spend. Verified RED→GREEN with a genuinely style-transforming
+fake (an identity-passthrough fake — what most existing tests use — can't
+tell "normalized" from "raw" since they're equal either way): confirmed
+the un-fixed code failed the new test, then confirmed the fix passes it.
+**A real bug surfaced by running the full suite, not caught by reasoning
+alone:** the first implementation called `stage1_5_normalize_styles`
+unconditionally, including for `stage2_results = []` (single-model
+degraded mode) — that vendor function reads its `style_normalization`
+config setting *before* looking at its input list, and some test config
+doubles for that code path don't define the attribute at all (it was never
+touched there before), so 3 single-model-branch tests crashed with
+`AttributeError`. Fixed with an explicit empty-input early return.
+Scoped mutmut (855 mutants) caught a second real gap on the first pass:
+the empty-input return's exact usage-dict shape/values were completely
+untested (9 survivors) — a wrong key or nonzero value there would have
+silently corrupted `metadata["usage"]["total"]` for every single-model run.
+Added a direct unit test pinning the exact `([], {zeroed usage})` return.
+Re-run: 828/855 killed, 27 survived, all pre-existing or newly-confirmed
+equivalents (documented inline, including the `.get(..., r["ranking"])`
+fallback — provably unreachable since `stage1_5_normalize_styles`
+guarantees one output entry per input, preserving `"model"`). 0 real
+gaps. Full suite: 785 passed.
+
+**2026-08-14, same day: `normalizer_model` pinned — grounded research +
+a real breakage found along the way.** Background research (WebSearch/
+WebFetch, this session) on 2025-2026 LLM-debate anonymization literature
+surfaced a residual-fingerprinting quantification directly relevant to the
+"which model does the rewriting" question §5's "inherit the package
+default" reasoning (pipeline-architecture-spec.md) never actually
+answered: **"Voice Under Revision"** (Tom van Nuenen, arXiv:2604.22142v1,
+submitted April 2026, cs.CL) rewrote 300 personal narratives through three
+frontier LLMs under three prompt conditions and measured re-identification
+via nearest-neighbor stylometric matching (character n-gram + word-length
+features, PCA-projected) against the 300 source texts. Exact figures,
+verified by fetching the paper's HTML full text directly (not taken from
+a secondary summary): **GPT-5.4 (`gpt5.42026-02`): 14.3% matched; Claude
+Sonnet 4.6 (`claudesonnet4.620260215`): 1.7%; Gemini 3.1 Pro
+(`gemini3.1pro`): 1.0%** — against a 0.3% chance baseline. Gemini was the
+clear best performer, GPT the clear worst, by an order of magnitude.
+Caveats the paper itself states, not glossed over: single English-language
+corpus, short texts (244 words avg., well below the 2,500-5,000 words
+traditional authorship-attribution work recommends), no cross-genre/
+cross-lingual claim, and the paper cannot attribute the effect to
+pretraining data vs. instruction-tuning vs. alignment vs. system defaults.
+Not the same task as this pipeline's own use (technical/analytical debate
+responses, not personal narratives) — treated as directionally relevant
+evidence, not a direct transfer.
+
+**Real breakage found while checking whether the tested models are even
+available today:** live OpenRouter fetch (2026-08-14) confirms **no
+Gemini Pro-tier text model exists at all** (matches the already-recorded
+Gap 1 in pipeline-architecture-spec.md §4) and **no Claude Sonnet 4.x
+model exists** (superseded by `anthropic/claude-sonnet-5`, a different,
+untested generation) — neither the paper's best nor second-best exact
+model can be used. Separately, and more urgently: `google/gemini-3.1-
+flash-lite-preview`, the model `normalizer_model` was silently inheriting
+as the package's hardcoded default (confirmed by reading `unified_config.py`
+directly), **is also dead on live OpenRouter** — leaving this field unset
+was not a neutral "defer the decision" choice, it meant Stage 1.5 (and the
+new Stage 2 commentary-normalization extension above) would fail outright
+the next time either actually ran against a real query.
+
+**Decision:** pinned `normalizer_model: google/gemini-3.6-flash` in
+`llm_council.yaml` — same vendor/family as the paper's single best-evidenced
+performer, and already this pipeline's own proven, live-verified 3rd core
+council seat (Resource & Stability Gate: proven integration over an
+untested one). Considered and rejected: `google/gemini-3.7-flash` (newer,
+cheaper, but zero operational track record in this project — the paper
+gives no reason to prefer it over 3.6 specifically), `google/gemini-3.5-
+flash-lite` (cheapest, but a lower capability tier for a task that needs to
+genuinely rewrite style while preserving content, not just cheaply
+paraphrase). Not claimed to replicate the paper's 1.0% figure — that
+number is Pro-tier-specific and on a different task; this is a reasoned
+choice under real, disclosed uncertainty, not a re-run of the study.
+Verified by direct execution: `load_config(Path("llm_council.yaml"))`
+resolves `cfg.council.normalizer_model == "google/gemini-3.6-flash"`,
+every other field unchanged. Full suite: 785 passed (no test asserts on
+this specific config value, so none needed updating).
+
+**Real-money gate (Pillar 6): satisfied, 2026-08-14, same session.** Ran
+a real, live dry run against a low-stakes test decision ("should a solo
+developer building a new CLI with zero users prioritize tests or docs
+first before release?") via `python3 -m scripts.pipeline_runner
+--topic-label dry-run-normalizer-verification --query "..." --max-cost-usd
+1.00`. **Complete success, zero warnings/errors.** Cost & Tokens summary:
+**total cost $0.3551**, CSS=0.752 (above the 0.50 gate, so Stage 2.75/3.75
+both correctly skipped — this run didn't happen to exercise the new Stage
+2 commentary-normalization path's cost inside the full pipeline). Stage 3
+synthesis correctly displayed real model names (`anthropic/claude-opus-4.8`,
+`openai/gpt-5.5`, `google/gemini-3.6-flash`, `z-ai/glm-5.2`) in the
+human-facing output — direct live confirmation that `_resolve_response_
+labels` genuinely restores identity for the human reader after the
+chairman's own anonymized reasoning pass, not just in tests. Stage 5
+extraction failed gracefully again (`malformed_extraction_response`, same
+pre-existing, already-tracked minor gap as the 2026-08-13 dry run — not a
+regression, not urgent). Output: `council-runs/2026-08-14T01-41-00-dry-
+run-normalizer-verification/` (gitignored, local only).
+
+**Separately, directly verified the new normalizer path itself** (the
+full pipeline run's CSS didn't happen to trigger it) — called
+`_normalize_stage2_for_stage3` directly against one real synthetic
+reviewer critique. Confirmed: real live call to `google/gemini-3.6-flash`,
+genuine subtle style rewrite ("is clearly the strongest here — I would
+rank it first" → "is the strongest option and should be ranked first"),
+real tracked cost (`cost_usd: 0.002853`, `cost_known: True`, 876 total
+tokens). `normalizer_model` pin confirmed working end-to-end against the
+live gateway, not just against `load_config()`'s parse step.
+
 **Declined (evidence-based, no code change and no upstream action):**
 non-persona diversity prompting for Stage 1 — evidence too thin
 (arXiv:2511.07784 attributes debate success to model heterogeneity, which

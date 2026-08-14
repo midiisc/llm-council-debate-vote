@@ -204,6 +204,16 @@ own current defaults rather than pinning a possibly-stale slug (the original
 doc's `google/gemini-2.0-flash-001` predates this entire model generation and
 was never re-verified).
 
+**Superseded 2026-08-14 (`normalizer_model` only, `max_reviewers` unchanged):**
+the "inherit the package default" reasoning above turned out to be wrong in
+practice — the package's inherited default (`google/gemini-3.1-flash-lite-
+preview`) went dead on live OpenRouter (confirmed 2026-08-14, same drift
+pattern as glm-5.2/kimi-k3's dated slugs above), which would have silently
+broken Stage 1.5 the next time it actually ran. Now pinned explicitly to
+`google/gemini-3.6-flash`, grounded against live rewriter-model evidence
+("Voice Under Revision," arXiv:2604.22142v1) — full reasoning and citation
+in `llm_council.yaml`'s own comment block and `docs/upstream-deltas.md`.
+
 GLM-5.2 is in `council.models` (Stage 1 + Stage 2 eligible) but never
 referenced as `chairman` — satisfies "4th voice, never chairman/judge."
 

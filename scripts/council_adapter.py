@@ -442,6 +442,162 @@ Now provide your evaluation and ranking:"""
     return ranking_prompt, label_to_model
 
 
+def _build_stage3_identity_map(
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    label_to_model: Dict[str, Dict[str, Any]],
+) -> Dict[str, str]:
+    """docs/specs/stage3-chairman-anonymization-contract.md, Function A.
+
+    Inverts Stage 2's already-computed `label_to_model` (real model slug ->
+    label) and extends it with a fresh, sequence-continuing label for any
+    Stage 2 reviewer that isn't already a Stage 1 drafter (a backup model
+    substituted only into a reviewer slot). Pure - never mutates any input.
+    """
+    model_to_label: Dict[str, str] = {
+        entry["model"]: label for label, entry in label_to_model.items()
+    }
+
+    next_index = len(label_to_model)
+    for result in stage2_results:
+        model = result["model"]
+        if model in model_to_label:
+            continue
+        model_to_label[model] = f"Response {chr(65 + next_index)}"
+        next_index += 1
+
+    return model_to_label
+
+
+def _anonymize_for_stage3(
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    aggregate_rankings: Optional[List[Dict[str, Any]]],
+    model_to_label: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+    """docs/specs/stage3-chairman-anonymization-contract.md, Function B.
+
+    Returns shallow copies of `stage1_results`/`stage2_results`/
+    `aggregate_rankings` with only the `"model"` key replaced by its
+    `model_to_label` label (falling back to the original real model string
+    if it's not in the map, which should never happen given Function A's
+    construction but must never raise). Every other key is passed through
+    unchanged. Never mutates any input.
+    """
+
+    def _relabel(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {**entry, "model": model_to_label.get(entry["model"], entry["model"])}
+            for entry in entries
+        ]
+
+    anon_stage1 = _relabel(stage1_results)
+    anon_stage2 = _relabel(stage2_results)
+    anon_rankings = None if aggregate_rankings is None else _relabel(aggregate_rankings)
+
+    return anon_stage1, anon_stage2, anon_rankings
+
+
+def _resolve_response_labels(text: str, model_to_label: Dict[str, str]) -> str:
+    """docs/specs/stage3-chairman-anonymization-contract.md, Function C.
+
+    Reverse substitution of Function A's map: replaces every occurrence of
+    a `"Response X"` label in the chairman's synthesis `text` with the real
+    model name it stands for, so the human-facing output never surfaces a
+    raw internal label (human-legibility carve-out). Longer labels are
+    substituted before any label that is one of their prefixes, so a
+    same-prefix pair (e.g. "Response A" / "Response AA") can never corrupt
+    each other's replacement.
+    """
+    label_to_model = {label: model for model, label in model_to_label.items()}
+
+    resolved = text
+    # Mutation-testing note (2026-08-14): `key=len` -> `key=None`/dropped
+    # entirely (falling back to plain lexicographic order) is a true
+    # equivalent mutant here, not a real gap. The only ordering property
+    # this loop needs is "if A is a proper prefix of B, B is processed
+    # before A" (the docstring's own stated guarantee) - and for any A
+    # that is a proper prefix of B, Python's string comparison always
+    # gives A < B (they agree on every character A has, and B has at
+    # least one more), so `reverse=True` on the *default* string ordering
+    # already puts B before A, same as sorting by length. Verified by
+    # direct execution (scoped mutmut run, 2 survivors on this line,
+    # traced by hand + proven for all inputs, not just the AC22 example).
+    for label in sorted(label_to_model, key=len, reverse=True):
+        resolved = resolved.replace(label, label_to_model[label])
+
+    return resolved
+
+
+async def _normalize_stage2_for_stage3(
+    stage2_results: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Extends Stage 1.5's own style-normalization call to Stage 2
+    reviewers' free-text ranking/critique commentary, closing the residual
+    stylistic-fingerprint channel documented in docs/upstream-deltas.md
+    (2026-08-14, "Known residual limitation" entry): only Stage 1 drafts
+    were being normalized before this fix, leaving each reviewer's own
+    prose habits in its critique text as an un-scrubbed identity-adjacent
+    signal for the chairman - the same channel Stage 1.5 exists to close
+    for drafts, just never extended to reviewer commentary.
+
+    Reuses the exact same `stage1_5_normalize_styles` call (same config
+    gate - `style_normalization`, same `normalizer_model`) rather than
+    inventing a second mechanism - it only requires each entry to carry
+    `"model"`/`"response"` keys, so `"ranking"` is mapped to `"response"`
+    and back; a reviewer's real ranking/critique text is never inspected
+    or parsed here, only round-tripped through the rewrite call.
+
+    Only ever applied to the copy built for Stage 3's chairman prompt -
+    never mutates or replaces the real `stage2_results` already used for
+    `parse_ranking_from_text`/`calculate_aggregate_rankings` (both run
+    earlier, against the real text) or returned to the caller for the
+    human-facing transcript - this cannot corrupt scoring or reduce
+    transcript fidelity.
+
+    `stage2_results = []` (single-model degraded mode, no Stage 2 round at
+    all) is a natural no-op: the underlying call never iterates, issues no
+    model call, and returns `([], {zeroed usage})`.
+    """
+    # Explicit early return, not just an empty-list no-op fall-through:
+    # `stage1_5_normalize_styles` reads `_get_style_normalization()`
+    # (config) BEFORE it ever looks at its input list, so calling it with
+    # an empty list still touches config - a real crash in single-model
+    # degraded mode, where Stage 1.5 has never run before and some test
+    # config doubles don't define `style_normalization` at all (that
+    # attribute was never needed on that code path until this function
+    # started calling the same config-reading dependency unconditionally).
+    # Found by running the full suite, not by reasoning alone - 3 real
+    # test failures, all single-model-branch tests, all the same
+    # AttributeError. Fixed here so single-model mode never touches this
+    # config key, matching its pre-existing behavior exactly.
+    if not stage2_results:
+        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    as_pseudo_stage1 = [
+        {"model": r["model"], "response": r["ranking"]} for r in stage2_results
+    ]
+    normalized, usage = await stage1_5_normalize_styles(as_pseudo_stage1)
+    normalized_ranking_by_model = {r["model"]: r["response"] for r in normalized}
+    # Mutation-testing note (2026-08-14): the `.get(r["model"], r["ranking"])`
+    # fallback default is a true equivalent mutant (unreachable in
+    # practice, not tested) - `stage1_5_normalize_styles` always appends
+    # exactly one output entry per input entry, preserving "model"
+    # unchanged (confirmed by direct source read of both its early-return
+    # path, which returns the input list itself untouched, and its normal
+    # per-item loop, which always sets `"model": result["model"]`), so
+    # `normalized_ranking_by_model` is guaranteed to contain every model
+    # `as_pseudo_stage1` (built directly from `stage2_results`, same model
+    # set) ever asked about. Kept anyway as a defensive fallback, matching
+    # `_anonymize_for_stage3`'s own AC15 - never a `KeyError` if that
+    # guarantee is ever violated by a future vendor change.
+    result = [
+        {**r, "ranking": normalized_ranking_by_model.get(r["model"], r["ranking"])}
+        for r in stage2_results
+    ]
+    return result, usage
+
+
 DEFAULT_STAGE1_DEADLINE_FRACTION = 0.5
 
 
@@ -569,9 +725,20 @@ async def run_council_with_timeouts(
     stage2_results: List[Dict[str, Any]]
     stage2_substitutions: List[SubstitutionEvent] = []
     stage2_shortfall_warning: Optional[str] = None
+    # Stage 3 chairman anonymization (docs/specs/stage3-chairman-
+    # anonymization-contract.md) must anonymize the SAME text Stage 2
+    # reviewers see, not stage1_results' raw draft text - Stage 1.5's
+    # style_normalize pass exists specifically to scrub stylistic
+    # fingerprinting (docs/upstream-deltas.md), and a label swap over
+    # still-fingerprinted prose isn't real anonymization. Single-model mode
+    # never runs Stage 1.5 at all (no peer review to protect against), so
+    # there is nothing to normalize - stage1_results is the only text that
+    # ever existed for that one draft.
+    stage1_for_stage3: List[Dict[str, Any]]
     if num_responses == 1:
         degraded_mode = "single_model"
         stage2_results = []
+        stage1_for_stage3 = stage1_results
         label_to_model = {"Response A": {"model": stage1_results[0]["model"], "display_index": 0}}
         aggregate_rankings = [
             {
@@ -587,6 +754,7 @@ async def run_council_with_timeouts(
         if num_responses == 2:
             degraded_mode = "two_models"
         responses_for_review, stage1_5_usage = await stage1_5_normalize_styles(stage1_results)
+        stage1_for_stage3 = responses_for_review
         total_usage["stage1_5"] = stage1_5_usage
 
         # Stage 2: retry-with-backoff + backup-model substitution, same
@@ -653,6 +821,52 @@ async def run_council_with_timeouts(
             "--- END GROUNDING COMPLIANCE NOTE ---"
         )
 
+    # Stage 3 identity anonymization (docs/specs/stage3-chairman-
+    # anonymization-contract.md) - computed once, outside the retry closure,
+    # since it's a pure function of stage1_for_stage3/stage2_results/
+    # aggregate_rankings/label_to_model, all fixed by this point and
+    # identical across every retry attempt. Closes the Stage 3 chairman
+    # identity leak (docs/upstream-deltas.md, "Stage 3 chairman identity
+    # leak" entry, 2026-08-14): the chairman's OWN prompt only ever sees
+    # the same Response-label vocabulary Stage 2 peer review already uses,
+    # never a real model slug - real identity is restored only in the
+    # human-facing synthesis text below, never in what the chairman reads.
+    # Deliberately `stage1_for_stage3` (style-normalized when Stage 1.5 ran,
+    # raw only in single-model mode where Stage 1.5 never runs), NOT the raw
+    # `stage1_results` - a label swap over still-fingerprinted prose is not
+    # real anonymization, since Stage 1.5's own job is scrubbing the
+    # stylistic signal a model could otherwise use to infer identity even
+    # with the "Model: X" tag gone (docs/upstream-deltas.md, "Stage 3
+    # chairman identity leak" entry's 2026-08-14 follow-up).
+    # Mutation-testing note (2026-08-14): passing `stage1_for_stage3` here is
+    # a true equivalent mutant (a scoped mutmut run against this call site
+    # survives with it swapped for `None`) - `_build_stage3_identity_map`
+    # never reads its own `stage1_results` parameter, since every Stage 1
+    # drafter's label is already fully recoverable from `label_to_model`
+    # (itself derived from stage1_results one step earlier, by Stage 2's own
+    # `_build_stage2_real_ranking_prompt`). The parameter is kept in the
+    # signature for contract-shape symmetry with `_anonymize_for_stage3`
+    # (which DOES need this argument's content), not because this function
+    # uses it. Verified by direct execution, traced by hand.
+    stage3_model_to_label = _build_stage3_identity_map(
+        stage1_for_stage3, stage2_results, label_to_model
+    )
+    # Same style-normalization extended to Stage 2 reviewer commentary
+    # (docs/upstream-deltas.md, "Known residual limitation" entry,
+    # 2026-08-14 fix) - a reviewer's own critique prose is as much an
+    # identity-adjacent signal as a drafter's, and was left un-normalized
+    # even after stage1_for_stage3 closed the same gap for drafts. Real
+    # extra cost (folds into total_usage["stage2_normalize"], summed into
+    # metadata["usage"]["total"]["cost_usd"] like every other bucket) -
+    # zero when stage2_results is empty (single-model degraded mode).
+    stage2_for_stage3, stage2_normalize_usage = await _normalize_stage2_for_stage3(
+        stage2_results
+    )
+    total_usage["stage2_normalize"] = stage2_normalize_usage
+    stage3_anon_stage1, stage3_anon_stage2, stage3_anon_rankings = _anonymize_for_stage3(
+        stage1_for_stage3, stage2_for_stage3, aggregate_rankings, stage3_model_to_label
+    )
+
     # Stage 3: retry-with-backoff on the chairman model only, no substitution
     # (docs/specs/stage2-3-debate-resilience-contract.md, Contract B).
     # `stage3_synthesize_final` itself already uses the status-preserving
@@ -673,9 +887,9 @@ async def run_council_with_timeouts(
     async def _stage3_query_fn(_model: str, _prompt: str, timeout: float) -> Dict[str, Any]:
         result, usage, _verdict = await stage3_synthesize_final(
             stage3_query,
-            stage1_results,
-            stage2_results,
-            aggregate_rankings=aggregate_rankings,
+            stage3_anon_stage1,
+            stage3_anon_stage2,
+            aggregate_rankings=stage3_anon_rankings,
             verdict_type=VerdictType.SYNTHESIS,
             timeout=timeout,
         )
@@ -693,6 +907,27 @@ async def run_council_with_timeouts(
         # traced by hand).
         if "error_status" in result:
             return {"status": result["error_status"], "error_detail": result.get("error_detail")}
+        # Real chairman identity (result["model"]) is untouched - it comes
+        # from stage3_synthesize_final's own `_get_chairman_model()` read,
+        # never from stage3_anon_stage1/stage2/rankings' contents. Only the
+        # response TEXT can contain an echoed "Response X" label (e.g. the
+        # debate-mode "Position A - Held by: Response C" framing) - resolved
+        # back to the real model name here, once, before this becomes the
+        # human-facing synthesis.
+        # Mutation-testing note (2026-08-14): `.get("response", "")`'s
+        # default is unreachable dead code, same invariant as the other
+        # `.get("response", ...)` call sites already documented in this
+        # function - by this point `"error_status" in result` is False, and
+        # `stage3_synthesize_final`'s only other return shape (success, both
+        # the chairman-disabled short-circuit and the real-query path)
+        # always includes a `"response"` key. Verified by direct execution
+        # (scoped mutmut run, 3 survivors on this line, traced by hand).
+        result = {
+            **result,
+            "response": _resolve_response_labels(
+                result.get("response", ""), stage3_model_to_label
+            ),
+        }
         return {"status": "ok", "result": result, "usage": usage}
 
     # ChairmanUnreachableError is deliberately left uncaught here - it

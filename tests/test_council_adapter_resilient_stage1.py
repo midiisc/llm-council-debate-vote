@@ -758,6 +758,156 @@ def test_stage3_synthesize_final_receives_correct_aggregate_rankings(monkeypatch
     _run(ca.run_council_with_timeouts("some query"))
 
     assert captured["aggregate_rankings"] is not None
+    # Stage 3 chairman anonymization (docs/specs/stage3-chairman-
+    # anonymization-contract.md): the chairman's own call receives the
+    # Stage 2 Response-label, never the real model slug - shuffle is
+    # no-op'd by _install_normal_flow_fakes above, so labels follow
+    # `models`' own order.
     assert captured["aggregate_rankings"] == [
-        {"model": m, "borda_score": 1.0, "rank": i + 1} for i, m in enumerate(models)
+        {"model": f"Response {chr(65 + i)}", "borda_score": 1.0, "rank": i + 1}
+        for i, m in enumerate(models)
     ]
+
+
+def test_stage3_receives_style_normalized_stage1_text_not_raw_draft(monkeypatch):
+    """Stage 3 chairman anonymization (docs/specs/stage3-chairman-
+    anonymization-contract.md) closes the explicit "Model: X" identity
+    leak, but Stage 1.5 (style_normalization: true,
+    docs/upstream-deltas.md) exists specifically to scrub stylistic
+    fingerprinting from Stage 1 drafts BEFORE Stage 2 peer review sees
+    them - a label swap alone is not real anonymization if the chairman
+    still reads the raw, un-normalized draft text underneath each label.
+    The chairman must see the SAME style-normalized text Stage 2 reviewers
+    already see, never stage1_results' original text."""
+    models = ["model-a", "model-b", "model-c"]
+    _install_normal_flow_fakes(monkeypatch, models)
+
+    async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
+        return ResilientQueryResult(
+            responses={m: _ok_response(m) for m in primary_models},
+            attempts=[], substitutions=[], unreachable_models=[], shortfall_warning=None,
+        )
+
+    _patch(monkeypatch, [__import__("scripts.resilient_query", fromlist=["x"])], "query_models_resilient", fake_query_models_resilient)
+
+    # Overrides _install_normal_flow_fakes' identity-passthrough fake for
+    # stage1_5_normalize_styles - an identity passthrough can't distinguish
+    # "chairman received the raw draft" from "chairman received the
+    # normalized draft" since they're equal either way. This fake actually
+    # rewrites the text so the two cases are observably different.
+    async def fake_stage1_5_actually_rewrites(stage1_results):
+        normalized = [
+            {"model": r["model"], "response": f"NORMALIZED::{r['response']}"}
+            for r in stage1_results
+        ]
+        return normalized, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_actually_rewrites)
+
+    captured = {}
+
+    async def fake_stage3_synthesize_final(user_query, stage1_results, stage2_results, aggregate_rankings=None, **kw):
+        captured["stage1_results"] = stage1_results
+        return {"model": "chairman-x", "response": "final synthesis"}, {}, None
+
+    _patch(monkeypatch, [_council_module], "stage3_synthesize_final", fake_stage3_synthesize_final)
+
+    _run(ca.run_council_with_timeouts("some query"))
+
+    assert captured["stage1_results"] is not None
+    assert all(
+        entry["response"].startswith("NORMALIZED::") for entry in captured["stage1_results"]
+    )
+
+
+def test_stage3_receives_style_normalized_stage2_ranking_text_not_raw_critique(monkeypatch):
+    """Extends the draft-normalization test above to Stage 2 reviewer
+    commentary (docs/upstream-deltas.md, "Known residual limitation" entry,
+    2026-08-14 fix): a reviewer's own critique/ranking prose is as much an
+    identity-adjacent stylistic signal as a drafter's, and was left
+    un-normalized even after stage1_for_stage3 closed the same gap for
+    drafts. The chairman must see the SAME style-normalized text for
+    reviewer commentary, never stage2_results' original "ranking" text."""
+    models = ["model-a", "model-b", "model-c"]
+    _install_normal_flow_fakes(monkeypatch, models)
+
+    async def fake_query_models_resilient(*, primary_models, backup_models, messages, timeout, query_fn, retry_policy, minimum_council_size, **kw):
+        return ResilientQueryResult(
+            responses={m: _ok_response(m) for m in primary_models},
+            attempts=[], substitutions=[], unreachable_models=[], shortfall_warning=None,
+        )
+
+    _patch(monkeypatch, [__import__("scripts.resilient_query", fromlist=["x"])], "query_models_resilient", fake_query_models_resilient)
+
+    # Same differentiating fake as the draft-normalization test above -
+    # rewrites whatever "response" text it receives, regardless of which
+    # stage's content is routed through it via the ranking<->response
+    # mapping in _normalize_stage2_for_stage3.
+    async def fake_stage1_5_actually_rewrites(stage1_results):
+        normalized = [
+            {"model": r["model"], "response": f"NORMALIZED::{r['response']}"}
+            for r in stage1_results
+        ]
+        return normalized, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_actually_rewrites)
+
+    captured = {}
+
+    async def fake_stage3_synthesize_final(user_query, stage1_results, stage2_results, aggregate_rankings=None, **kw):
+        captured["stage2_results"] = stage2_results
+        return {"model": "chairman-x", "response": "final synthesis"}, {}, None
+
+    _patch(monkeypatch, [_council_module], "stage3_synthesize_final", fake_stage3_synthesize_final)
+
+    _run(ca.run_council_with_timeouts("some query"))
+
+    assert captured["stage2_results"] is not None
+    assert len(captured["stage2_results"]) == len(models)
+    assert all(
+        entry["ranking"].startswith("NORMALIZED::") for entry in captured["stage2_results"]
+    )
+
+
+def test_normalize_stage2_for_stage3_empty_input_returns_zeroed_usage_no_config_touch(monkeypatch):
+    """Direct unit test for `_normalize_stage2_for_stage3`'s empty-input
+    early return (docs/upstream-deltas.md, "Known residual limitation"
+    entry, 2026-08-14 fix). Found by scoped mutmut: no existing
+    integration test pins the EXACT usage dict this returns for
+    `stage2_results = []` (single-model degraded mode) - a wrong key name
+    or a nonzero value here would silently corrupt
+    `metadata["usage"]["total"]` for every single-model run, undetected."""
+    result, usage = _run(ca._normalize_stage2_for_stage3([]))
+    assert result == []
+    assert usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def test_normalize_stage2_for_stage3_rewrites_ranking_preserves_other_keys(monkeypatch):
+    """Direct unit test (non-empty path): only "ranking" is replaced by the
+    normalizer's output, every other key ("model", "parsed_ranking", ...)
+    passes through unchanged, and the real `stage2_results` argument is
+    never mutated."""
+    async def fake_stage1_5_actually_rewrites(stage1_results):
+        normalized = [
+            {"model": r["model"], "response": f"NORMALIZED::{r['response']}"}
+            for r in stage1_results
+        ]
+        return normalized, {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+
+    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_actually_rewrites)
+
+    stage2_results = [
+        {"model": "model-a", "ranking": "raw critique a", "parsed_ranking": {"scores": {"Response A": 8}}},
+        {"model": "model-b", "ranking": "raw critique b", "parsed_ranking": {"scores": {"Response A": 6}}},
+    ]
+
+    result, usage = _run(ca._normalize_stage2_for_stage3(stage2_results))
+
+    assert result == [
+        {"model": "model-a", "ranking": "NORMALIZED::raw critique a", "parsed_ranking": {"scores": {"Response A": 8}}},
+        {"model": "model-b", "ranking": "NORMALIZED::raw critique b", "parsed_ranking": {"scores": {"Response A": 6}}},
+    ]
+    assert usage == {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+    # the real argument is untouched
+    assert stage2_results[0]["ranking"] == "raw critique a"
+    assert stage2_results[1]["ranking"] == "raw critique b"

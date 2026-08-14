@@ -649,6 +649,14 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     assert metadata["usage"]["by_stage"]["stage3"] == {
         "prompt_tokens": 6, "completion_tokens": 7, "total_tokens": 13, "cost_usd": 0.02,
     }
+    # --- stage2_normalize (docs/upstream-deltas.md, "Known residual
+    # limitation" entry, 2026-08-14 fix): _normalize_stage2_for_stage3
+    # reuses the SAME faked stage1_5_normalize_styles, so it returns the
+    # same canned usage a second time - straight assignment, same as
+    # stage1_5's own bucket above, not real accumulation. ---
+    assert metadata["usage"]["by_stage"]["stage2_normalize"] == {
+        "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "cost_usd": 0.0,
+    }
 
     # --- stage2 usage: now REAL accumulation (docs/specs/stage2-3-debate-
     # resilience-contract.md, Contract A - Stage 2 reviewers go through the
@@ -664,10 +672,11 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     assert stage2_usage["total_tokens"] == 85
     assert stage2_usage["cost_usd"] == pytest.approx(0.006)
 
-    # --- grand total sums every stage (60+1+60+6, 25+2+25+7, 85+3+85+13) ---
-    assert metadata["usage"]["total"]["prompt_tokens"] == 127
-    assert metadata["usage"]["total"]["completion_tokens"] == 59
-    assert metadata["usage"]["total"]["total_tokens"] == 186
+    # --- grand total sums every stage, now including stage2_normalize's own
+    # contribution (60+1+60+6+1, 25+2+25+7+2, 85+3+85+13+3) ---
+    assert metadata["usage"]["total"]["prompt_tokens"] == 128
+    assert metadata["usage"]["total"]["completion_tokens"] == 61
+    assert metadata["usage"]["total"]["total_tokens"] == 189
 
     # --- _add_cost_to_usage(model=model) really threads the model kwarg -
     # now merged across Stage 1 AND Stage 2's own by_model contributions
@@ -690,9 +699,24 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
 
     s3_query, s3_stage1, s3_stage2, s3_rankings, s3_verdict, s3_timeout = calls["stage3_call"]
     assert s3_query == "the exact query"
-    assert s3_stage1 == stage1_results
-    assert s3_stage2 == stage2_results
-    assert s3_rankings == metadata["aggregate_rankings"]
+
+    # Stage 3 chairman anonymization (docs/specs/stage3-chairman-
+    # anonymization-contract.md): the chairman's own call must never
+    # receive real model identity - only the same Response-label
+    # vocabulary Stage 2 already assigned. Every field other than "model"
+    # must stay byte-identical to the real (human-facing) values.
+    model_to_label = {
+        entry["model"]: label for label, entry in metadata["label_to_model"].items()
+    }
+    assert s3_stage1 == [{**r, "model": model_to_label[r["model"]]} for r in stage1_results]
+    assert s3_stage2 == [{**r, "model": model_to_label[r["model"]]} for r in stage2_results]
+    assert s3_rankings == [
+        {**r, "model": model_to_label[r["model"]]} for r in metadata["aggregate_rankings"]
+    ]
+    assert s3_stage1 != stage1_results
+    assert s3_stage2 != stage2_results
+    assert s3_rankings != metadata["aggregate_rankings"]
+
     assert s3_verdict == VerdictType.SYNTHESIS
     assert s3_timeout == 33.0
 
@@ -783,7 +807,14 @@ def test_single_model_branch_degraded_mode_and_untouched_stage1_5_stage2_usage(m
             "note": "Single model - no peer review",
         }
     ]
-    assert calls["stage3_call"] == ([], metadata["aggregate_rankings"])
+    # Stage 3 chairman anonymization: single-model branch still runs
+    # through the same anonymized-copy path - metadata's own
+    # aggregate_rankings stays real-named (human-facing), but what the
+    # chairman itself receives has "model" swapped for its Stage 1 label.
+    assert calls["stage3_call"] == (
+        [],
+        [{**metadata["aggregate_rankings"][0], "model": "Response A"}],
+    )
 
     # stage1_5/stage2 total_usage entries retain their untouched initial
     # values in this branch (never reassigned) - pins both the initial 0
