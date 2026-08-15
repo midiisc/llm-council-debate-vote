@@ -670,7 +670,7 @@ def test_stage1_reasoning_effort_map_exact_contents():
     assert ca._STAGE1_REASONING_EFFORT == {
         "anthropic/claude-opus-4.8": "high",
         "openai/gpt-5.5": "high",
-        "google/gemini-3.6-flash": "medium",
+        "google/gemini-3.7-flash": "medium",
         "z-ai/glm-5.2": "medium",
     }
 
@@ -680,14 +680,14 @@ def test_stage1_reasoning_effort_map_exact_contents():
     [
         ("anthropic/claude-opus-4.8", "high"),
         ("openai/gpt-5.5", "high"),
-        ("google/gemini-3.6-flash", "medium"),
+        ("google/gemini-3.7-flash", "medium"),
         ("z-ai/glm-5.2", "medium"),
     ],
 )
 def test_stage1_query_fn_looks_up_exact_effort_per_mapped_model(monkeypatch, model, expected_effort):
     captured = {}
 
-    async def fake_query_model_with_status_and_effort(m, messages, timeout, reasoning_effort=None):
+    async def fake_query_model_with_status_and_effort(m, messages, timeout, reasoning_effort=None, enable_web_search=False):
         captured["model"] = m
         captured["messages"] = messages
         captured["timeout"] = timeout
@@ -712,7 +712,7 @@ def test_stage1_query_fn_unmapped_model_gets_reasoning_effort_none(monkeypatch):
     behavior), never a KeyError."""
     captured = {}
 
-    async def fake_query_model_with_status_and_effort(m, messages, timeout, reasoning_effort=None):
+    async def fake_query_model_with_status_and_effort(m, messages, timeout, reasoning_effort=None, enable_web_search=False):
         captured["reasoning_effort"] = reasoning_effort
         return {"status": "ok", "content": "stub", "latency_ms": 1, "usage": {}}
 
@@ -726,7 +726,7 @@ def test_stage1_query_fn_unmapped_model_gets_reasoning_effort_none(monkeypatch):
 def test_stage1_query_fn_returns_the_inner_call_result_unmodified(monkeypatch):
     sentinel_result = {"status": "rate_limited", "latency_ms": 5, "error": "distinctive-marker", "retry_after": 3}
 
-    async def fake_query_model_with_status_and_effort(m, messages, timeout, reasoning_effort=None):
+    async def fake_query_model_with_status_and_effort(m, messages, timeout, reasoning_effort=None, enable_web_search=False):
         return sentinel_result
 
     monkeypatch.setattr(ca, "query_model_with_status_and_effort", fake_query_model_with_status_and_effort)

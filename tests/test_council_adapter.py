@@ -1742,3 +1742,92 @@ def test_shortfall_warnings_from_both_stages_joined_with_pipe_separator(monkeypa
     _, _, _, metadata = asyncio.run(ca.run_council_with_timeouts("some query"))
 
     assert metadata["shortfall_warning"] == "stage1 short | stage2 short"
+
+
+# ---------------------------------------------------------------------------
+# docs/specs/prompt-cache-session-affinity-contract.md, ACs 1-5: a
+# session_id-only CacheContext must be set before Stage 1/2/3 begin and
+# cleared afterward (success or exception), with a distinct session_id per
+# call, and the real build_openrouter_payload must pick it up.
+# ---------------------------------------------------------------------------
+
+
+def test_ac1_2_cache_context_set_before_stages_and_cleared_after_success(monkeypatch):
+    models = ["model-a", "model-b", "model-c"]
+    _install_happy_path_fakes(monkeypatch, models)
+
+    seen = {"set_ctx": None, "cleared": False}
+
+    def fake_set_cache_context(ctx):
+        seen["set_ctx"] = ctx
+
+    def fake_clear_cache_context():
+        seen["cleared"] = True
+
+    monkeypatch.setattr(ca, "set_cache_context", fake_set_cache_context, raising=False)
+    monkeypatch.setattr(ca, "clear_cache_context", fake_clear_cache_context, raising=False)
+
+    asyncio.run(ca.run_council_with_timeouts("some query"))
+
+    assert seen["set_ctx"] is not None
+    assert seen["set_ctx"].segments == []
+    assert seen["set_ctx"].session_id  # non-empty, truthy
+    assert seen["cleared"] is True
+
+
+def test_ac2_cache_context_cleared_even_when_stage1_raises(monkeypatch):
+    models = ["model-a", "model-b", "model-c"]
+    _install_happy_path_fakes(monkeypatch, models)
+
+    seen = {"cleared": False}
+
+    async def raising_query_models_resilient(**kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ca, "set_cache_context", lambda ctx: None, raising=False)
+    monkeypatch.setattr(ca, "clear_cache_context", lambda: seen.__setitem__("cleared", True), raising=False)
+    monkeypatch.setattr(ca, "query_models_resilient", raising_query_models_resilient, raising=False)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(ca.run_council_with_timeouts("some query"))
+
+    assert seen["cleared"] is True
+
+
+def test_ac3_distinct_session_id_across_two_calls(monkeypatch):
+    models = ["model-a", "model-b", "model-c"]
+    _install_happy_path_fakes(monkeypatch, models)
+
+    seen_ids = []
+
+    def fake_set_cache_context(ctx):
+        seen_ids.append(ctx.session_id)
+
+    monkeypatch.setattr(ca, "set_cache_context", fake_set_cache_context, raising=False)
+    monkeypatch.setattr(ca, "clear_cache_context", lambda: None, raising=False)
+
+    asyncio.run(ca.run_council_with_timeouts("query one"))
+    asyncio.run(ca.run_council_with_timeouts("query two"))
+
+    assert len(seen_ids) == 2
+    assert seen_ids[0] != seen_ids[1]
+
+
+def test_ac4_real_build_openrouter_payload_picks_up_session_id_only():
+    from llm_council.cache_context import CacheContext, set_cache_context, clear_cache_context
+    from llm_council.gateway.openrouter import build_openrouter_payload
+
+    try:
+        set_cache_context(CacheContext(segments=[], session_id="test-session-abc"))
+        payload = build_openrouter_payload(
+            model="anthropic/claude-opus-4.8",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    finally:
+        clear_cache_context()
+
+    assert payload["session_id"] == "test-session-abc"
+    # segments=[] must be a safe no-op for the Anthropic cache_control
+    # breakpoint branch - messages pass through untouched, not rewritten
+    # into content-part form.
+    assert payload["messages"] == [{"role": "user", "content": "hello"}]

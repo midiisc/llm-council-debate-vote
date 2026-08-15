@@ -223,7 +223,7 @@ def test_substitutions_present_are_each_printed_as_a_note_to_stderr(monkeypatch,
                 "reason": "unreachable after 3 attempts (last status=timeout)",
             },
             {
-                "slot_model": "google/gemini-3.6-flash",
+                "slot_model": "google/gemini-3.7-flash",
                 "backup_model": "qwen/qwen3.8-max",
                 "reason": "unreachable after 1 attempts (last status=auth_error)",
             },
@@ -242,7 +242,7 @@ def test_substitutions_present_are_each_printed_as_a_note_to_stderr(monkeypatch,
         in err
     )
     assert (
-        "NOTE: google/gemini-3.6-flash was unreachable this session, "
+        "NOTE: google/gemini-3.7-flash was unreachable this session, "
         "substituted with backup qwen/qwen3.8-max (unreachable after 1 "
         "attempts (last status=auth_error))"
         in err

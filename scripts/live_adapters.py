@@ -24,12 +24,14 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Verified live on OpenRouter, 2026-08-09 (see docs/upstream-deltas.md) -
 # used as the evidence-fetching model because it's cheap and web-search
 # capable via the :online suffix, not because it's a council member.
-EVIDENCE_MODEL = "google/gemini-3.6-flash:online"
+# 2026-08-16: swapped 3.6-flash -> 3.7-flash (identical specs, half price,
+# same :online/web_search support - confirmed live). See upstream-deltas.md.
+EVIDENCE_MODEL = "google/gemini-3.7-flash:online"
 
 # Same base model as EVIDENCE_MODEL, minus the :online search plugin - the
 # Stage 3.5 completeness check (scripts/completeness_check.py) reasons over
 # text already provided in the prompt, no web search needed.
-COMPLETENESS_CHECK_MODEL = "google/gemini-3.6-flash"
+COMPLETENESS_CHECK_MODEL = "google/gemini-3.7-flash"
 
 MAX_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1.0
@@ -139,18 +141,71 @@ async def _post_chat_completion_async(
     )
 
 
+def _extract_web_search_provenance(
+    enable_web_search: bool, data: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """docs/specs/stage1-web-search-contract.md. Classifies a response's
+    web-search outcome into exactly one of three shapes - see the
+    contract's ACs 3-5. `data` is the raw parsed OpenRouter JSON body (not
+    the status dict being built), so this can be called before the rest of
+    the response is assembled. `data=None` covers non-2xx/timeout/error
+    branches, where no response body was ever parsed - the model had
+    access to the tool (if enabled) but no search outcome can be
+    determined, so this degrades to "enabled_no_search" rather than
+    fabricating search results."""
+    if not enable_web_search:
+        return {"state": "not_enabled"}
+    if data is None:
+        return {"state": "enabled_no_search"}
+
+    message = data.get("choices", [{}])[0].get("message", {})
+    annotations = message.get("annotations") or []
+    citations = [a for a in annotations if a.get("type") == "url_citation"]
+    if not citations:
+        return {"state": "enabled_no_search"}
+
+    usage = data.get("usage", {})
+    queries_count = (
+        usage.get("server_tool_use_details", {}).get("web_search_requests", 0)
+    )
+
+    sources: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for citation in citations:
+        url_citation = citation.get("url_citation", {})
+        url = url_citation.get("url")
+        if url is None or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        sources.append({"url": url, "title": url_citation.get("title")})
+
+    return {
+        "state": "enabled_searched",
+        "queries_count": queries_count,
+        "sources": sources,
+    }
+
+
 async def query_model_with_status_and_effort(
     model: str,
     messages: list[dict],
     timeout: float = 120.0,
     reasoning_effort: Optional[str] = None,
+    enable_web_search: bool = False,
 ) -> dict[str, Any]:
     """Stage 1 query_fn (docs/specs/reasoning-effort-wiring-contract.md,
     Contract 4) - drop-in replacement for
     `llm_council.gateway_adapter.query_model_with_status` as
     `resilient_query.py`'s `QueryFn` (same `(model, messages, timeout) ->
-    dict` shape, same status-dict shape), with one addition: an optional
-    top-level `reasoning_effort` request field.
+    dict` shape, same status-dict shape), with two additions: an optional
+    top-level `reasoning_effort` request field, and an optional
+    `enable_web_search` flag (docs/specs/stage1-web-search-contract.md)
+    that wires OpenRouter's `openrouter:web_search` server tool.
+
+    `enable_web_search=False` (the default) is byte-identical to this
+    function's behavior before this contract - no `tools`/`max_tool_calls`
+    request fields, `web_search_provenance` in the returned dict is always
+    `{"state": "not_enabled"}`.
 
     Reuses the installed package's own `build_openrouter_payload`/
     `resolve_endpoint`/`resolve_model_name` (with `reasoning_params=None`,
@@ -197,6 +252,11 @@ async def query_model_with_status_and_effort(
     payload = build_openrouter_payload(model=model, messages=messages)
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
+    if enable_web_search:
+        payload["tools"] = [
+            {"type": "openrouter:web_search", "parameters": {"max_uses": 1}}
+        ]
+        payload["max_tool_calls"] = 1
 
     start_time = time.time()
 
@@ -221,6 +281,7 @@ async def query_model_with_status_and_effort(
                     "latency_ms": latency_ms,
                     "error": f"Rate limited by {model}",
                     "retry_after": int(retry_after) if retry_after.isdigit() else 60,
+                    "web_search_provenance": _extract_web_search_provenance(enable_web_search),
                 }
 
             if response.status_code in (401, 403):
@@ -228,6 +289,7 @@ async def query_model_with_status_and_effort(
                     "status": STATUS_AUTH_ERROR,
                     "latency_ms": latency_ms,
                     "error": f"Authentication failed for {model}: {response.status_code}",
+                    "web_search_provenance": _extract_web_search_provenance(enable_web_search),
                 }
 
             if response.status_code == 400:
@@ -235,6 +297,7 @@ async def query_model_with_status_and_effort(
                     "status": STATUS_ERROR,
                     "latency_ms": latency_ms,
                     "error": f"Bad request for {model}: {response.text[:200]}",
+                    "web_search_provenance": _extract_web_search_provenance(enable_web_search),
                 }
 
             response.raise_for_status()
@@ -255,6 +318,7 @@ async def query_model_with_status_and_effort(
                     "cached_tokens": _extract_cached_tokens(usage),
                     "cache_write_tokens": _extract_cache_write_tokens(usage),
                 },
+                "web_search_provenance": _extract_web_search_provenance(enable_web_search, data),
             }
 
     except (httpx.TimeoutException, asyncio.TimeoutError):
@@ -263,6 +327,7 @@ async def query_model_with_status_and_effort(
             "status": STATUS_TIMEOUT,
             "latency_ms": latency_ms,
             "error": f"Timeout after {timeout}s",
+            "web_search_provenance": _extract_web_search_provenance(enable_web_search),
         }
 
     except Exception as e:
@@ -271,6 +336,7 @@ async def query_model_with_status_and_effort(
             "status": STATUS_ERROR,
             "latency_ms": latency_ms,
             "error": str(e),
+            "web_search_provenance": _extract_web_search_provenance(enable_web_search),
         }
 
 

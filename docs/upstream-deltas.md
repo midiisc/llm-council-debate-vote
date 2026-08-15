@@ -1255,3 +1255,340 @@ produced) — condensed here for the ledger:
   - **Conclusion**: neither CSS nor direct content reading found real evidence that `high` effort improves Stage 1 output for either promoted seat - nor evidence it hurts. Presented to the user as a genuine coin-flip from available data, with further trials flagged as real additional cost for a possibly-unmeasurable effect rather than a promise of resolution.
   - **Final decision (user, presented with keep-high/switch-medium/invest-in-more-trials, chose keep-high)**: `_STAGE1_REASONING_EFFORT` stays at `{opus-4.8: high, gpt-5.5: high, flash: medium, glm: medium}` - the pre-dry-run original default. This is a judgment call made WITH full knowledge that the data doesn't clearly support it, not a data-backed verdict - recorded here explicitly so a future session doesn't mistake "kept `high`" for "proven `high` is better."
   - **Full arc of this incident, useful as a standing lesson**: shipped default (high) -> CSS dry-run showed a drop -> misread as quality regression -> reverted to medium -> user challenge caught the misread -> corrected, restored to high, added `docs/pipeline-architecture-spec.md` §9 -> content dry-run to actually check quality -> came back split -> settled on high by explicit judgment call, not data. Total real-money cost across all dry-run legs this session: ~$0.72 (two CSS-comparison runs) + 4 Stage-1-only calls (content comparison, not separately logged but small relative to the CSS runs).
+- 2026-08-16 — **Gemini seat swapped `3.6-flash` -> `3.7-flash` across the whole pipeline, on user request originating from a mistaken "Gemini 2.7 Flash" name (no such model exists on OpenRouter's live catalog - only a 2.5 generation and the 3.5-3.7 generation, confirmed via direct `/api/v1/models` fetch this session).**
+  - **Live grounding**: fetched `https://openrouter.ai/api/v1/models` directly. `google/gemini-3.7-flash` is real and live, with IDENTICAL `context_length` (1,048,576), `max_completion_tokens` (65,536), and `supported_parameters` (incl. `reasoning_effort`, `reasoning`, `tools`) to `google/gemini-3.6-flash` - but at exactly half the price: prompt $0.000000375 vs $0.00000075/token, completion $0.000001875 vs $0.00000375/token (both also carry identical `web_search: 0.014` pricing, confirming `:online` support parity).
+  - **Context**: the 2026-08-13/14 decision (see the `normalizer_model` entries above) explicitly considered and rejected `3.7-flash` in favor of `3.6-flash`, citing only "newer, cheaper, but zero operational track record in this project" - not a technical gap. That reasoning is unchanged; only the pricing delta is new information (the exact 2x figure wasn't on file before). Presented to the user as a real reversal of a prior explicit decision, with the Pillar-6 real-money-gate caveat surfaced; user chose "swap everywhere."
+  - **Applied**: `llm_council.yaml` (`council.models`, `tiers.pools.{high,balanced,reasoning}.models`, `council.normalizer_model`), `scripts/council_adapter.py` (`_STAGE1_REASONING_EFFORT` map key), `scripts/live_adapters.py` (`EVIDENCE_MODEL`, `COMPLETENESS_CHECK_MODEL`), `scripts/pipeline_runner.py` (`PipelineConfig.completeness_check_model` default). Old comment blocks explaining the original 3.6-flash choice left in place (not deleted) with a dated "SUPERSEDED" note pointing here, per this project's own convention of preserving decision history rather than silently overwriting it.
+  - **Tests**: mechanically renamed the same slug string in `tests/test_reasoning_effort_stage1_contract.py`, `tests/test_debate.py`, `tests/test_pipeline_runner.py` (these assert against the module's *default* model value / illustrative fixture data, not a business rule tied to "3.6" specifically - renaming keeps them in sync with the new default rather than weakening any assertion). Full suite re-run: 824 passed, 0 failures.
+  - **Verified by direct execution, not just re-reading YAML**: `llm_council.unified_config.load_config(Path("llm_council.yaml"))` against the installed `llm-council-core==0.40.1` confirms `cfg.council.models`, `cfg.council.normalizer_model`, and all three tier pools resolve to `google/gemini-3.7-flash` post-edit - the documented nesting-bug workaround still applies correctly to the new slug.
+  - **Still pending, unchanged from Pillar 6**: a fresh dry-run Cost & Tokens summary is required before the next real-decision run, since this changes the model pool/pricing tier for the first time since the swap. Not run this session - config/code change only.
+- 2026-08-16 (later) — **OpenRouter-config effectiveness review: research -> panel -> real LLM council -> a second panel re-examining a conflict with a 2-day-old prior decision. Two concrete outcomes; nothing shipped yet, spec still to write.**
+  - **Research** (6 parallel live-doc-verification agents, all citing URLs + this session's date): confirmed real - `openrouter:web_search`/`web_fetch` server tools (top-level `tools` array, `max_uses` tool-param + top-level `max_tool_calls` step budget, both genuinely OpenRouter-enforced, confirmed via a follow-up direct fetch of `openrouter.ai/docs/guides/features/server-tools/web-search`), structured outputs (`response_format`, all 4 roster models support it per live `supported_parameters`), Response Healing plugin (JSON-syntax-only, non-streaming-only), provider routing/model-fallback array, Presets (hosted-only), OpenRouter's own MCP server, and Fusion (a real managed panel+judge product). Confirmed absent: request-level `mcp_servers` passthrough, completion webhooks. Root architectural fact, confirmed by direct source read of the installed `llm_council/gateway/openrouter.py::build_openrouter_payload`: it accepts ONLY `reasoning_params`/`max_tokens`/`temperature`/`disable_tools` - no `plugins`/`tools`/`response_format`/`provider` field exists on the Stage 1 (debate) call path, so none of the above are reachable without a project-owned raw-HTTP bypass, same shape as the already-shipped Contract 4.
+  - **First panel + first real council consult** (both used the current `gemini-3.7-flash` roster - required a manual MCP server reconnect first, since it had cached the pre-swap `3.6-flash` config from its own startup; a Pillar-6 dry run was run before the real consult, $0.2273/33k tokens, all 4 models healthy, swap validated live): converged on shipping a dormant, already-installed prompt-cache activation "immediately" and building web-search as a narrow Contract-5-style Stage-1 bypass (3 of 4 models - `claude-opus-4.8`/`gpt-5.5`/`gemini-3.7-flash` at confirmed native pricing $0.01/$0.01/$0.014 per call; `z-ai/glm-5.2` excluded, no native search engine, unconfirmed Exa/Parallel fallback price), fixed per-model-per-round cap rather than extending the downstream cost ceiling backward, fail-closed on budget exhaustion. The real council's 4 models independently added a requirement neither the internal panel nor the research pass had: **search provenance (queries + source URLs) must be threaded into Stage 2/3 synthesis, not just logged for forensics** - both Claude and GLM-5.2 called this a hard requirement, since "search results are framed as reference data" alone isn't a reliable prompt-injection mitigation on its own. (Note: the real council's chairman synthesis for this specific call came back labeled `(Fallback - single model response)` with `Council status: partial` and no `Cost & Tokens` block, unlike the dry run - the chairman-level cross-model synthesis step appears to have degraded for this call; the underlying 4 individual Stage 1 opinions and Stage 2 peer-review labels were all present and used, but the real per-call cost for this consult is unknown and not recorded here. Flagged as a Pillar-5 gap - `mcp__llm-council__consult_council`'s chairman-synthesis reliability - not investigated further this pass.)
+  - **Conflict found before writing any spec**: `docs/specs/reasoning-effort-wiring-contract.md`'s own "Non-goals" section states web-search expansion to Stage 1 was "explicitly considered and rejected by the 2026-08-14 panel" - see this file's 2026-08-14 "Deep research mode" entry, Q1 verdict: rejected specifically because it "would homogenize the 4 models' independent drafts, undermining the Knowledge-Divergence rationale (arXiv:2603.05293) that gives Stage 2's cross-review signal its value." Neither today's internal panel nor the real council re-examined or even mentioned this - both focused on cost/pricing/injection. Surfaced to the user rather than silently proceeding or silently dropping the feature; user chose "re-examine with the homogenization concern in scope, then decide."
+  - **Paper re-grounding, direct read not the 2026-08-14 panel's paraphrase** (arXiv:2603.05293, "Knowledge Divergence and the Value of Debate for Scalable Oversight", Robin Young, 2026-03-05, `cs.LG`/`cs.CL`): the paper's homogenization mechanism (§3.4 "Dynamic Subspaces Under Debate") formally models PEER-TO-PEER revelation across debate rounds (model A reading model B's argument mid-debate and absorbing it, monotonically shrinking debate advantage toward zero). This mechanism cannot fire in this pipeline's actual Stage 1, confirmed via `docs/pipeline-architecture-spec.md` as a single-pass independent-draft stage with zero peer visibility (peer exposure starts at Stage 2) - the 2026-08-14 panel's Red finding never cited §3.4 specifically, so this is a genuine sharpening of an imprecisely-mechanized objection, not a strawman. The mechanism that DOES apply is the paper's static framework (§2): shared knowledge inputs reduce debate value proportionally to their overlap, not wholesale - and the paper's own remark that models from different pretraining pipelines have higher "effective rank" of private knowledge (more robust to a single shared-knowledge injection) directly favors this project's 4-different-labs roster. Paper's own Limitations section: explicitly a stylized/idealized model, "the debate advantage Δ... describes the ceiling of debate's value, not its floor" - not an empirical claim about this specific pipeline.
+  - **Second panel (homogenization re-examination), grounded in the direct paper read above, not the original paraphrase**: converged **8 concerns raised, 6 resolved, 2 needing user decision** - explicitly neither "proceed as scoped" (today's earlier convergence) nor "uphold the 2026-08-14 rejection" wholesale, but proceed WITH these made hard requirements, not optional hardening: (1) each of the 3 search-enabled models forms and issues its OWN independent search query - no shared/pooled search step (the worst case for homogenization, previously unaddressed); (2) search is claim-scoped (verifying a specific claim the model itself proposes), not open-ended exploratory search, reusing the existing Stage 0.5 grounding/epistemic-clause machinery rather than inventing a 5th distinct search "shape"; (3) GLM-5.2's search exclusion becomes a codified, tested, permanent invariant (a constant + test asserting at least one core-4 model is always unsearched at Stage 1) rather than an artifact of today's pricing gap that might silently disappear once GLM-5.2's price is confirmed; (4) provenance must distinguish "no search fired" from "search fired" for every model, not just log successful calls; (5) `max_uses` server-side enforcement and retry/backup non-duplication (does a Stage 1 retry re-issue and re-bill a search call?) must be verified before shipping, not assumed; (6) `docs/specs/stage1-web-search-contract.md` must be written capturing all of the above before any blind-TDV implementation - nothing here is shippable yet per Pillar 2.
+  - **Prompt-cache activation, independently re-scoped and found narrower than either panel assumed**: direct read of the installed package confirms `cache_context.set_cache_context()` is called ONLY from `llm_council/verification/api.py` (the `verify()`/ADR-034 code path) - it is not a general drop-in for `consult_council`'s Stage 1-3 debate path, contrary to how this was described to both panels and the real council this session. However, `CacheContext.matches()` returns `False` immediately on an empty `segments` list (confirmed by direct read of `cache_context.py`), so a `CacheContext` with only `session_id` set (no `segments`) is a verified-safe no-op for the Anthropic-specific `cache_control` breakpoint logic while still getting the `session_id` sticky-routing benefit unconditionally (`build_openrouter_payload` adds `session_id` to the payload whenever `cache_ctx` is not `None`, before the Anthropic-specific branch). The FULL cache_control-breakpoint savings would require reverse-engineering the package's *internal* Stage 1-3 prompt-assembly structure to build a correct `segments` map - a separate, Contract-4-scale investigation, not attempted this pass. Narrower, session_id-only activation is the actual "ship now" candidate, not the fuller feature both panels assumed was free.
+  - **The 2 open user decisions, both resolved (2026-08-16)**: (1) **gate first real-decision Stage-1-search use on a fact-vs-judgment measurement dry-run** (not proceed-by-judgment-call) - mirrors the Contract 4 CSS/content dry-run precedent; rationale given: this is a novel risk class (prompt injection, draft homogenization), not a tuning knob like reasoning-effort was, so real evidence is warranted before real use. (2) **GLM-5.2's Stage-1 search exclusion is a permanent architectural rule**, not a pricing-driven default - codify as a tested invariant (constant + test asserting at least one of the 4 core models is always unsearched at Stage 1), independent of any future GLM-5.2 fallback-pricing confirmation. Both decisions folded directly into `docs/specs/stage1-web-search-contract.md`, written next.
+  - **Prompt-cache session-affinity activation: shipped.** `docs/specs/
+    prompt-cache-session-affinity-contract.md` written (small-contract tier,
+    Contracts 1-3 style - direct test-first, not blind-TDV, since it wraps
+    the Stage 1 call site without altering its resilience behavior). Test-
+    first RED confirmed real (3 of 4 new tests failed before the code
+    change, for the exact expected reason - `set_cache_context`/
+    `clear_cache_context` not yet called). Implemented: `council_adapter.py::
+    run_council_with_timeouts` now sets a fresh `CacheContext(segments=[],
+    session_id=str(uuid.uuid4()))` before its body runs and clears it in a
+    `finally` (covers exception paths, not just the success return). 4 new
+    tests (ACs 1-4) plus the full 828-test suite (824 baseline + 4 new) re-
+    run GREEN. AC 4 asserts against the REAL installed `build_openrouter_
+    payload`, not a mock - confirms `segments=[]` really is a safe no-op for
+    the Anthropic `cache_control` branch and `session_id` really lands in
+    the payload. **Still pending, per its own Rollout precondition**: a real
+    dry-run pair (with/without this change) to capture the actual cost/
+    latency delta before citing an expected saving as fact - not required
+    pre-merge (this doesn't change request content, only routing metadata),
+    but required before claiming the saving is real. Not run this pass.
+  - **`docs/specs/stage1-web-search-contract.md` written** (Contract 5),
+    incorporating every hard requirement from the second panel plus two
+    corrections found via one real, direct OpenRouter test call made while
+    grounding the spec (not guessed from docs prose): (1) the real
+    `message.annotations`/`usage.server_tool_use_details.
+    web_search_requests` schema, confirmed live - the docs' prose had the
+    wrong field name (`server_tool_use`, missing `_details`); (2) `max_uses:
+    1` did NOT strictly cap search calls to 1 in this live test - 2 fired,
+    billed at 2x the naive per-model price ($0.028 = 2 x $0.014, confirmed
+    via the response's own `usage.cost` minus token cost) - AC 10 now
+    requires the dry-run Cost & Tokens summary state BOTH the naive and the
+    2x-observed ceiling, not just the naive figure. **Not yet implemented** -
+    next step is blind-TDV per the contract's own Test strategy section,
+    matching Contract 4's precedent for a Stage-1-resilience-call-site
+    change.
+- 2026-08-16 (later still) — **External 8-point "research round + convergence
+  loop" proposal reviewed: research -> panel -> real LLM council, unanimous
+  reject-the-architecture / adopt-the-kernel verdict. Run in parallel with
+  Contract 5's in-flight blind-TDV workflow (different files, no collision;
+  no repo edits made by this pass beyond this ledger entry and the new spec
+  below).**
+  - **The proposal**: independent-vs-shared web search for a new "research
+    round," a dedup/merge pass on models' surfaced "open questions," a
+    debate round feeding each model its own answer + all peers' answers +
+    merged questions (+ shared sources), and a stopping rule tracking the
+    COUNT of open questions round over round - keep looping while flat/
+    growing.
+  - **Grounding check before any panel**: this project has rejected
+    unconditional/iterative multi-round revision three separate times,
+    citing ARMOR-MAD (arXiv:2606.13197), "Revision or Re-Solving?"
+    (arXiv:2604.01029), "Deliberative Illusion" (arXiv:2606.03032) - most
+    recently in `docs/specs/human-debate-characteristics-contract.md`:
+    "Not adopted." The proposal's debate+convergence-loop core is
+    structurally close to that rejected pattern.
+  - **Fresh literature re-check** (direct arXiv abstract/section reads):
+    ARMOR-MAD's own method IS a genuinely signal-gated bounded loop (agreement
+    score per round, stop at threshold, hard cap `T_max`) - its central
+    finding (conditional beats fixed-round debate) really does distinguish a
+    gated loop from what was rejected. BUT its validated signal is
+    agreement/consensus, NOT "open-question count" (unvalidated, no support
+    in any cited paper here); and "Revision or Re-Solving?"/"Deliberative
+    Illusion" are agnostic to gating mechanism - their risks (second-pass
+    gains are often just re-solving; factual attrition compounds across
+    rounds) apply to whatever happens INSIDE a round regardless of how it's
+    triggered, so a gated loop is only safe if each round stays narrow/
+    constrained, matching this project's existing Stage 2.75
+    (`scripts/revision_round.py`: single-pass, citation-gated, "others
+    agree" explicitly disallowed as a reason to switch).
+  - **5 live-verified technical findings** (research workflow, direct
+    fetches, not docs prose): (1) only Google documents its own web-search
+    backend ("Grounding with Google Search," `ai.google.dev`) - Anthropic
+    and OpenAI's own docs name NO backend at all, so `engine`-pinning can't
+    verifiably fix the cross-model evidence-consistency confound for 2 of 3
+    web-search models; (2) `engine` has 6 real values (`auto`/`native`/
+    `exa`/`firecrawl`/`parallel`/`perplexity`), forcing a shared non-native
+    engine is supported but not a clean cost win (`exa` $0.007-0.015 vs
+    native $0.01-0.014; `parallel` $0.001-0.005 is the cheap option but
+    quality/recency tradeoffs are undocumented); (3) `response_format` +
+    `tools` (web_search) combine in one request with no documented
+    restriction, but per-model support is ENDPOINT-ROUTING-DEPENDENT -
+    `openai/gpt-5.5` loses structured-output support on its Bedrock
+    endpoint, `z-ai/glm-5.2` is inconsistent across 43 endpoints (16 missing
+    `structured_outputs`) - would need `provider` pinning to guarantee,
+    itself new scope Contract 5 already deferred; (4) the "Response
+    Healing" plugin's exact request shape is `"plugins":
+    [{"id": "response-healing"}]`, requires `response_format`
+    (`json_schema`/`json_object`) AND non-streaming to activate - JSON
+    syntax repair only, never schema/field correctness; (5) this session's
+    `session_id`-only prompt-cache activation lives INSIDE the installed
+    package's `build_openrouter_payload` - it does NOT automatically extend
+    to any new project-owned raw-HTTP call site (any future contract needs
+    its own explicit `session_id`).
+  - **Panel verdict** (9 personas: standing quartet + guardrail trio +
+    Scientist + Backend, pulled in for the literature-adjacent claim and the
+    new API-contract-design question): **13 concerns raised, 10 resolved, 3
+    needing user decision.** Reject the full architecture; this project's own
+    docs already flagged, but never specced, the actual literature-supported
+    kernel - "extend Stage 2.75 with ARMOR-MAD-style Pre-debate Agreement
+    Routing... as one small additive function, not a rewrite"
+    (`docs/upstream-deltas.md`, earlier entry). Gate on CSS (already
+    validated, already computed), never "open-question count." No new
+    search step needed for the gate itself - descope search from this
+    change entirely. Skip `response_format`/Response Healing/structured
+    `open_questions` (no consumer under the smaller scope; would need
+    undelivered provider-pinning). Skip partial engine-pinning as a
+    "consistency guarantee" (only verifiably true for 1 of 3 vendors).
+  - **Real LLM council verdict** (`mcp__llm-council__consult_council`,
+    `confidence=high`, $0.4731/73.1k tokens - chairman synthesis fired
+    correctly this time, unlike the earlier partial/fallback result):
+    **unanimous across all 4 models on every one of 5 questions**, matching
+    the panel exactly. Two things the real council added beyond the panel:
+    (1) Claude Opus (top-ranked, 0.889) - the single most load-bearing
+    safeguard: the agreement gate must decide WHETHER the existing narrow
+    revision runs, never change WHAT that revision is allowed to do when it
+    fires - loosening the citation-gated constraint when the gate trips
+    would silently reopen the exact risk this project already spent effort
+    avoiding; (2) GLM-5.2/GPT-5.5's compromise on engine-pinning - don't ship
+    a fake guarantee, but DO log per-vendor search-backend knowledge (known/
+    unknown per vendor) as an acknowledged confound in eval output - cheap,
+    honest, worth doing whenever search is eventually built (not now, since
+    search itself is descoped from this change).
+  - **Decided** (delegated to this session, "decide as apt" per explicit
+    user instruction): adopt the small Pre-debate Agreement Routing
+    extension to Stage 2.75, gated on existing CSS, with Opus's
+    whether-not-what safeguard as a hard requirement. Reject: the full
+    research-round architecture, "open-question count" as any kind of
+    signal, pooled/shared search, partial engine-pinning as a shipped
+    "guarantee," `open_questions` structured output. Defer indefinitely (no
+    concrete consumer, no assigned priority): per-vendor search-backend
+    confound logging, and GPT-5.5's minority "test the full architecture
+    offline behind a research flag, never production" suggestion - noted as
+    a reasonable future option, not scheduled.
+  - **Sequencing**: spec written now (`docs/specs/stage2-75-agreement-
+    routing-contract.md`) - doesn't touch `scripts/council_adapter.py`/
+    `scripts/live_adapters.py`, so no collision with Contract 5's in-flight
+    diff. Implementation deliberately NOT started this pass - waits for
+    Contract 5 to land and be verified clean, since Agreement Routing's
+    natural landing site (`pipeline_runner.py`'s stage-2 orchestration)
+    shares enough surface with Contract 5's changes to warrant sequencing
+    rather than parallel implementation.
+- 2026-08-16 (later) — **Contract 5 (Stage-1 web search) landed via
+  blind-TDV. Workflow reported `PASS: false`; verified directly rather than
+  accepted or silently overridden, per this project's established Contract-4
+  practice.**
+  - **What the workflow reported**: 89 mutants scoped (`scripts/
+    live_adapters.py` + `scripts/council_adapter.py`), 24 killed, 65
+    survivors grouped into 7 "survived"-status entries (41 individual
+    mutants, spanning `_post_chat_completion`, `real_fetch_evidence`,
+    `real_fetch_live_model_ids`, `_source_is_reachable`,
+    `_load_debate_resilience_config`, `_resolve_response_labels`,
+    `_normalize_stage2_for_stage3`) plus 3 "equivalent"-status entries (24
+    individual mutants). The workflow's own pass/fail gate counts any
+    non-"equivalent" entry as a real gap regardless of justification text,
+    producing `realSurvivors: 7` and `PASS: false`.
+  - **Verified directly, not taken on trust**: `git diff -U0` on both
+    changed files confirms all 7 "survived"-status functions have ZERO diff
+    hunks - genuinely untouched by this contract, pre-existing survivors
+    from before this session (same "OUT OF SCOPE" pattern Contract 4
+    accepted for 63 of its own 85 initial survivors). Spot-checked one
+    equivalent-mutant justification against the real source
+    (`CacheContext(segments=[], session_id=...)` vs. `segments` omitted) -
+    matches this session's own earlier direct verification that
+    `CacheContext`'s dataclass default for `segments` is also `[]`,
+    confirmed identical behavior. The math is exact: 41 out-of-scope + 24
+    equivalent = 65 = 89 total - 24 killed - every single surviving mutant
+    is accounted for, zero unaddressed real gaps in substance, even though
+    the workflow's blunt entry-count metric reported `PASS: false`.
+  - **Read the actual implementation directly** (not just the agent's
+    summary): `scripts/live_adapters.py::_extract_web_search_provenance`
+    and `query_model_with_status_and_effort`'s `enable_web_search` branch
+    match the contract's ACs 1-6 exactly - byte-identical payload when
+    disabled, correct `tools`/`max_tool_calls` shape when enabled, correct
+    three-state provenance classification. `scripts/council_adapter.py`'s
+    `_STAGE1_WEB_SEARCH_ENABLED_MODELS` set and `_stage1_query_fn` wiring
+    match ACs 7-9 exactly - `z-ai/glm-5.2` never in the set,
+    `_stage1_query_fn`'s call signature unchanged.
+  - **Full suite**: 871 passed (828 baseline + 43 new tests from the blind
+    test author's `tests/test_web_search_stage1_contract.py`), 0 failures.
+  - **Verdict: accepted as a genuine pass.** The web-search capability
+    exists, is tested, and is mutation-verified for its own new code - the
+    reported `PASS: false` was a reporting-granularity artifact (grouping
+    by function/entry rather than counting genuinely-addressed vs. genuinely-
+    open mutants), not an actual defect. Not committed - working-tree
+    changes only, per this session's practice of leaving commits to
+    explicit user request.
+  - **Still pending, unchanged from the contract's own Rollout precondition
+    (Pillar 6, stricter than Contract 4's)**: the fact-vs-judgment
+    measurement dry-run gating first real-decision use, per the user's
+    explicit 2026-08-16 decision. Not run this pass - implementation only.
+- 2026-08-16 (later still) — **Attempted to write the Pre-debate Agreement
+  Routing spec decided above; found a real architectural mismatch before
+  writing any code, so nothing was specced or built.**
+  - CSS (`metadata["quality_metrics"]["core"]["consensus_strength"]`,
+    confirmed via `pipeline_runner.py:437`) is computed FROM Stage 2's peer
+    rankings (`calculate_quality_metrics(stage2_rankings=...)`) - it cannot
+    exist before Stage 2 runs. The original ARMOR-MAD-aligned idea this
+    session's panel/council endorsed ("skip Stage 2/3 entirely when
+    Round-0 [Stage 1] responses already agree", `docs/upstream-deltas.md`'s
+    earlier entry citing ARMOR-MAD) needs an agreement signal computed from
+    STAGE 1 ALONE, before Stage 2 exists - CSS cannot serve that role no
+    matter how the code is arranged.
+  - Both the internal panel and the real LLM council answered "(2) use the
+    existing consensus-strength score, not open-question count" to the
+    general gating-signal question - correct for what's ALREADY BUILT
+    (Stage 2.75's existing `should_trigger_revision(css)` gate,
+    `scripts/revision_round.py`), but neither actually designed a new
+    Stage-1-only agreement metric, which is what a genuine pre-Stage-2 skip
+    would require. Answering "use CSS" for a question that implicitly
+    assumed CSS could gate something earlier than it structurally can was
+    an unexamined gap in both review passes, not caught until specing
+    started.
+  - **Conclusion: nothing new to build.** The existing Stage 2.75 mechanism
+    (single-pass, citation-gated, triggered only when CSS < 0.50) already
+    correctly implements the literature-validated kernel - "skip/limit
+    revision when consensus is already strong" - confirmed correct by two
+    independent review passes plus the real council, with no code changes
+    needed. The more ambitious "skip Stage 2 peer-review entirely before it
+    runs" version remains a genuinely distinct, not-yet-designed
+    possibility - it would need its own fresh grounding pass to define what
+    a Stage-1-only agreement signal even measures (e.g. embedding
+    similarity across the 4 draft texts, a cheap classifier call, or
+    something else - unexamined) before it could be specced, let alone
+    built. Not pursued this session - out of scope for what was actually
+    decided (adopt the small, already-validated kernel; reject the
+    speculative larger architecture), and inventing a new metric now would
+    itself be exactly the kind of unvalidated-signal risk this session's
+    literature re-check warned against.
+  - No files changed by this entry beyond this ledger note - `docs/specs/
+    stage1-web-search-contract.md`/Contract 5 remain the only spec/code
+    output from this session's second research-panel-council pass.
+- 2026-08-16 (final) — **Both pending rollout dry-runs executed for real,
+  against live OpenRouter. One clean positive result; one real, material
+  cost-model correction that changes Contract 5's economics - reported
+  honestly, not smoothed over, per this project's own established practice.**
+  - **Prompt-cache session-affinity dry-run** (per its own Rollout
+    precondition): ran `council_adapter.run_council_with_timeouts()` twice,
+    same low-stakes query ("single requirements.txt vs. requirements.txt +
+    requirements-dev.txt for a solo dev"), once with `set_cache_context`/
+    `clear_cache_context` monkeypatched to no-ops (reproducing the exact
+    pre-change request shape) and once with the real, shipped code.
+    **Result: real, measurable saving.** Without: $0.3736, 62,263 tokens.
+    With: $0.3276, 55,794 tokens - a **12.3% cost reduction** ($0.046
+    saved this trial), cached-token count rose 2,917 -> 4,669 (consistent
+    with the sticky-routing mechanism actually engaging), latency
+    unaffected (178.7s vs 179.1s, no regression). CSS differed between the
+    two runs (0.682 vs 0.438) but per this project's own established
+    Contract-4-dry-run lesson (`docs/pipeline-architecture-spec.md` §9),
+    CSS measures cross-model ranking agreement, not correctness/quality -
+    this single n=1 trial's CSS delta is NOT claimed as evidence the
+    change affected debate quality either direction, only that the cost/
+    latency/cache-hit numbers are real. **Verdict: the expected saving is
+    confirmed real, not merely assumed - safe to cite going forward.**
+  - **Contract 5 web-search dry-run** (per its own, stricter Rollout
+    precondition): ran direct Stage-1-only calls (bypassing Stage 0.5/2/3,
+    matching Contract 4's own dry-run method) for all 3 enabled models
+    (`claude-opus-4.8`, `gpt-5.5`, `gemini-3.7-flash`), once with
+    `enable_web_search=False` (baseline) and once `True` (search), same
+    low-stakes query (Python packaging-tool choice for a solo maintainer -
+    chosen specifically because it has both a genuine judgment component
+    AND a factual/currency component a real search could resolve
+    differently).
+    - **(a) Content convergence - real read of the text, not a CSS proxy,
+      per the contract's own AC**: partial and narrow, not wholesale.
+      All 3 models ALREADY independently agreed on the headline
+      recommendation (`uv`) even at baseline, before any search happened -
+      search didn't manufacture that agreement, it was already there.
+      What DID measurably narrow: the SPECIFIC build-backend sub-
+      recommendation. Baseline responses hedged/varied (`hatchling` vs.
+      `hatchling or uv_build` vs. `uv_build` specifically); with search,
+      the two models that actually searched (Claude, GPT-5.5) both
+      converged tightly onto naming `uv_build` specifically, citing
+      overlapping real sources (`packaging.python.org`, `docs.astral.sh`).
+      Gemini, which had access but chose NOT to search this round
+      (`web_search_provenance: enabled_no_search` - a real, working
+      instance of that state), kept its baseline framing (`hatchling`)
+      unchanged - so search-enabled models ended up MORE distinct from the
+      non-searching model on this sub-point than the 3 baseline models
+      were from each other. Each model's overall reasoning style,
+      structure, and secondary framing (Claude's "not having to decide is
+      a feature" editorial point; GPT-5.5's explicit A/B choice table)
+      stayed distinct in both conditions. **This matches, with real
+      evidence, the theoretical prediction from this session's earlier
+      arXiv:2603.05293 re-grounding: homogenization from shared knowledge
+      is partial/dimension-specific, not wholesale - here it concentrated
+      on one current, verifiable fact (a backend's name), not on judgment
+      or reasoning style.**
+    - **(b) Search behavior**: confirmed all 3 provenance states work
+      correctly on real responses - `enabled_searched` (Claude: 1 query,
+      5 sources; GPT-5.5: 1 query, 3 sources) and `enabled_no_search`
+      (Gemini, had access, chose not to use it this round) both observed
+      for real, not just in unit tests.
+    - **(c) Cost - a real, material correction to AC 10's ceiling
+      framing, not just a bigger number than expected.** Direct inspection
+      of the raw `usage` dict (not just the top-line `cost` field) shows
+      the dominant cost driver is NOT the flat per-search-call fee AC 10's
+      ceiling was built around - it's **extra PROMPT tokens from the
+      fetched search-result content being injected into the model's own
+      context**, billed at that model's normal (often expensive) per-
+      prompt-token rate. Claude Opus's prompt tokens jumped 85 -> 13,837
+      tokens when search fired (GPT-5.5: 57 -> 10,918) for a SINGLE search
+      call each. Real per-round cost this trial: $0.107 (baseline, 3
+      models) -> $0.254 (search, 2 of 3 actually searched) - a **~$0.147
+      delta**, well above AC 10's naive ($0.034) or even 2x-observed
+      ($0.068) ceilings, both of which only ever accounted for the flat
+      search-tool fee. **`max_uses` does not meaningfully bound this cost
+      driver** - the expensive part is proportional to how much RESULT
+      CONTENT one search call returns (`max_results`, default 5, matches
+      Claude's 5 citations from its 1 permitted call here), not how many
+      calls are made. A future revisit of Contract 5's cost controls
+      should look at `max_results`/`max_characters`/`search_context_size`
+      tool parameters, not just `max_uses`, if tighter cost bounding is
+      wanted - not implemented this pass, flagged as a real, undelivered
+      gap in the shipped contract's cost-control design, not silently
+      absorbed.
+  - **Neither dry-run's code was changed as a result of these findings**
+    (both contracts already shipped and pass their own tests/mutation
+    gates) - this entry is the required, honest reporting step per each
+    contract's own Rollout precondition, including the null/inconclusive
+    and worse-than-assumed parts, not just the confirming ones. Both
+    capabilities remain available for real use; the corrected cost
+    expectation for Contract 5 (materially higher than AC 10 states) should
+    be read alongside the contract before relying on its documented
+    ceiling for a real budget decision.

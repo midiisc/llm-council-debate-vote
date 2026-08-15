@@ -27,7 +27,25 @@ council:
     models:
       - anthropic/claude-opus-4.8
       - openai/gpt-5.5
-      - google/gemini-3.6-flash
+      - google/gemini-3.7-flash  # 2026-08-16: was google/gemini-3.6-flash.
+                                   # Live OpenRouter /api/v1/models fetch
+                                   # confirmed 3.7-flash has IDENTICAL specs
+                                   # to 3.6-flash (1,048,576 context, 65,536
+                                   # max output, same supported_parameters
+                                   # list incl. reasoning_effort) at exactly
+                                   # HALF the price ($0.375/$1.875 per M
+                                   # prompt/completion vs $0.75/$3.75). The
+                                   # 2026-08-13/14 decision to keep 3.6-flash
+                                   # (see comment below on normalizer_model,
+                                   # and upstream-deltas.md) cited only "zero
+                                   # operational track record" against
+                                   # 3.7-flash, not a technical gap - user
+                                   # explicitly approved the swap once the
+                                   # pricing was confirmed live. Real-money
+                                   # gate (Pillar 6): a fresh dry-run Cost &
+                                   # Tokens summary is required before the
+                                   # next real-decision use. See
+                                   # upstream-deltas.md.
       - z-ai/glm-5.2  # 2026-08-12: was z-ai/glm-5.2-20260616 - that dated slug
                         # is DEAD on live OpenRouter (confirmed via direct
                         # /api/v1/models fetch, only z-ai/glm-5.2 and
@@ -77,7 +95,11 @@ council:
     #    time (previously silently broken) - a fresh dry run showing the
     #    Cost & Tokens summary is required before the next real-decision
     #    use, not yet performed this session. See docs/upstream-deltas.md.
-    normalizer_model: google/gemini-3.6-flash
+    #    SUPERSEDED 2026-08-16: swapped to google/gemini-3.7-flash to match
+    #    the core council seat above (same "SAME model as core seat"
+    #    rationale that justified 3.6-flash here in the first place still
+    #    applies). See upstream-deltas.md.
+    normalizer_model: google/gemini-3.7-flash
   gateways:
     default: openrouter
     fallback:
@@ -100,7 +122,7 @@ council:
         models:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
-          - google/gemini-3.6-flash
+          - google/gemini-3.7-flash
           - z-ai/glm-5.2
       quick:
         models:
@@ -110,12 +132,12 @@ council:
         models:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
-          - google/gemini-3.6-flash
+          - google/gemini-3.7-flash
       reasoning:
         models:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
-          - google/gemini-3.6-flash
+          - google/gemini-3.7-flash
           - z-ai/glm-5.2
   evaluation:
     rubric:

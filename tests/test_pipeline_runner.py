@@ -1131,7 +1131,7 @@ def test_completeness_check_called_once_when_grounding_ran(tmp_path):
     evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
     fetch_evidence = _make_fetch_evidence(evidence)
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))  # no revision
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '["1"]'})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": '["1"]'})
 
     config = PipelineConfig(
         topic_label="t",
@@ -1146,7 +1146,7 @@ def test_completeness_check_called_once_when_grounding_ran(tmp_path):
     # Stage 4, distinguished by prompt content.
     completeness_calls = [
         c for c in query_model.calls
-        if c[0] == "google/gemini-3.6-flash" and "Extract a small reasoning graph" not in c[1]
+        if c[0] == "google/gemini-3.7-flash" and "Extract a small reasoning graph" not in c[1]
     ]
     assert len(completeness_calls) == 1
     # the actual synthesis text must reach the completeness prompt, not be
@@ -1163,7 +1163,7 @@ def test_completeness_check_parse_failure_is_surfaced_not_hidden(tmp_path):
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))  # no revision
     # A malformed (non-JSON) response for the completeness check.
     query_model = FakeQueryModel(
-        response_by_model={"google/gemini-3.6-flash": "not json at all"}
+        response_by_model={"google/gemini-3.7-flash": "not json at all"}
     )
 
     config = PipelineConfig(
@@ -1210,7 +1210,7 @@ def test_debug_log_records_grounding_and_revision_when_they_run(tmp_path):
     evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
     fetch_evidence = _make_fetch_evidence(evidence)
     council_fn = _make_council_fn(_council_result_fixture(css=0.2))  # triggers revision
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "[]"})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": "[]"})
 
     config = PipelineConfig(
         topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
@@ -1247,7 +1247,7 @@ def test_query_model_with_effort_none_leaves_every_stage_on_plain_query_model(tm
     evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
     fetch_evidence = _make_fetch_evidence(evidence)
     council_fn = _make_council_fn(_council_result_fixture(css=0.2))
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "[]"})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": "[]"})
 
     config = PipelineConfig(
         topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,
@@ -1272,7 +1272,7 @@ def test_query_model_with_effort_routes_revision_and_critique_at_high_and_comple
     council_fn = _make_council_fn(_council_result_fixture(css=0.2))  # triggers revision + critique
     query_model = FakeQueryModel()
     query_model_with_effort = FakeQueryModelWithEffort(
-        response_by_model={"google/gemini-3.6-flash": "[]"}
+        response_by_model={"google/gemini-3.7-flash": "[]"}
     )
 
     config = PipelineConfig(
@@ -1308,8 +1308,8 @@ def test_query_model_with_effort_routes_revision_and_critique_at_high_and_comple
     assert efforts_by_model["model-x"] == {"high"}
     assert efforts_by_model["model-y"] == {"high"}
     assert efforts_by_model["openai/gpt-5.5"] == {"high"}
-    # the completeness check call (google/gemini-3.6-flash) requested "low"
-    assert efforts_by_model["google/gemini-3.6-flash"] == {"low"}
+    # the completeness check call (google/gemini-3.7-flash) requested "low"
+    assert efforts_by_model["google/gemini-3.7-flash"] == {"low"}
 
     # the real prompt text must actually reach the effort-routed call, not
     # a placeholder - each model's own revision prompt carries its own
@@ -1330,7 +1330,7 @@ def test_debug_log_grounding_counts_each_tag_correctly(tmp_path):
     }
     fetch_evidence = _make_fetch_evidence(evidence)
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "[]"})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": "[]"})
 
     config = PipelineConfig(
         topic_label="t",
@@ -1503,7 +1503,7 @@ def test_debug_log_no_safety_warning_when_check_absent(tmp_path):
 def test_stage5_writes_reasoning_graph_file_on_success(tmp_path):
     fetch_evidence = _make_fetch_evidence()
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '{"nodes": [], "edges": []}'})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": '{"nodes": [], "edges": []}'})
 
     config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
     result = _run(config, fetch_evidence, council_fn, query_model)
@@ -1525,7 +1525,7 @@ def test_stage5_writes_reasoning_graph_file_on_success(tmp_path):
 def test_stage5_skipped_when_cost_ceiling_already_met(tmp_path):
     fetch_evidence = _make_fetch_evidence()
     council_fn = _make_council_fn(_council_result_fixture(css=0.9, cost_x=3.0, cost_y=3.0))
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '{"nodes": [], "edges": []}'})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": '{"nodes": [], "edges": []}'})
 
     config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path, max_cost_usd=1.0)
     result = _run(config, fetch_evidence, council_fn, query_model)
@@ -1564,7 +1564,7 @@ def test_stage5_skipped_when_wall_clock_margin_exceeded(tmp_path, monkeypatch):
 
     fetch_evidence = _make_fetch_evidence()
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": '{"nodes": [], "edges": []}'})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": '{"nodes": [], "edges": []}'})
 
     config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
     result = _run(config, fetch_evidence, council_fn, query_model)
@@ -1579,7 +1579,7 @@ def test_stage5_skipped_on_malformed_extraction_response_never_crashes(tmp_path)
     fetch_evidence = _make_fetch_evidence()
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))
     # not valid JSON - build_reasoning_graph's own malformed-response path
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "not json at all"})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": "not json at all"})
 
     config = PipelineConfig(topic_label="t", query="q", output_root=tmp_path)
     result = _run(config, fetch_evidence, council_fn, query_model)
@@ -1806,7 +1806,7 @@ def test_debug_log_completeness_parse_failed_exact_message(tmp_path):
     evidence = {"1": [Evidence(source="http://x.com", date="2026-01-01", supports=True)]}
     fetch_evidence = _make_fetch_evidence(evidence)
     council_fn = _make_council_fn(_council_result_fixture(css=0.9))
-    query_model = FakeQueryModel(response_by_model={"google/gemini-3.6-flash": "not json"})
+    query_model = FakeQueryModel(response_by_model={"google/gemini-3.7-flash": "not json"})
 
     config = PipelineConfig(
         topic_label="t", query="q", raw_claims_text="1. Some claim.", output_root=tmp_path,

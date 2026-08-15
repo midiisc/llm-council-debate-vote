@@ -72,7 +72,7 @@ class PipelineConfig:
     # so this module never imports live_adapters, the same testability
     # boundary the module docstring already describes for fetch_evidence/
     # council_fn/query_model.
-    completeness_check_model: str = "google/gemini-3.6-flash"
+    completeness_check_model: str = "google/gemini-3.7-flash"
 
 
 @dataclass

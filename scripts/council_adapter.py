@@ -47,12 +47,14 @@ import html
 import random
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from llm_council.cache_context import CacheContext, clear_cache_context, set_cache_context
 from llm_council.council import _get_chairman_model, _get_council_models
 from llm_council.council_rankings import calculate_aggregate_rankings, parse_ranking_from_text
 from llm_council.council_stages import (
@@ -628,20 +630,38 @@ DEFAULT_STAGE1_DEADLINE_FRACTION = 0.5
 _STAGE1_REASONING_EFFORT: Dict[str, str] = {
     "anthropic/claude-opus-4.8": "high",
     "openai/gpt-5.5": "high",
-    "google/gemini-3.6-flash": "medium",
+    "google/gemini-3.7-flash": "medium",
     "z-ai/glm-5.2": "medium",
+}
+
+# docs/specs/stage1-web-search-contract.md: the 3 of 4 roster models that
+# get OpenRouter's `openrouter:web_search` server tool during Stage 1's
+# independent-draft round. "z-ai/glm-5.2" must NEVER be added here - this
+# is a permanent exclusion, not a config knob (see the contract's
+# non-goals). A model not in this set (including any backup substitute
+# outside the primary roster) gets enable_web_search=False.
+_STAGE1_WEB_SEARCH_ENABLED_MODELS: set = {
+    "anthropic/claude-opus-4.8",
+    "openai/gpt-5.5",
+    "google/gemini-3.7-flash",
 }
 
 
 async def _stage1_query_fn(model: str, messages: List[Dict[str, str]], timeout: float) -> Dict[str, Any]:
     """`query_models_resilient`'s `QueryFn` for Stage 1 - a per-model-aware
-    closure over `query_model_with_status_and_effort` (Contract 4). Every
-    other `query_models_resilient` argument (primary_models, backup_models,
+    closure over `query_model_with_status_and_effort` (Contract 4, extended
+    by docs/specs/stage1-web-search-contract.md). Every other
+    `query_models_resilient` argument (primary_models, backup_models,
     retry_policy, minimum_council_size, deadline) is unchanged by this
-    wiring."""
+    wiring; this closure's own call signature also stays unchanged - see
+    the web-search contract's non-goals."""
     effort = _STAGE1_REASONING_EFFORT.get(model)
     return await query_model_with_status_and_effort(
-        model, messages, timeout, reasoning_effort=effort
+        model,
+        messages,
+        timeout,
+        reasoning_effort=effort,
+        enable_web_search=(model in _STAGE1_WEB_SEARCH_ENABLED_MODELS),
     )
 
 
@@ -672,385 +692,406 @@ async def run_council_with_timeouts(
     Critical #3). None (default) means no deadline is computed - Stage 1
     retries/substitutes exactly as before this contract landed.
     """
-    total_usage: Dict[str, Dict[str, Any]] = {
-        "stage1": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "stage1_5": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "stage2": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "stage3": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+    # docs/specs/prompt-cache-session-affinity-contract.md ACs 1-3: a
+    # session_id-only CacheContext (no segments) activates OpenRouter
+    # sticky-routing for every Stage 1-3 call this function's async
+    # context reaches - a fresh session_id per call (never reused across
+    # runs), cleared unconditionally via try/finally so a raised
+    # exception can't leak a stale context into the next call.
+    # Mutation-testing note (2026-08-16): the explicit `segments=[]` here is
+    # a true equivalent mutant (a scoped mutmut run survives with it
+    # dropped) - CacheContext's own dataclass default for `segments` is
+    # `field(default_factory=list)`, i.e. also `[]`, so omitting the kwarg
+    # produces a CacheContext with an identical `.segments == []` to
+    # passing it explicitly; no observable behavior (matches()/
+    # breakpoint_offsets()'s outputs, or any downstream read) can ever
+    # distinguish the two. Kept explicit here for readability (this is the
+    # one call site establishing the "no segments yet" contract), not
+    # because it changes behavior. Verified by direct execution, traced by
+    # hand.
+    set_cache_context(CacheContext(segments=[], session_id=str(uuid.uuid4())))
+    try:
+        total_usage: Dict[str, Dict[str, Any]] = {
+            "stage1": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "stage1_5": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "stage2": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "stage3": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
-    # Stage 1: bypasses stage1_collect_responses (no timeout override there)
-    # and calls query_models_resilient directly (retry-with-backoff +
-    # backup-model substitution, docs/specs/debate-resilience-contract.md),
-    # reproducing query_models_parallel's aggregation on top of its result.
-    messages = [{"role": "user", "content": build_stage1_prompt(user_query)}]
-    resilience_config = _load_debate_resilience_config()
-    stage1_deadline = (
-        time.monotonic() + overall_wall_clock_seconds * stage1_deadline_fraction
-        if overall_wall_clock_seconds is not None
-        else None
-    )
-    resilient_result = await query_models_resilient(
-        primary_models=_get_council_models(),
-        backup_models=resilience_config.backup_models,
-        messages=messages,
-        timeout=stage1_timeout,
-        query_fn=_stage1_query_fn,
-        retry_policy=resilience_config.retry_policy,
-        minimum_council_size=resilience_config.minimum_council_size,
-        deadline=stage1_deadline,
-    )
-    responses = resilient_result.responses
-
-    stage1_results: List[Dict[str, Any]] = []
-    for model, response in responses.items():
-        stage1_results.append({"model": model, "response": response.get("content", "")})
-        usage = response.get("usage", {})
-        total_usage["stage1"]["prompt_tokens"] += usage.get("prompt_tokens", 0)
-        total_usage["stage1"]["completion_tokens"] += usage.get("completion_tokens", 0)
-        total_usage["stage1"]["total_tokens"] += usage.get("total_tokens", 0)
-        _add_cost_to_usage(total_usage["stage1"], usage, model=model)
-
-    num_responses = len(stage1_results)
-
-    # ADR-016 safety gate - config-driven, matches run_full_council's own
-    # `if eval_config.safety.enabled:` gating (AC14). getattr fallbacks
-    # tolerate a test double that doesn't mirror SafetyCheckResult's exact
-    # shape - this project never reads flagged_patterns/reason back out
-    # today, so a loose double is a legitimate simplification, not a gap.
-    eval_config = get_config().evaluation
-    if eval_config.safety.enabled:
-        for result in stage1_results:
-            # Mutation-testing note (2026-08-13): `.get("response", "")`'s
-            # default is unreachable dead code, not a real gap - every dict
-            # in stage1_results is built at line 201 with a "response" key
-            # unconditionally present, so mutating the default value
-            # ("", None, "XXXX") or dropping it survives mutmut but never
-            # changes actual behavior. Verified by direct execution (mutmut
-            # run, 3 survivors on this line, traced by hand).
-            safety_check = check_response_safety(result.get("response", ""))
-            result["safety_check"] = {
-                "passed": getattr(safety_check, "passed", getattr(safety_check, "safe", True)),
-                "reason": getattr(safety_check, "reason", None),
-                "flagged_patterns": getattr(safety_check, "flagged_patterns", []),
-            }
-
-    # docs/specs/grounding-annotation-enforcement-contract.md, Contract 2:
-    # a Stage 1 response with zero grounding tags must never pass through
-    # silently - collected here so it can be both surfaced in metadata
-    # (pipeline_runner.py's debug_log) and threaded into Stage 3 so the
-    # chairman actually weighs it during synthesis, not just logged for a
-    # human who might not read it.
-    # Mutation-testing note (2026-08-14): `.get("response", "")`'s default is
-    # unreachable dead code here too, same invariant as the safety-gate loop
-    # above - stage1_results is the identical list built at line ~330 with a
-    # "response" key unconditionally present. Verified by direct execution
-    # (scoped mutmut run, 3 survivors on this line, traced by hand).
-    ungrounded_models = [
-        r["model"] for r in stage1_results if not has_grounding_annotations(r.get("response", ""))
-    ]
-
-    if num_responses == 0:
-        return (
-            [],
-            [],
-            {"model": "error", "response": "All models failed to respond. Please try again."},
-            {"usage": total_usage},
+        # Stage 1: bypasses stage1_collect_responses (no timeout override there)
+        # and calls query_models_resilient directly (retry-with-backoff +
+        # backup-model substitution, docs/specs/debate-resilience-contract.md),
+        # reproducing query_models_parallel's aggregation on top of its result.
+        messages = [{"role": "user", "content": build_stage1_prompt(user_query)}]
+        resilience_config = _load_debate_resilience_config()
+        stage1_deadline = (
+            time.monotonic() + overall_wall_clock_seconds * stage1_deadline_fraction
+            if overall_wall_clock_seconds is not None
+            else None
         )
-
-    # Mutation-testing note (2026-08-13): `None` vs `""` here is a true
-    # equivalent mutant - the only later reads of degraded_mode are a
-    # truthiness check (`if degraded_mode:`, below) and an equality check
-    # against the literal "two_models", and None/"" are both falsy and both
-    # != "two_models", so num_responses >= 3 (the only path where this
-    # initial value survives unreassigned) behaves identically either way.
-    # Verified by direct execution (mutmut run, 1 survivor, traced by hand).
-    degraded_mode = None
-    stage2_results: List[Dict[str, Any]]
-    stage2_substitutions: List[SubstitutionEvent] = []
-    stage2_shortfall_warning: Optional[str] = None
-    # Stage 3 chairman anonymization (docs/specs/stage3-chairman-
-    # anonymization-contract.md) must anonymize the SAME text Stage 2
-    # reviewers see, not stage1_results' raw draft text - Stage 1.5's
-    # style_normalize pass exists specifically to scrub stylistic
-    # fingerprinting (docs/upstream-deltas.md), and a label swap over
-    # still-fingerprinted prose isn't real anonymization. Single-model mode
-    # never runs Stage 1.5 at all (no peer review to protect against), so
-    # there is nothing to normalize - stage1_results is the only text that
-    # ever existed for that one draft.
-    stage1_for_stage3: List[Dict[str, Any]]
-    if num_responses == 1:
-        degraded_mode = "single_model"
-        stage2_results = []
-        stage1_for_stage3 = stage1_results
-        label_to_model = {"Response A": {"model": stage1_results[0]["model"], "display_index": 0}}
-        aggregate_rankings = [
-            {
-                "model": stage1_results[0]["model"],
-                "rank": 1,
-                "average_score": None,
-                "average_position": None,
-                "vote_count": 0,
-                "note": "Single model - no peer review",
-            }
-        ]
-    else:
-        if num_responses == 2:
-            degraded_mode = "two_models"
-        responses_for_review, stage1_5_usage = await stage1_5_normalize_styles(stage1_results)
-        stage1_for_stage3 = responses_for_review
-        total_usage["stage1_5"] = stage1_5_usage
-
-        # Stage 2: retry-with-backoff + backup-model substitution, same
-        # `query_models_resilient` engine as Stage 1/3
-        # (docs/specs/stage2-3-debate-resilience-contract.md, Contract A).
-        # `stage1_used_backups` excludes any backup already spent on a
-        # Stage 1 slot from Stage 2's own backup pool - AC3's cross-stage
-        # exclusivity requirement - `query_models_resilient` itself only
-        # guards against reuse *within* one call, not across stages.
-        stage2_ranking_prompt, label_to_model = _build_stage2_real_ranking_prompt(
-            user_query, responses_for_review
-        )
-        stage1_used_backups = {s.backup_model for s in resilient_result.substitutions}
-        stage2_effective_backups = [
-            m for m in resilience_config.backup_models if m not in stage1_used_backups
-        ]
-        stage2_resilient_result = await query_models_resilient(
+        resilient_result = await query_models_resilient(
             primary_models=_get_council_models(),
-            backup_models=stage2_effective_backups,
-            messages=[{"role": "user", "content": stage2_ranking_prompt}],
-            timeout=stage2_timeout,
-            query_fn=query_model_with_status,
+            backup_models=resilience_config.backup_models,
+            messages=messages,
+            timeout=stage1_timeout,
+            query_fn=_stage1_query_fn,
             retry_policy=resilience_config.retry_policy,
             minimum_council_size=resilience_config.minimum_council_size,
+            deadline=stage1_deadline,
         )
-        stage2_results = []
-        stage2_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        for reviewer_model, response in stage2_resilient_result.responses.items():
-            full_text = response.get("content", "")
-            stage2_results.append(
-                {
-                    "model": reviewer_model,
-                    "ranking": full_text,
-                    "parsed_ranking": parse_ranking_from_text(full_text),
+        responses = resilient_result.responses
+
+        stage1_results: List[Dict[str, Any]] = []
+        for model, response in responses.items():
+            stage1_results.append({"model": model, "response": response.get("content", "")})
+            usage = response.get("usage", {})
+            total_usage["stage1"]["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            total_usage["stage1"]["completion_tokens"] += usage.get("completion_tokens", 0)
+            total_usage["stage1"]["total_tokens"] += usage.get("total_tokens", 0)
+            _add_cost_to_usage(total_usage["stage1"], usage, model=model)
+
+        num_responses = len(stage1_results)
+
+        # ADR-016 safety gate - config-driven, matches run_full_council's own
+        # `if eval_config.safety.enabled:` gating (AC14). getattr fallbacks
+        # tolerate a test double that doesn't mirror SafetyCheckResult's exact
+        # shape - this project never reads flagged_patterns/reason back out
+        # today, so a loose double is a legitimate simplification, not a gap.
+        eval_config = get_config().evaluation
+        if eval_config.safety.enabled:
+            for result in stage1_results:
+                # Mutation-testing note (2026-08-13): `.get("response", "")`'s
+                # default is unreachable dead code, not a real gap - every dict
+                # in stage1_results is built at line 201 with a "response" key
+                # unconditionally present, so mutating the default value
+                # ("", None, "XXXX") or dropping it survives mutmut but never
+                # changes actual behavior. Verified by direct execution (mutmut
+                # run, 3 survivors on this line, traced by hand).
+                safety_check = check_response_safety(result.get("response", ""))
+                result["safety_check"] = {
+                    "passed": getattr(safety_check, "passed", getattr(safety_check, "safe", True)),
+                    "reason": getattr(safety_check, "reason", None),
+                    "flagged_patterns": getattr(safety_check, "flagged_patterns", []),
                 }
-            )
-            # Keyed by each reviewer's single winning attempt (primary or
-            # the one successful backup), never every retry - already
-            # "final successful attempt only" usage accounting.
-            response_usage = response.get("usage", {})
-            stage2_usage["prompt_tokens"] += response_usage.get("prompt_tokens", 0)
-            stage2_usage["completion_tokens"] += response_usage.get("completion_tokens", 0)
-            stage2_usage["total_tokens"] += response_usage.get("total_tokens", 0)
-            _add_cost_to_usage(stage2_usage, response_usage, model=reviewer_model)
-        total_usage["stage2"] = stage2_usage
-        stage2_substitutions = stage2_resilient_result.substitutions
-        stage2_shortfall_warning = stage2_resilient_result.shortfall_warning
-        aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-        if degraded_mode == "two_models":
-            for r in aggregate_rankings:
-                r["note"] = "Two-model council - rankings based on single vote"
 
-    stage3_query = user_query
-    if verified_facts:
-        stage3_query += f"\n\n{_build_facts_section(verified_facts)}"
-    if ungrounded_models:
-        stage3_query += (
-            "\n\n--- BEGIN GROUNDING COMPLIANCE NOTE ---\n"
-            "The following model(s) did not include any grounding tags in "
-            "their Stage 1 draft, despite being instructed to tag every "
-            f"substantive claim: {', '.join(ungrounded_models)}. Weigh this "
-            "explicitly when synthesizing - an unlabeled draft's claims "
-            "cannot be distinguished from fabricated ones.\n"
-            "--- END GROUNDING COMPLIANCE NOTE ---"
-        )
-
-    # Stage 3 identity anonymization (docs/specs/stage3-chairman-
-    # anonymization-contract.md) - computed once, outside the retry closure,
-    # since it's a pure function of stage1_for_stage3/stage2_results/
-    # aggregate_rankings/label_to_model, all fixed by this point and
-    # identical across every retry attempt. Closes the Stage 3 chairman
-    # identity leak (docs/upstream-deltas.md, "Stage 3 chairman identity
-    # leak" entry, 2026-08-14): the chairman's OWN prompt only ever sees
-    # the same Response-label vocabulary Stage 2 peer review already uses,
-    # never a real model slug - real identity is restored only in the
-    # human-facing synthesis text below, never in what the chairman reads.
-    # Deliberately `stage1_for_stage3` (style-normalized when Stage 1.5 ran,
-    # raw only in single-model mode where Stage 1.5 never runs), NOT the raw
-    # `stage1_results` - a label swap over still-fingerprinted prose is not
-    # real anonymization, since Stage 1.5's own job is scrubbing the
-    # stylistic signal a model could otherwise use to infer identity even
-    # with the "Model: X" tag gone (docs/upstream-deltas.md, "Stage 3
-    # chairman identity leak" entry's 2026-08-14 follow-up).
-    # Mutation-testing note (2026-08-14): passing `stage1_for_stage3` here is
-    # a true equivalent mutant (a scoped mutmut run against this call site
-    # survives with it swapped for `None`) - `_build_stage3_identity_map`
-    # never reads its own `stage1_results` parameter, since every Stage 1
-    # drafter's label is already fully recoverable from `label_to_model`
-    # (itself derived from stage1_results one step earlier, by Stage 2's own
-    # `_build_stage2_real_ranking_prompt`). The parameter is kept in the
-    # signature for contract-shape symmetry with `_anonymize_for_stage3`
-    # (which DOES need this argument's content), not because this function
-    # uses it. Verified by direct execution, traced by hand.
-    stage3_model_to_label = _build_stage3_identity_map(
-        stage1_for_stage3, stage2_results, label_to_model
-    )
-    # Same style-normalization extended to Stage 2 reviewer commentary
-    # (docs/upstream-deltas.md, "Known residual limitation" entry,
-    # 2026-08-14 fix) - a reviewer's own critique prose is as much an
-    # identity-adjacent signal as a drafter's, and was left un-normalized
-    # even after stage1_for_stage3 closed the same gap for drafts. Real
-    # extra cost (folds into total_usage["stage2_normalize"], summed into
-    # metadata["usage"]["total"]["cost_usd"] like every other bucket) -
-    # zero when stage2_results is empty (single-model degraded mode).
-    stage2_for_stage3, stage2_normalize_usage = await _normalize_stage2_for_stage3(
-        stage2_results
-    )
-    total_usage["stage2_normalize"] = stage2_normalize_usage
-    stage3_anon_stage1, stage3_anon_stage2, stage3_anon_rankings = _anonymize_for_stage3(
-        stage1_for_stage3, stage2_for_stage3, aggregate_rankings, stage3_model_to_label
-    )
-
-    # Stage 3: retry-with-backoff on the chairman model only, no substitution
-    # (docs/specs/stage2-3-debate-resilience-contract.md, Contract B).
-    # `stage3_synthesize_final` itself already uses the status-preserving
-    # `query_model_with_status` internally and never raises on a chairman
-    # failure - it returns a response dict carrying "error_status"/
-    # "error_detail" instead (confirmed by direct source read of
-    # `llm_council.council_stages.stage3_synthesize_final`, 2026-08-14).
-    # `_stage3_query_fn` re-runs the full (cheap, local) prompt build + real
-    # query on every attempt and translates that into the status-dict shape
-    # `_synthesize_resilient` expects, so a transient failure gets retried
-    # instead of silently becoming the user-visible final answer. The
-    # verdict returned by `stage3_synthesize_final` is not carried through
-    # `_stage3_query_fn` - `_verdict_result` was already an unused,
-    # underscore-prefixed discard in the pre-wiring code (VerdictType.
-    # SYNTHESIS never populates it - only BINARY/TIE_BREAKER do), so
-    # threading it through here would be dead plumbing with no observable
-    # effect, not a real capability.
-    async def _stage3_query_fn(_model: str, _prompt: str, timeout: float) -> Dict[str, Any]:
-        result, usage, _verdict = await stage3_synthesize_final(
-            stage3_query,
-            stage3_anon_stage1,
-            stage3_anon_stage2,
-            aggregate_rankings=stage3_anon_rankings,
-            verdict_type=VerdictType.SYNTHESIS,
-            timeout=timeout,
-        )
-        # Mutation-testing note (2026-08-14): the "error_detail" key/value
-        # is a true equivalent mutant right now - `_synthesize_resilient`
-        # only ever reads `response.get("status")` (never "error_detail"),
-        # and `ChairmanUnreachableError` only carries `last_status`, not the
-        # detail string. Kept anyway (not stripped) because it documents the
-        # real shape `stage3_synthesize_final` returns and is one obvious
-        # follow-up wire-up (surfacing it in a `logger.warning` per attempt,
-        # matching this file's existing ADR-046 fallback-logging pattern) if
-        # per-attempt failure detail is ever wanted for debugging - a
-        # deliberate, harmless no-op today, not an oversight. Verified by
-        # direct execution (scoped mutmut run, 5 survivors on this line,
-        # traced by hand).
-        if "error_status" in result:
-            return {"status": result["error_status"], "error_detail": result.get("error_detail")}
-        # Real chairman identity (result["model"]) is untouched - it comes
-        # from stage3_synthesize_final's own `_get_chairman_model()` read,
-        # never from stage3_anon_stage1/stage2/rankings' contents. Only the
-        # response TEXT can contain an echoed "Response X" label (e.g. the
-        # debate-mode "Position A - Held by: Response C" framing) - resolved
-        # back to the real model name here, once, before this becomes the
-        # human-facing synthesis.
-        # Mutation-testing note (2026-08-14): `.get("response", "")`'s
-        # default is unreachable dead code, same invariant as the other
-        # `.get("response", ...)` call sites already documented in this
-        # function - by this point `"error_status" in result` is False, and
-        # `stage3_synthesize_final`'s only other return shape (success, both
-        # the chairman-disabled short-circuit and the real-query path)
-        # always includes a `"response"` key. Verified by direct execution
+        # docs/specs/grounding-annotation-enforcement-contract.md, Contract 2:
+        # a Stage 1 response with zero grounding tags must never pass through
+        # silently - collected here so it can be both surfaced in metadata
+        # (pipeline_runner.py's debug_log) and threaded into Stage 3 so the
+        # chairman actually weighs it during synthesis, not just logged for a
+        # human who might not read it.
+        # Mutation-testing note (2026-08-14): `.get("response", "")`'s default is
+        # unreachable dead code here too, same invariant as the safety-gate loop
+        # above - stage1_results is the identical list built at line ~330 with a
+        # "response" key unconditionally present. Verified by direct execution
         # (scoped mutmut run, 3 survivors on this line, traced by hand).
-        result = {
-            **result,
-            "response": _resolve_response_labels(
-                result.get("response", ""), stage3_model_to_label
-            ),
-        }
-        return {"status": "ok", "result": result, "usage": usage}
-
-    # ChairmanUnreachableError is deliberately left uncaught here - it
-    # propagates to pipeline_runner.py's existing broad `except Exception`
-    # around this call, which already records a "failed" PipelineResult
-    # with debug_log (confirmed by direct read of pipeline_runner.py's call
-    # site, 2026-08-14) - a loud, non-silent failure using infrastructure
-    # that already exists, per AC8's explicit "never a silent fallback"
-    # requirement.
-    # Mutation-testing note: `_synthesize_resilient`'s first positional arg
-    # (`stage3_query`) is a true equivalent mutant here - `_stage3_query_fn`
-    # above never reads its own `_prompt` parameter (it closes over
-    # `stage3_query` directly instead, since the real prompt-building lives
-    # inside `stage3_synthesize_final`), so this value only matters for
-    # Stage 1's `query_models_resilient` shape-compatibility, not for actual
-    # behavior here. Verified by direct execution, traced by hand.
-    stage3_response, stage3_usage, _chairman_degraded = await _synthesize_resilient(
-        stage3_query,
-        _get_chairman_model(),
-        stage3_timeout,
-        resilience_config.retry_policy,
-        _stage3_query_fn,
-    )
-    stage3_result = stage3_response["result"]
-    # Mutation-testing note (2026-08-14): `None` vs `""` here is a true
-    # equivalent mutant - `_verdict_result` is the unused, underscore-
-    # prefixed discard already documented above (never read anywhere in this
-    # module after assignment), so no test can observe its value regardless
-    # of what it's set to. Verified by direct execution (scoped mutmut run,
-    # 1 survivor, traced by hand).
-    _verdict_result = None
-    total_usage["stage3"] = stage3_usage
-
-    usage_summary = _build_usage_summary(total_usage)
-    emit_usage_metrics(usage_summary)
-
-    metadata: Dict[str, Any] = {
-        "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings,
-        "usage": usage_summary,
-    }
-    if degraded_mode:
-        metadata["degraded_mode"] = degraded_mode
-    if ungrounded_models:
-        metadata["ungrounded_models"] = ungrounded_models
-    # Stage 1 + Stage 2 substitutions/shortfalls merged into one flat view -
-    # a human reading metadata shouldn't have to know which stage a dropout
-    # happened in to notice it happened at all.
-    all_substitutions = list(resilient_result.substitutions) + list(stage2_substitutions)
-    if all_substitutions:
-        metadata["substitutions"] = [asdict(s) for s in all_substitutions]
-    shortfall_warnings = [
-        w for w in (resilient_result.shortfall_warning, stage2_shortfall_warning) if w is not None
-    ]
-    if shortfall_warnings:
-        metadata["shortfall_warning"] = " | ".join(shortfall_warnings)
-
-    # Mutation-testing note (2026-08-13): `len(stage1_results) > 0` vs
-    # `>= 0` is a true equivalent mutant here - the `if num_responses == 0:
-    # return (...)` early-return above (and stage1_results is never
-    # mutated afterward) already guarantees len(stage1_results) > 0 at this
-    # point, so `> 0` is always True regardless of the operator. Likewise
-    # `r.get("response", "")`'s default is unreachable dead code for the
-    # same reason as the safety-gate loop above - "response" is always
-    # present. Verified by direct execution (mutmut run, 4 survivors on
-    # these two lines, traced by hand).
-    if should_include_quality_metrics() and len(stage1_results) > 0:
-        stage1_dict = {r["model"]: {"content": r.get("response", "")} for r in stage1_results}
-        rankings_tuples = [
-            (r["model"], r.get("average_position", r.get("borda_score", 0.0)))
-            for r in aggregate_rankings
+        ungrounded_models = [
+            r["model"] for r in stage1_results if not has_grounding_annotations(r.get("response", ""))
         ]
-        quality_metrics = calculate_quality_metrics(
-            stage1_responses=stage1_dict,
-            stage2_rankings=stage2_results,
-            stage3_synthesis=stage3_result,
-            aggregate_rankings=rankings_tuples,
-            label_to_model=label_to_model,
-        )
-        metadata["quality_metrics"] = quality_metrics.to_dict()
 
-    return stage1_results, stage2_results, stage3_result, metadata
+        if num_responses == 0:
+            return (
+                [],
+                [],
+                {"model": "error", "response": "All models failed to respond. Please try again."},
+                {"usage": total_usage},
+            )
+
+        # Mutation-testing note (2026-08-13): `None` vs `""` here is a true
+        # equivalent mutant - the only later reads of degraded_mode are a
+        # truthiness check (`if degraded_mode:`, below) and an equality check
+        # against the literal "two_models", and None/"" are both falsy and both
+        # != "two_models", so num_responses >= 3 (the only path where this
+        # initial value survives unreassigned) behaves identically either way.
+        # Verified by direct execution (mutmut run, 1 survivor, traced by hand).
+        degraded_mode = None
+        stage2_results: List[Dict[str, Any]]
+        stage2_substitutions: List[SubstitutionEvent] = []
+        stage2_shortfall_warning: Optional[str] = None
+        # Stage 3 chairman anonymization (docs/specs/stage3-chairman-
+        # anonymization-contract.md) must anonymize the SAME text Stage 2
+        # reviewers see, not stage1_results' raw draft text - Stage 1.5's
+        # style_normalize pass exists specifically to scrub stylistic
+        # fingerprinting (docs/upstream-deltas.md), and a label swap over
+        # still-fingerprinted prose isn't real anonymization. Single-model mode
+        # never runs Stage 1.5 at all (no peer review to protect against), so
+        # there is nothing to normalize - stage1_results is the only text that
+        # ever existed for that one draft.
+        stage1_for_stage3: List[Dict[str, Any]]
+        if num_responses == 1:
+            degraded_mode = "single_model"
+            stage2_results = []
+            stage1_for_stage3 = stage1_results
+            label_to_model = {"Response A": {"model": stage1_results[0]["model"], "display_index": 0}}
+            aggregate_rankings = [
+                {
+                    "model": stage1_results[0]["model"],
+                    "rank": 1,
+                    "average_score": None,
+                    "average_position": None,
+                    "vote_count": 0,
+                    "note": "Single model - no peer review",
+                }
+            ]
+        else:
+            if num_responses == 2:
+                degraded_mode = "two_models"
+            responses_for_review, stage1_5_usage = await stage1_5_normalize_styles(stage1_results)
+            stage1_for_stage3 = responses_for_review
+            total_usage["stage1_5"] = stage1_5_usage
+
+            # Stage 2: retry-with-backoff + backup-model substitution, same
+            # `query_models_resilient` engine as Stage 1/3
+            # (docs/specs/stage2-3-debate-resilience-contract.md, Contract A).
+            # `stage1_used_backups` excludes any backup already spent on a
+            # Stage 1 slot from Stage 2's own backup pool - AC3's cross-stage
+            # exclusivity requirement - `query_models_resilient` itself only
+            # guards against reuse *within* one call, not across stages.
+            stage2_ranking_prompt, label_to_model = _build_stage2_real_ranking_prompt(
+                user_query, responses_for_review
+            )
+            stage1_used_backups = {s.backup_model for s in resilient_result.substitutions}
+            stage2_effective_backups = [
+                m for m in resilience_config.backup_models if m not in stage1_used_backups
+            ]
+            stage2_resilient_result = await query_models_resilient(
+                primary_models=_get_council_models(),
+                backup_models=stage2_effective_backups,
+                messages=[{"role": "user", "content": stage2_ranking_prompt}],
+                timeout=stage2_timeout,
+                query_fn=query_model_with_status,
+                retry_policy=resilience_config.retry_policy,
+                minimum_council_size=resilience_config.minimum_council_size,
+            )
+            stage2_results = []
+            stage2_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            for reviewer_model, response in stage2_resilient_result.responses.items():
+                full_text = response.get("content", "")
+                stage2_results.append(
+                    {
+                        "model": reviewer_model,
+                        "ranking": full_text,
+                        "parsed_ranking": parse_ranking_from_text(full_text),
+                    }
+                )
+                # Keyed by each reviewer's single winning attempt (primary or
+                # the one successful backup), never every retry - already
+                # "final successful attempt only" usage accounting.
+                response_usage = response.get("usage", {})
+                stage2_usage["prompt_tokens"] += response_usage.get("prompt_tokens", 0)
+                stage2_usage["completion_tokens"] += response_usage.get("completion_tokens", 0)
+                stage2_usage["total_tokens"] += response_usage.get("total_tokens", 0)
+                _add_cost_to_usage(stage2_usage, response_usage, model=reviewer_model)
+            total_usage["stage2"] = stage2_usage
+            stage2_substitutions = stage2_resilient_result.substitutions
+            stage2_shortfall_warning = stage2_resilient_result.shortfall_warning
+            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+            if degraded_mode == "two_models":
+                for r in aggregate_rankings:
+                    r["note"] = "Two-model council - rankings based on single vote"
+
+        stage3_query = user_query
+        if verified_facts:
+            stage3_query += f"\n\n{_build_facts_section(verified_facts)}"
+        if ungrounded_models:
+            stage3_query += (
+                "\n\n--- BEGIN GROUNDING COMPLIANCE NOTE ---\n"
+                "The following model(s) did not include any grounding tags in "
+                "their Stage 1 draft, despite being instructed to tag every "
+                f"substantive claim: {', '.join(ungrounded_models)}. Weigh this "
+                "explicitly when synthesizing - an unlabeled draft's claims "
+                "cannot be distinguished from fabricated ones.\n"
+                "--- END GROUNDING COMPLIANCE NOTE ---"
+            )
+
+        # Stage 3 identity anonymization (docs/specs/stage3-chairman-
+        # anonymization-contract.md) - computed once, outside the retry closure,
+        # since it's a pure function of stage1_for_stage3/stage2_results/
+        # aggregate_rankings/label_to_model, all fixed by this point and
+        # identical across every retry attempt. Closes the Stage 3 chairman
+        # identity leak (docs/upstream-deltas.md, "Stage 3 chairman identity
+        # leak" entry, 2026-08-14): the chairman's OWN prompt only ever sees
+        # the same Response-label vocabulary Stage 2 peer review already uses,
+        # never a real model slug - real identity is restored only in the
+        # human-facing synthesis text below, never in what the chairman reads.
+        # Deliberately `stage1_for_stage3` (style-normalized when Stage 1.5 ran,
+        # raw only in single-model mode where Stage 1.5 never runs), NOT the raw
+        # `stage1_results` - a label swap over still-fingerprinted prose is not
+        # real anonymization, since Stage 1.5's own job is scrubbing the
+        # stylistic signal a model could otherwise use to infer identity even
+        # with the "Model: X" tag gone (docs/upstream-deltas.md, "Stage 3
+        # chairman identity leak" entry's 2026-08-14 follow-up).
+        # Mutation-testing note (2026-08-14): passing `stage1_for_stage3` here is
+        # a true equivalent mutant (a scoped mutmut run against this call site
+        # survives with it swapped for `None`) - `_build_stage3_identity_map`
+        # never reads its own `stage1_results` parameter, since every Stage 1
+        # drafter's label is already fully recoverable from `label_to_model`
+        # (itself derived from stage1_results one step earlier, by Stage 2's own
+        # `_build_stage2_real_ranking_prompt`). The parameter is kept in the
+        # signature for contract-shape symmetry with `_anonymize_for_stage3`
+        # (which DOES need this argument's content), not because this function
+        # uses it. Verified by direct execution, traced by hand.
+        stage3_model_to_label = _build_stage3_identity_map(
+            stage1_for_stage3, stage2_results, label_to_model
+        )
+        # Same style-normalization extended to Stage 2 reviewer commentary
+        # (docs/upstream-deltas.md, "Known residual limitation" entry,
+        # 2026-08-14 fix) - a reviewer's own critique prose is as much an
+        # identity-adjacent signal as a drafter's, and was left un-normalized
+        # even after stage1_for_stage3 closed the same gap for drafts. Real
+        # extra cost (folds into total_usage["stage2_normalize"], summed into
+        # metadata["usage"]["total"]["cost_usd"] like every other bucket) -
+        # zero when stage2_results is empty (single-model degraded mode).
+        stage2_for_stage3, stage2_normalize_usage = await _normalize_stage2_for_stage3(
+            stage2_results
+        )
+        total_usage["stage2_normalize"] = stage2_normalize_usage
+        stage3_anon_stage1, stage3_anon_stage2, stage3_anon_rankings = _anonymize_for_stage3(
+            stage1_for_stage3, stage2_for_stage3, aggregate_rankings, stage3_model_to_label
+        )
+
+        # Stage 3: retry-with-backoff on the chairman model only, no substitution
+        # (docs/specs/stage2-3-debate-resilience-contract.md, Contract B).
+        # `stage3_synthesize_final` itself already uses the status-preserving
+        # `query_model_with_status` internally and never raises on a chairman
+        # failure - it returns a response dict carrying "error_status"/
+        # "error_detail" instead (confirmed by direct source read of
+        # `llm_council.council_stages.stage3_synthesize_final`, 2026-08-14).
+        # `_stage3_query_fn` re-runs the full (cheap, local) prompt build + real
+        # query on every attempt and translates that into the status-dict shape
+        # `_synthesize_resilient` expects, so a transient failure gets retried
+        # instead of silently becoming the user-visible final answer. The
+        # verdict returned by `stage3_synthesize_final` is not carried through
+        # `_stage3_query_fn` - `_verdict_result` was already an unused,
+        # underscore-prefixed discard in the pre-wiring code (VerdictType.
+        # SYNTHESIS never populates it - only BINARY/TIE_BREAKER do), so
+        # threading it through here would be dead plumbing with no observable
+        # effect, not a real capability.
+        async def _stage3_query_fn(_model: str, _prompt: str, timeout: float) -> Dict[str, Any]:
+            result, usage, _verdict = await stage3_synthesize_final(
+                stage3_query,
+                stage3_anon_stage1,
+                stage3_anon_stage2,
+                aggregate_rankings=stage3_anon_rankings,
+                verdict_type=VerdictType.SYNTHESIS,
+                timeout=timeout,
+            )
+            # Mutation-testing note (2026-08-14): the "error_detail" key/value
+            # is a true equivalent mutant right now - `_synthesize_resilient`
+            # only ever reads `response.get("status")` (never "error_detail"),
+            # and `ChairmanUnreachableError` only carries `last_status`, not the
+            # detail string. Kept anyway (not stripped) because it documents the
+            # real shape `stage3_synthesize_final` returns and is one obvious
+            # follow-up wire-up (surfacing it in a `logger.warning` per attempt,
+            # matching this file's existing ADR-046 fallback-logging pattern) if
+            # per-attempt failure detail is ever wanted for debugging - a
+            # deliberate, harmless no-op today, not an oversight. Verified by
+            # direct execution (scoped mutmut run, 5 survivors on this line,
+            # traced by hand).
+            if "error_status" in result:
+                return {"status": result["error_status"], "error_detail": result.get("error_detail")}
+            # Real chairman identity (result["model"]) is untouched - it comes
+            # from stage3_synthesize_final's own `_get_chairman_model()` read,
+            # never from stage3_anon_stage1/stage2/rankings' contents. Only the
+            # response TEXT can contain an echoed "Response X" label (e.g. the
+            # debate-mode "Position A - Held by: Response C" framing) - resolved
+            # back to the real model name here, once, before this becomes the
+            # human-facing synthesis.
+            # Mutation-testing note (2026-08-14): `.get("response", "")`'s
+            # default is unreachable dead code, same invariant as the other
+            # `.get("response", ...)` call sites already documented in this
+            # function - by this point `"error_status" in result` is False, and
+            # `stage3_synthesize_final`'s only other return shape (success, both
+            # the chairman-disabled short-circuit and the real-query path)
+            # always includes a `"response"` key. Verified by direct execution
+            # (scoped mutmut run, 3 survivors on this line, traced by hand).
+            result = {
+                **result,
+                "response": _resolve_response_labels(
+                    result.get("response", ""), stage3_model_to_label
+                ),
+            }
+            return {"status": "ok", "result": result, "usage": usage}
+
+        # ChairmanUnreachableError is deliberately left uncaught here - it
+        # propagates to pipeline_runner.py's existing broad `except Exception`
+        # around this call, which already records a "failed" PipelineResult
+        # with debug_log (confirmed by direct read of pipeline_runner.py's call
+        # site, 2026-08-14) - a loud, non-silent failure using infrastructure
+        # that already exists, per AC8's explicit "never a silent fallback"
+        # requirement.
+        # Mutation-testing note: `_synthesize_resilient`'s first positional arg
+        # (`stage3_query`) is a true equivalent mutant here - `_stage3_query_fn`
+        # above never reads its own `_prompt` parameter (it closes over
+        # `stage3_query` directly instead, since the real prompt-building lives
+        # inside `stage3_synthesize_final`), so this value only matters for
+        # Stage 1's `query_models_resilient` shape-compatibility, not for actual
+        # behavior here. Verified by direct execution, traced by hand.
+        stage3_response, stage3_usage, _chairman_degraded = await _synthesize_resilient(
+            stage3_query,
+            _get_chairman_model(),
+            stage3_timeout,
+            resilience_config.retry_policy,
+            _stage3_query_fn,
+        )
+        stage3_result = stage3_response["result"]
+        # Mutation-testing note (2026-08-14): `None` vs `""` here is a true
+        # equivalent mutant - `_verdict_result` is the unused, underscore-
+        # prefixed discard already documented above (never read anywhere in this
+        # module after assignment), so no test can observe its value regardless
+        # of what it's set to. Verified by direct execution (scoped mutmut run,
+        # 1 survivor, traced by hand).
+        _verdict_result = None
+        total_usage["stage3"] = stage3_usage
+
+        usage_summary = _build_usage_summary(total_usage)
+        emit_usage_metrics(usage_summary)
+
+        metadata: Dict[str, Any] = {
+            "label_to_model": label_to_model,
+            "aggregate_rankings": aggregate_rankings,
+            "usage": usage_summary,
+        }
+        if degraded_mode:
+            metadata["degraded_mode"] = degraded_mode
+        if ungrounded_models:
+            metadata["ungrounded_models"] = ungrounded_models
+        # Stage 1 + Stage 2 substitutions/shortfalls merged into one flat view -
+        # a human reading metadata shouldn't have to know which stage a dropout
+        # happened in to notice it happened at all.
+        all_substitutions = list(resilient_result.substitutions) + list(stage2_substitutions)
+        if all_substitutions:
+            metadata["substitutions"] = [asdict(s) for s in all_substitutions]
+        shortfall_warnings = [
+            w for w in (resilient_result.shortfall_warning, stage2_shortfall_warning) if w is not None
+        ]
+        if shortfall_warnings:
+            metadata["shortfall_warning"] = " | ".join(shortfall_warnings)
+
+        # Mutation-testing note (2026-08-13): `len(stage1_results) > 0` vs
+        # `>= 0` is a true equivalent mutant here - the `if num_responses == 0:
+        # return (...)` early-return above (and stage1_results is never
+        # mutated afterward) already guarantees len(stage1_results) > 0 at this
+        # point, so `> 0` is always True regardless of the operator. Likewise
+        # `r.get("response", "")`'s default is unreachable dead code for the
+        # same reason as the safety-gate loop above - "response" is always
+        # present. Verified by direct execution (mutmut run, 4 survivors on
+        # these two lines, traced by hand).
+        if should_include_quality_metrics() and len(stage1_results) > 0:
+            stage1_dict = {r["model"]: {"content": r.get("response", "")} for r in stage1_results}
+            rankings_tuples = [
+                (r["model"], r.get("average_position", r.get("borda_score", 0.0)))
+                for r in aggregate_rankings
+            ]
+            quality_metrics = calculate_quality_metrics(
+                stage1_responses=stage1_dict,
+                stage2_rankings=stage2_results,
+                stage3_synthesis=stage3_result,
+                aggregate_rankings=rankings_tuples,
+                label_to_model=label_to_model,
+            )
+            metadata["quality_metrics"] = quality_metrics.to_dict()
+
+        return stage1_results, stage2_results, stage3_result, metadata
+    finally:
+        clear_cache_context()
