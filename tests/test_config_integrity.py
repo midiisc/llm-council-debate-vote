@@ -72,11 +72,15 @@ def test_council_size_is_exactly_four():
     assert len(config.council.models) == 4
 
 
-def test_glm_5_2_present_but_never_chairman():
+def test_kimi_k3_present_but_never_chairman():
+    # 2026-08-17: 4th seat swapped z-ai/glm-5.2 -> moonshotai/kimi-k3 per
+    # docs/specs/core-seat-swap-contract.md (GLM-5.2 never graduated its
+    # 20-session ADR-029 bar). Same chairman-exclusion rule carries over
+    # unchanged -- it was never GLM-specific, it's "the 4th seat."
     config = _load_real_config()
-    glm_models = [m for m in config.council.models if m.startswith("z-ai/glm")]
-    assert len(glm_models) == 1
-    assert config.council.chairman not in glm_models
+    kimi_models = [m for m in config.council.models if m.startswith("moonshotai/kimi")]
+    assert len(kimi_models) == 1
+    assert config.council.chairman not in kimi_models
 
 
 def test_rubric_scoring_is_enabled():

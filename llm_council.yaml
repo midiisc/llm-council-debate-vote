@@ -46,10 +46,29 @@ council:
                                    # Tokens summary is required before the
                                    # next real-decision use. See
                                    # upstream-deltas.md.
-      - z-ai/glm-5.2  # 2026-08-12: was z-ai/glm-5.2-20260616 - that dated slug
-                        # is DEAD on live OpenRouter (confirmed via direct
-                        # /api/v1/models fetch, only z-ai/glm-5.2 and
-                        # z-ai/glm-5.2:batch exist now). See upstream-deltas.md.
+      - moonshotai/kimi-k3  # 2026-08-17: was z-ai/glm-5.2 - SWAPPED, not added
+                              # (council stays at 4 seats; a unanimous
+                              # 2026-08-13 4-judge panel rejected any 5th seat,
+                              # see agent-model-reasoning-config.md §1). GLM-5.2
+                              # was never graduated (3 logged sessions total,
+                              # scorecard.jsonl, nowhere near the 20-session
+                              # ADR-029 bar) - swapped for the panel's own
+                              # diversity-optimized pick (2026-08-12 finding:
+                              # Kimi K3 is the only backup-pool candidate with a
+                              # genuinely different post-training methodology -
+                              # self-critique rubric-reward, no RLHF - vs. this
+                              # roster's other 3 RLHF-based seats; Qwen3.8-Max
+                              # and Grok-4.6 were both rejected for this specific
+                              # swap as diversity-redundant or diversity-negative
+                              # respectively). Blocking precondition (Kimi K3 was
+                              # upstream capacity-constrained at Moonshot,
+                              # confirmed live 2026-08-17) cleared same day by a
+                              # real, cheap, user-confirmed API test call
+                              # (status=ok, latency_ms=5612, cost=$0.001) - one
+                              # low-load sample, not a load test; this dry run is
+                              # the real signal on 4-model concurrent behavior.
+                              # Full reasoning: docs/specs/core-seat-swap-
+                              # contract.md, docs/upstream-deltas.md.
     chairman: anthropic/claude-opus-4.8
     chairman_disabled: false
     synthesis_mode: debate
@@ -123,7 +142,7 @@ council:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
           - google/gemini-3.7-flash
-          - z-ai/glm-5.2
+          - moonshotai/kimi-k3
       quick:
         models:
           - anthropic/claude-opus-4.8
@@ -138,7 +157,7 @@ council:
           - anthropic/claude-opus-4.8
           - openai/gpt-5.5
           - google/gemini-3.7-flash
-          - z-ai/glm-5.2
+          - moonshotai/kimi-k3
   evaluation:
     rubric:
       enabled: true  # 5-dimension scoring (accuracy/relevance/completeness/
@@ -175,44 +194,40 @@ council:
 # all from labs distinct from the 4 configured council.models above
 # (Anthropic/OpenAI/Google/Zhipu) - see upstream-deltas.md for sourcing.
 #
-# Ordering below (2026-08-12) is the ranked output of a grounded 3-lens
-# judge panel run specifically to answer "which candidate maximizes
-# training-corpus/methodology diversity against the existing 4 seats" -
-# see upstream-deltas.md, "4th-seat diversity panel" entry, and
-# pipeline-architecture-spec.md §2 for the full reasoning. The panel's
-# diversity-optimized top pick was Kimi K3, not GLM-5.2's incumbent seat -
-# user explicitly chose to KEEP GLM-5.2 as the primary seat (lower risk,
-# already-verified debate/critique quality) and use the panel's own
-# backup ranking instead of its primary-seat recommendation. First-unused
-# entry wins a slot (see docs/specs/debate-resilience-contract.md) - order
-# here is deliberate, not incidental.
+# Ordering below (originally 2026-08-12, RE-RANKED 2026-08-17) is the
+# ranked output of a grounded 3-lens judge panel run specifically to answer
+# "which candidate maximizes training-corpus/methodology diversity against
+# the existing 4 seats" - see upstream-deltas.md, "4th-seat diversity
+# panel" entry, and pipeline-architecture-spec.md §2 for the full
+# reasoning. The panel's diversity-optimized top pick was Kimi K3, not
+# GLM-5.2's then-incumbent seat - user originally chose to KEEP GLM-5.2 as
+# the primary seat (lower risk, already-verified debate/critique quality)
+# and use the panel's own backup ranking instead of its primary-seat
+# recommendation. SUPERSEDED 2026-08-17: GLM-5.2 never graduated its
+# 20-session ADR-029 bar (3 logged sessions total) - swapped out for
+# Kimi K3 per docs/specs/core-seat-swap-contract.md. Kimi K3 removed from
+# this backup list (now a core seat, no longer eligible to backstop
+# itself); Qwen3.8-Max and Grok-4.6 keep their relative order, renumbered.
+# First-unused entry wins a slot (see docs/specs/debate-resilience-
+# contract.md) - order here is deliberate, not incidental.
 debate_resilience:
   backup_models:
-    - moonshotai/kimi-k3           # Moonshot AI - panel's diversity-optimized
-                                     # top pick (self-critique-reward alignment,
-                                     # not RLHF - most methodologically distinct
-                                     # of all 4 candidates). 2026-08-13: the
-                                     # dated slug moonshotai/kimi-k3-20260715
-                                     # pinned here since 2026-08-12 went DEAD on
-                                     # live OpenRouter (confirmed via direct
-                                     # /api/v1/models fetch) - same drift pattern
-                                     # already seen with z-ai/glm-5.2-20260616.
-                                     # Undated moonshotai/kimi-k3 is the live
-                                     # replacement, same 1,048,576 context. See
-                                     # upstream-deltas.md, "Kimi K3 slug drift"
-                                     # entry, for the full grounding.
-    - qwen/qwen3.8-max               # Alibaba - live-confirmed 2026-08-12, 1M
-                                       # context. Methodologically redundant
-                                       # with GLM (both RLVR-primary + late
-                                       # human-preference stage) - ranked 2nd
-                                       # backup, not 1st, for that reason.
-    - x-ai/grok-4.6                   # xAI - live-confirmed 2026-08-12, 500K
-                                        # context. Ranked LAST on the diversity
+    - qwen/qwen3.8-max                # Alibaba - live-confirmed 2026-08-12, 1M
+                                        # context. Rank 1 as of 2026-08-17 (was
+                                        # rank 2) after Kimi K3 promoted to a
+                                        # core seat. Methodologically redundant
+                                        # with GLM-5.2's former role (both
+                                        # RLVR-primary + late human-preference
+                                        # stage) - a resilience pick, not a
+                                        # diversity one.
+    - x-ai/grok-4.6                    # xAI - live-confirmed 2026-08-12, 500K
+                                        # context. Rank 2 as of 2026-08-17 (was
+                                        # rank 3). Ranked LAST on the diversity
                                         # axis this pool exists for - its own
                                         # model cards describe an RLHF/RLAIF
                                         # pipeline built on Anthropic's own
                                         # Petri audit tooling, structurally the
-                                        # same paradigm as the 3 incumbent
+                                        # same paradigm as the other core
                                         # seats. Kept as pure-resilience
                                         # fallback, not a diversity pick.
   minimum_council_size: 4  # below this, proceed degraded but never silently -

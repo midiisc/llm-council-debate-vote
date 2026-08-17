@@ -291,16 +291,18 @@ def test_ac18_loads_real_schema_debate_resilience_block_exactly(tmp_path):
 
 
 def test_ac18_loads_this_projects_actual_llm_council_yaml_debate_resilience_block():
-    # Cross-check against the real, checked-in config (re-confirmed live,
-    # 2026-08-13, to carry a debate_resilience: block with backup_models
-    # ["moonshotai/kimi-k3", "qwen/qwen3.8-max", "x-ai/grok-4.6"]
-    # (updated from the original 2-model pool after this test was first
-    # authored -- moonshotai/kimi-k3-20260715 was added as the panel's
+    # Cross-check against the real, checked-in config. Originally
+    # backup_models was ["moonshotai/kimi-k3", "qwen/qwen3.8-max",
+    # "x-ai/grok-4.6"] (moonshotai/kimi-k3-20260715 added as the panel's
     # diversity-optimized top backup pick, then 2026-08-13 the dated slug
     # went dead on live OpenRouter and was fixed to the undated
     # moonshotai/kimi-k3 -- see docs/upstream-deltas.md, "Kimi K3 slug
-    # drift" entry), minimum_council_size: 4, retry.max_attempts: 3,
-    # retry.backoff_seconds: [5, 15],
+    # drift" entry). SUPERSEDED 2026-08-17: Kimi K3 promoted to a core
+    # seat (docs/specs/core-seat-swap-contract.md, replacing the
+    # never-graduated z-ai/glm-5.2) and removed from this backup list --
+    # it's no longer eligible to backstop itself. Now
+    # ["qwen/qwen3.8-max", "x-ai/grok-4.6"], minimum_council_size: 4,
+    # retry.max_attempts: 3, retry.backoff_seconds: [5, 15],
     # retry.retryable_statuses: [timeout, rate_limited, error].
     real_config_path = REPO_ROOT / "llm_council.yaml"
     assert real_config_path.exists(), "expected llm_council.yaml at repo root"
@@ -308,7 +310,6 @@ def test_ac18_loads_this_projects_actual_llm_council_yaml_debate_resilience_bloc
     result = ca._load_debate_resilience_config(config_path=real_config_path)
 
     assert result.backup_models == [
-        "moonshotai/kimi-k3",
         "qwen/qwen3.8-max",
         "x-ai/grok-4.6",
     ]

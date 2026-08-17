@@ -1592,3 +1592,194 @@ produced) — condensed here for the ledger:
     expectation for Contract 5 (materially higher than AC 10 states) should
     be read alongside the contract before relying on its documented
     ceiling for a real budget decision.
+
+## Model-provider operational finding (not an `llm-council-core` delta — tracked here per Pillar 1)
+
+**2026-08-17: Kimi K3 (`moonshotai/kimi-k3`, `debate_resilience.backup_models[0]`)
+is upstream capacity-constrained at Moonshot AI — this is the root cause of
+observed timeouts, not a billing/credits gate.** User reported Kimi
+"always timing out" and asked whether it sits behind some paid-extra-credits
+tier unavailable through OpenRouter. Live-verified, 2026-08-17:
+
+- **Pricing** (OpenRouter model page, fetched live): $2.60-3.00/M input,
+  $13-15/M output — 4-8x pricier than the other four configured models
+  (e.g. `google/gemini-3.7-flash` at $0.375/$1.875/M), but drawn from the
+  same paid OpenRouter balance as every other non-`:free` model in
+  `council.models`/`debate_resilience.backup_models`. **No credits/tier
+  distinction exists** — OpenRouter has no promotional-credit pool for
+  anyone; `:free`-suffixed slugs are the only $0 option and Kimi K3 has no
+  reliable `:free` variant on OpenRouter. The "paid extra credits" framing
+  was not confirmed; premise rejected.
+- **Actual cause**: OpenRouter shows a live capacity warning on Kimi K3 —
+  "limited capacity, slower responses" — with intermittent 429s as
+  Moonshot's own upstream serving capacity is exhausted. This is a
+  provider-side constraint at Moonshot, not an OpenRouter billing/routing
+  issue and not fixable by this repo's gateway config
+  ([[project_openrouter_gateway_architecture]]: OpenRouter-only, no direct
+  Moonshot key possible without breaking that architecture).
+- **Why this repo sees it as "timing out"**: `debate_resilience.retry`
+  (`max_attempts: 3`, backoff `[5, 15]s`, `retryable_statuses: [timeout,
+  rate_limited, error]`) retries a capacity-constrained model into the
+  per-model timeout window, so repeated 429/slow-response cycles surface
+  as a timeout rather than a distinguishable rate-limit message.
+- **No config change made.** Kimi K3 staying `backup_models[0]` rather
+  than a core `council.models` seat (2026-08-12 decision, see "4th-seat
+  diversity panel" entry above) is the correct mitigation already in
+  place — this finding is a reason to *not* promote it further (e.g. to
+  chairman) until Moonshot's capacity stabilizes, not a reason to change
+  current wiring. Re-check capacity live before any future decision to
+  promote Kimi K3 out of the backup pool — this is a point-in-time
+  provider-capacity snapshot, not a permanent property of the model.
+- Sources: [Kimi K3 — API Pricing & Benchmarks, OpenRouter](https://openrouter.ai/moonshotai/kimi-k3),
+  [Is Kimi K3 Free? No Free API Key, Price, Speed & Alternatives](https://freellm.net/blog/is-kimi-k3-free-api-pricing-openrouter-alternatives),
+  [OpenRouter Free Tier 2026 — Free Models, Credits & Limits](https://pricepertoken.com/endpoints/openrouter/free),
+  all fetched live 2026-08-17.
+
+**2026-08-17, same-day re-check (per `docs/specs/core-seat-swap-contract.md`'s
+blocking precondition): inconclusive, block NOT lifted.** Re-fetched
+`openrouter.ai/moonshotai/kimi-k3` directly. No capacity-warning banner
+appeared in the fetched content this time, but the fetch itself flagged its
+own limitation — "uptime and performance sections are present but lack
+specific percentage data" — consistent with those indicators being
+client-side-rendered (JS) and invisible to a static HTML fetch, a known
+failure mode already documented for this exact catalog
+(`docs/agent-model-reasoning-config.md`'s grounding header: WebFetch
+"caught truncating/misreporting entries on this same catalog earlier in
+this session"). A same-day WebSearch aggregation still surfaced the
+capacity-constrained finding ("OpenRouter shows a capacity warning for
+Kimi K3... limited capacity, slower responses, and non-cheap pricing"),
+though this could be recycled content from the same source used in the
+first 2026-08-17 check rather than independent fresh confirmation — not
+treated as strong evidence either way. No live API test call was made (no
+OpenRouter key available in this session, and spending real money here
+would bypass the Pillar 6 gate this very check exists to inform).
+**Net: neither signal is reliable enough to call this cleared.** The
+core-seat-swap-contract.md blocking precondition remains unsatisfied.
+Re-check again with a tool that can read rendered capacity/uptime data
+(or an actual low-stakes API call once one is warranted) before the next
+attempt to clear this gate — do not treat two inconclusive WebFetch passes
+as equivalent to one clean "no warning" result.
+
+**2026-08-17, same-day live API test call — real request, `status: ok`.**
+User confirmed a real, cheap, low-stakes call before it ran (Pillar 6
+posture, even below the formal Real-Money-gate threshold). Direct
+execution of `llm_council.openrouter.query_model_with_status(model=
+"moonshotai/kimi-k3", messages=[...], timeout=60.0)` from this repo's own
+installed package (not a mocked/fake path) — the same function the live
+pipeline itself calls. Result: `status: "ok"`, `latency_ms: 5612`, no 429,
+no timeout, `usage.cost: $0.001005`. This is direct-execution evidence
+(this project's own gold-standard verification method, used throughout
+this ledger for confirming/refuting prior findings) that Kimi K3 is
+reachable and responsive at this moment, contradicting "always timing
+out" as a currently-true blanket statement. **Caveat, stated plainly: one
+low-load sample, not a sustained/concurrent load test** — a real pipeline
+run queries 4 models together with longer debate prompts, which this
+single short call didn't reproduce; intermittent capacity issues under
+real load are not ruled out by one clean call. Net assessment:
+`docs/specs/core-seat-swap-contract.md`'s blocking precondition is
+reasonably satisfied by this direct-execution result (stronger evidence
+than the inconclusive marketing-page re-checks above), but the residual
+under-load-behavior caveat should be carried into that spec's Rollout
+step rather than treated as fully closed.
+
+**2026-08-17: core-seat swap applied and dry-run verified — GLM-5.2 →
+Kimi K3, config + code + docs, Rollout complete.** User approved
+proceeding after the reasoning-effort item resolved clean. Applied all 4
+`llm_council.yaml` locations (`council.models`,
+`tiers.pools.high/balanced/reasoning`, reordered
+`debate_resilience.backup_models`), plus a real code surface found while
+implementing (not in the original spec draft — Fix-on-Sight):
+`scripts/council_adapter.py::_STAGE1_REASONING_EFFORT` (now
+`"moonshotai/kimi-k3": "low"`) and the `_STAGE1_WEB_SEARCH_ENABLED_MODELS`
+exclusion comment. **Verified live**, matching GLM-5.2's own already-
+documented reason for exclusion: `moonshotai/kimi-k3`'s pricing block on
+live `/api/v1/models` has no `web_search` key (only `prompt`/`completion`/
+`input_cache_read`), identical gap to GLM-5.2 — same exclusion, re-checked
+rather than assumed to transfer. 4 pinned tests updated to match the new
+config/roster (not silenced — new correct values asserted, same pattern
+as the 2026-08-14 Stage 3 anonymization precedent): `test_config_
+integrity.py::test_glm_5_2_present_but_never_chairman` →
+`test_kimi_k3_present_but_never_chairman`,
+`test_council_adapter_resilient_stage1.py`'s AC18 real-config
+cross-check, and both `_STAGE1_REASONING_EFFORT`/
+`_STAGE1_WEB_SEARCH_ENABLED_MODELS` exact-contents tests. Full suite: 871
+passed.
+
+**Real-execution sanity check caught a live-vs-cached-config trap** (the
+same class of silent-failure this ledger already documents twice for
+`load_config()`): `mcp__llm-council__council_health_check` still reported
+`z-ai/glm-5.2` in its `models` list *after* the yaml edit — a stale,
+long-running MCP server process serving a config it read at startup, not
+a config-file bug. Direct execution of
+`llm_council.unified_config.create_tier_contract('reasoning')` (the
+actual function `consult_council()` resolves against, per this ledger's
+own prior finding) correctly returned `moonshotai/kimi-k3`. Lesson
+re-confirmed: never trust `council_health_check`'s flat model list alone
+to prove a config change took effect — same caveat as the original
+`load_config()` bugs, now hit a third time via a different mechanism
+(process staleness, not schema nesting). The MCP server was not
+restarted this session; this note exists so a future session doesn't
+mistake the still-stale health-check output for the swap having failed.
+
+**Pillar 6 Real-Money gate — two real dry runs, same low-stakes query
+used in prior 2026-08-13 dry runs** (`python -m scripts.pipeline_runner`,
+direct execution, not the possibly-stale MCP path): First attempt hit a
+self-inflicted `--max-wall-clock-seconds 300` ceiling (my own parameter
+choice, not a finding about Kimi — the package default is 1200s) after
+Stage 1 and Stage 2 both completed successfully with all 4 models
+responding (`debug_log`: "council returned 4 model response(s)",
+CSS=0.438); cost so far $0.515. **Second attempt, correct defaults:
+complete success.** `status: "complete"`, **total cost $0.6028**,
+CSS=0.685 (Stage 2.75 correctly skipped, above the 0.50 gate), Stage 3
+synthesis produced by the chairman (`anthropic/claude-opus-4.8`), no
+shortfall warning, no substitution event. Kimi K3 was ranked last by peer
+review on this specific query, but the chairman's synthesis explicitly
+validated its dissenting position ("I explicitly validate
+moonshotai/kimi-k3's dissent... pragmatically superior advice") and
+singled out its concrete technical contribution (a flat-vs-src-layout
+package-discovery risk check) as "the most actionable safety check
+offered anywhere" — real evidence the debate architecture's minority-
+report design intent functions correctly with this seat, not just that
+the seat is reachable. This closes the "one low-load sample, not a load
+test" caveat from the earlier capacity re-check: Stage 1 exercised all 4
+models concurrently, for real money, twice, with no failure attributable
+to Kimi K3 itself (only to my own wall-clock misconfiguration on the
+first attempt). Total real spend across this whole swap's verification
+(single ping test + both dry-run attempts): ~$1.12. Full transcripts:
+`council-runs/2026-08-17T06-47-34-kimi-k3-core-seat-swap-dryrun/` (failed,
+partial) and `council-runs/2026-08-17T06-53-20-kimi-k3-core-seat-swap-
+dryrun-2/` (complete) — both gitignored, local only.
+
+**Not yet committed to git** — all edits (yaml, code, tests, docs) sit in
+the working tree per this repo's "only commit when explicitly asked"
+norm. `docs/agent-model-reasoning-config.md` §1/§2 tables updated to match
+(also fixed an adjacent, unrelated pre-existing staleness found while
+editing: the Core 3 row still said "Gemini 3.6 Flash"/old pricing despite
+the 2026-08-16 swap to `gemini-3.7-flash` already being live in
+`llm_council.yaml` — corrected in the same edit).
+
+**2026-08-17: `moonshotai/kimi-k3` reasoning-effort grounding item
+resolved — live-verified, not guessed.** Direct `curl` of
+`https://openrouter.ai/api/v1/models` (raw JSON, grepped for this model's
+entry — same method `agent-model-reasoning-config.md`'s header note
+already establishes as authoritative for this endpoint, deliberately not
+WebFetch-summarized). Confirmed: `reasoning_effort` IS in the model's
+`supported_parameters`, and its `reasoning` block is `{"mandatory": false,
+"default_enabled": true, "supported_efforts": ["max", "high", "low"],
+"default_effort": "max"}`. **Real gap found**: unlike GLM-5.2's wiring
+(effort `"medium"`, `agent-model-reasoning-config.md` line 102), Kimi K3
+has no `"medium"` tier at all — only `max`/`high`/`low` — and its
+*default*, if the wiring leaves this parameter unset, is `"max"`: the
+most expensive and slowest tier, directly contradicting this project's
+deliberate cost-tier posture for a non-graduated 4th seat ("neither
+should be silently promoted to frontier-effort"). **Resolution for
+`core-seat-swap-contract.md`'s AC 6**: Contract 4's per-round table must
+explicitly set `"low"` for this seat (nearest available match to GLM's
+cost-conscious intent) rather than leaving it unset — an unset value here
+would silently and expensively default to `max`, the opposite of what
+was intended, the same class of silent-default failure already seen
+twice in this ledger (`load_config()`'s two bugs, the dead
+`normalizer_model` default). Not yet applied to
+`agent-model-reasoning-config.md`'s live roster table — that table still
+correctly describes the current, unswapped config; this entry is the
+grounding the swap will consume once applied.

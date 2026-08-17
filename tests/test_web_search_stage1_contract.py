@@ -686,7 +686,10 @@ def test_ac6_no_new_status_value_is_ever_introduced_for_any_outcome(monkeypatch)
 
 # ---------------------------------------------------------------------------
 # AC7 -- _STAGE1_WEB_SEARCH_ENABLED_MODELS constant: exact contents, and
-# z-ai/glm-5.2 is permanently excluded.
+# the 4th seat (moonshotai/kimi-k3 as of 2026-08-17, was z-ai/glm-5.2) is
+# permanently excluded -- both lack a native `web_search` price on live
+# OpenRouter /api/v1/models pricing, re-verified across the swap rather
+# than assumed. See docs/specs/core-seat-swap-contract.md.
 # ---------------------------------------------------------------------------
 
 
@@ -702,13 +705,13 @@ def test_ac7_stage1_web_search_enabled_models_is_a_set():
     assert isinstance(ca._STAGE1_WEB_SEARCH_ENABLED_MODELS, set)
 
 
-def test_ac7_glm_5_2_is_never_in_the_web_search_enabled_set():
-    assert "z-ai/glm-5.2" not in ca._STAGE1_WEB_SEARCH_ENABLED_MODELS
+def test_ac7_fourth_seat_is_never_in_the_web_search_enabled_set():
+    assert "moonshotai/kimi-k3" not in ca._STAGE1_WEB_SEARCH_ENABLED_MODELS
 
 
 # ---------------------------------------------------------------------------
 # AC8 -- _stage1_query_fn passes enable_web_search=True for exactly the 3
-# enabled models, False for glm-5.2 and any other/unmapped model.
+# enabled models, False for the 4th seat and any other/unmapped model.
 # ---------------------------------------------------------------------------
 
 
@@ -718,7 +721,7 @@ def test_ac7_glm_5_2_is_never_in_the_web_search_enabled_set():
         ("anthropic/claude-opus-4.8", True),
         ("openai/gpt-5.5", True),
         ("google/gemini-3.7-flash", True),
-        ("z-ai/glm-5.2", False),
+        ("moonshotai/kimi-k3", False),
     ],
 )
 def test_ac8_stage1_query_fn_passes_exact_enable_web_search_per_roster_model(

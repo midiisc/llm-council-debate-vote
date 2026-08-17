@@ -667,11 +667,17 @@ def test_stage1_reasoning_effort_map_exact_contents():
     # consensus), never "significant disagreement". See
     # docs/pipeline-architecture-spec.md's CSS interpretation reference and
     # docs/upstream-deltas.md's 2026-08-14 "CSS correction" entry.
+    # 2026-08-17: 4th seat swapped z-ai/glm-5.2 -> moonshotai/kimi-k3 per
+    # docs/specs/core-seat-swap-contract.md. "medium" doesn't carry over --
+    # live-verified Kimi K3 has no "medium" reasoning-effort tier
+    # (supported_efforts: ["max","high","low"]) -- "low" is the nearest
+    # cost-conscious match. See upstream-deltas.md's "reasoning-effort
+    # grounding item resolved" entry.
     assert ca._STAGE1_REASONING_EFFORT == {
         "anthropic/claude-opus-4.8": "high",
         "openai/gpt-5.5": "high",
         "google/gemini-3.7-flash": "medium",
-        "z-ai/glm-5.2": "medium",
+        "moonshotai/kimi-k3": "low",
     }
 
 
@@ -681,7 +687,7 @@ def test_stage1_reasoning_effort_map_exact_contents():
         ("anthropic/claude-opus-4.8", "high"),
         ("openai/gpt-5.5", "high"),
         ("google/gemini-3.7-flash", "medium"),
-        ("z-ai/glm-5.2", "medium"),
+        ("moonshotai/kimi-k3", "low"),
     ],
 )
 def test_stage1_query_fn_looks_up_exact_effort_per_mapped_model(monkeypatch, model, expected_effort):

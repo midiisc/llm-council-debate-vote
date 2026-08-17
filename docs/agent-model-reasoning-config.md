@@ -28,8 +28,8 @@ the daily precheck meant to catch this automatically.
 |---|---|---|---|---|---|---|
 | Core 1 (chairman) | Claude Opus 4.8 | `anthropic/claude-opus-4.8` | 1,000,000 | $5.00 / $25.00 | frontier | Stage 1 draft, Stage 2.75 revision, **Stage 3 synthesis (exclusive)** |
 | Core 2 | GPT-5.5 | `openai/gpt-5.5` | 1,050,000 | $5.00 / $30.00 | frontier | Stage 1 draft, Stage 2.75 revision, **Stage 3.75 critique (exclusive)** |
-| Core 3 | Gemini 3.6 Flash | `google/gemini-3.6-flash` | 1,048,576 | $1.50 / $7.50 | standard/cost-tier (deliberate — see §6) | Stage 1 draft, Stage 2.75 revision |
-| 4th seat (gated) | GLM-5.2 | `z-ai/glm-5.2` | 1,048,576 | $0.50 / $3.15 | frontier (RLVR-primary) | Stage 1 + Stage 2 only. Never chairman, never Stage 3.75 critic. Needs 20+ ADR-029 scorecard sessions to fully graduate. |
+| Core 3 | Gemini 3.7 Flash | `google/gemini-3.7-flash` | 1,048,576 | $0.375 / $1.875 | standard/cost-tier (deliberate — see §6) | Stage 1 draft, Stage 2.75 revision. **2026-08-16: swapped from 3.6-flash** — identical specs, half the price. |
+| 4th seat (gated) | Kimi K3 | `moonshotai/kimi-k3` | 1,048,576 | $3.00 / $15.00 (2.60/13 promo, live-fetched 2026-08-17) | frontier (self-critique rubric-reward, no RLHF) | Stage 1 + Stage 2 only. Never chairman, never Stage 3.75 critic. Fresh seat — 0 ADR-029 sessions, starts SHADOW. **2026-08-17: swapped from GLM-5.2**, which never cleared the 20-session graduation bar (3 logged sessions total). See `docs/specs/core-seat-swap-contract.md`. |
 
 *"Size" for these closed frontier models means published quality tier +
 price/context class, not parameter count — none of the 4 core labs disclose
@@ -51,11 +51,15 @@ exhausted or a terminal error) — never for a merely slow response. Mechanism:
 `docs/specs/debate-resilience-contract.md`, config: `llm_council.yaml`'s
 `debate_resilience.backup_models` (ordered list, first-unused wins).
 
+**2026-08-17: Kimi K3 removed from this pool** — promoted to the 4th core
+seat (replacing GLM-5.2), no longer eligible to backstop itself. Qwen3.8-Max
+and Grok-4.6 keep their relative order, renumbered 1/2. See
+`docs/specs/core-seat-swap-contract.md`.
+
 | Rank | Model | Slug | Context | Pricing (prompt/completion per M) | Why this rank |
 |---|---|---|---|---|---|
-| 1 | Kimi K3 | `moonshotai/kimi-k3` | 1,048,576 | $3.00 / $15.00 | Most methodologically distinct candidate (self-critique rubric-reward, no RLHF) — see diversity panel. **2026-08-13: the dated slug `moonshotai/kimi-k3-20260715` pinned since 2026-08-12 went dead on live OpenRouter; fixed to this undated slug, same drift class as GLM's earlier incident.** |
-| 2 | Qwen3.8-Max | `qwen/qwen3.8-max` | 1,000,000 | $2.00 / $6.00 | Solid capability, methodologically redundant with GLM (both RLVR-primary) |
-| 3 | Grok 4.6 | `x-ai/grok-4.6` | 500,000 | $2.00 / $6.00 | Last on the diversity axis this pool exists for; pure-resilience fallback |
+| 1 | Qwen3.8-Max | `qwen/qwen3.8-max` | 1,000,000 | $2.00 / $6.00 | Solid capability, methodologically redundant with GLM-5.2's former role (both RLVR-primary) — resilience pick, not a diversity one |
+| 2 | Grok 4.6 | `x-ai/grok-4.6` | 500,000 | $2.00 / $6.00 | Last on the diversity axis this pool exists for; pure-resilience fallback |
 
 **Not in the backup pool yet: Meta Muse Spark 1.2** — researched this session,
 real and live (`meta/muse-spark-1.2`, ctx 1,048,576, ~$1.25/$4.25 per M —

@@ -627,19 +627,34 @@ DEFAULT_STAGE1_DEADLINE_FRACTION = 0.5
 # opus-4.8/gpt-5.5 pending a direct content-quality comparison (not a CSS
 # proxy) - see docs/upstream-deltas.md's 2026-08-14 "Contract 4 dry-run"
 # and "CSS correction" entries for the full history and current status.
+# 2026-08-17: 4th seat swapped z-ai/glm-5.2 -> moonshotai/kimi-k3 per
+# docs/specs/core-seat-swap-contract.md (GLM-5.2 never graduated its
+# 20-session bar). "medium" doesn't carry over - live /api/v1/models fetch
+# confirmed Kimi K3's supported_efforts is ["max","high","low"], no
+# "medium" tier at all, default_effort="max" if left unset (the expensive,
+# slow default this project deliberately avoids for a non-graduated seat).
+# "low" is the nearest available match to GLM's cost-conscious intent -
+# see upstream-deltas.md, "reasoning-effort grounding item resolved".
 _STAGE1_REASONING_EFFORT: Dict[str, str] = {
     "anthropic/claude-opus-4.8": "high",
     "openai/gpt-5.5": "high",
     "google/gemini-3.7-flash": "medium",
-    "z-ai/glm-5.2": "medium",
+    "moonshotai/kimi-k3": "low",
 }
 
-# docs/specs/stage1-web-search-contract.md: the 3 of 4 roster models that
-# get OpenRouter's `openrouter:web_search` server tool during Stage 1's
-# independent-draft round. "z-ai/glm-5.2" must NEVER be added here - this
-# is a permanent exclusion, not a config knob (see the contract's
-# non-goals). A model not in this set (including any backup substitute
-# outside the primary roster) gets enable_web_search=False.
+# docs/specs/stage1-web-search-contract.md: only roster models with a
+# native `web_search` price on live OpenRouter `/api/v1/models` pricing
+# get the `openrouter:web_search` server tool during Stage 1's
+# independent-draft round - this is a per-model-capability exclusion, not
+# a config knob. z-ai/glm-5.2 (the 4th seat until 2026-08-17) had no
+# `web_search` pricing field at all. Its replacement, moonshotai/kimi-k3,
+# was live-checked the same session and has the identical gap (pricing
+# block: prompt/completion/input_cache_read only, no web_search key) - so
+# the 4th seat stays excluded from this set across the swap, same reason,
+# re-verified rather than assumed. Re-check this exclusion against live
+# pricing data again if the 4th seat ever changes hands again. A model not
+# in this set (including any backup substitute outside the primary
+# roster) gets enable_web_search=False.
 _STAGE1_WEB_SEARCH_ENABLED_MODELS: set = {
     "anthropic/claude-opus-4.8",
     "openai/gpt-5.5",
