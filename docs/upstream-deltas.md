@@ -6,9 +6,12 @@ by the Pillar 5 self-update check (every 2-3 days) and by any ad hoc grounding
 pass. Never edit `llm_council.yaml`/`.env`/scripts based on a claim that isn't
 recorded here or freshly re-verified.
 
-Last upstream check: **2026-08-09**. Checked against: PyPI `llm-council-core`
-v0.40.1, GitHub `amiable-dev/llm-council` @ `master` (README + ADR-010/-036/-044),
-live OpenRouter `/api/v1/models` catalog.
+Last upstream check: **2026-08-21**. Checked against: PyPI `llm-council-core`
+v0.42.0 (installed version — upgraded from v0.40.1 this pass, see the
+2026-08-21 entry near the end of this file), GitHub `amiable-dev/llm-council`
+issues #591/#592/#593, `amiable-dev/llm-council` @ `master` (README +
+ADR-010/-036/-044) as of 2026-08-09, live OpenRouter `/api/v1/models`
+catalog as of 2026-08-09.
 
 ## Open deltas (setup doc still says the old thing — needs a doc/config fix)
 
@@ -32,9 +35,9 @@ live OpenRouter `/api/v1/models` catalog.
 - OpenRouter 5.5% non-crypto fee, Requesty 5% markup + EU residency — confirmed against pricing pages.
 - Requesty BYOK removing the 5% markup — **not confirmed**, pricing page doesn't state this; treat as unverified, don't assume it in cost planning.
 
-| `load_config()` in `unified_config.py` (~line 1095) | Any `llm_council.yaml` following the doc's/README's nesting example | **Confirmed live bug in v0.40.1**: extracts the inner contents of the top-level `council:` key and passes them as `UnifiedConfig(**council_config)` kwargs directly, instead of re-nesting under `.council`. Since `UnifiedConfig` has no top-level `models`/`chairman`/`synthesis_mode`/etc. fields, they're silently dropped (pydantic default `extra="ignore"`) and the package's hardcoded defaults apply instead — **with no error, no warning, `ready: true`**. Only `gateways:` survives, because it happens to also be a real top-level `UnifiedConfig` field. First caught by actually running `council_health_check` and finding `deepseek/deepseek-v4-pro` in the model list despite never being configured. Workaround (verified working): wrap council-level fields in one EXTRA `council:` layer — see comment block at the top of `llm_council.yaml`. | Direct execution of `load_config()` against both the buggy and workaround YAML shapes, 2026-08-09 | **Fixed via workaround in `llm_council.yaml`. Reported upstream: [amiable-dev/llm-council#591](https://github.com/amiable-dev/llm-council/issues/591)** |
+| `load_config()` in `unified_config.py` (~line 1095) | Any `llm_council.yaml` following the doc's/README's nesting example | **Confirmed live bug in v0.40.1**: extracts the inner contents of the top-level `council:` key and passes them as `UnifiedConfig(**council_config)` kwargs directly, instead of re-nesting under `.council`. Since `UnifiedConfig` has no top-level `models`/`chairman`/`synthesis_mode`/etc. fields, they're silently dropped (pydantic default `extra="ignore"`) and the package's hardcoded defaults apply instead — **with no error, no warning, `ready: true`**. Only `gateways:` survives, because it happens to also be a real top-level `UnifiedConfig` field. First caught by actually running `council_health_check` and finding `deepseek/deepseek-v4-pro` in the model list despite never being configured. Workaround (verified working): wrap council-level fields in one EXTRA `council:` layer — see comment block at the top of `llm_council.yaml`. | Direct execution of `load_config()` against both the buggy and workaround YAML shapes, 2026-08-09 | **Bug 1 fixed upstream in v0.42.0** (PR amiable-dev/llm-council#605, commit `27c7089`) — both the envelope shape this repo's workaround uses AND the flat template shape now load correctly, and the maintainer confirmed the double-nested workaround "keeps working, so nothing breaks for you on upgrade." Re-verified directly, 2026-08-21: `get_config()` against this repo's real `llm_council.yaml` under installed v0.42.0 returns the correct 4-model roster, chairman, tiers, gateways, rubric config — no regression. See the 2026-08-21 entry near the end of this file. [amiable-dev/llm-council#591](https://github.com/amiable-dev/llm-council/issues/591) (closed)** |
 
-| `council.models` alone (no `tiers.pools`) | Assumed sufficient after fixing the first `load_config()` bug | **Confirmed live bug #2, more severe**: `council_health_check` reads the flat `council.models` list (correct), but a real `consult_council()` call resolves its model list via `TierContract.allowed_models` instead - `run_council_with_fallback` priority is "explicit models arg > tier_contract > default", and `consult_council` always passes a `tier_contract`. `TierContract.allowed_models` comes from `tiers.pools.<confidence>.models`, which pydantic's `TierConfig.ensure_default_pools()` silently auto-fills with the package's wrong defaults if left unset - no error, `council_health_check` still reports `ready:true` because it checks a completely different code path. A real query would have silently run the wrong 4 models (including `deepseek-v4-pro`) despite `council_health_check` looking correct. Fixed by populating `tiers.pools.high/quick/balanced/reasoning.models` explicitly (see comment block in `llm_council.yaml`). Verified via direct execution of `create_tier_contract('high')` from the project directory - `allowed_models` now matches our 4 configured models. | Direct execution tracing `run_council_with_fallback` -> `create_tier_contract` -> `_get_allowed_models` -> `_get_tier_model_pools`, 2026-08-09 | **Fixed in `llm_council.yaml`. Reported upstream alongside Bug 1: [amiable-dev/llm-council#591](https://github.com/amiable-dev/llm-council/issues/591)** |
+| `council.models` alone (no `tiers.pools`) | Assumed sufficient after fixing the first `load_config()` bug | **Confirmed live bug #2, more severe**: `council_health_check` reads the flat `council.models` list (correct), but a real `consult_council()` call resolves its model list via `TierContract.allowed_models` instead - `run_council_with_fallback` priority is "explicit models arg > tier_contract > default", and `consult_council` always passes a `tier_contract`. `TierContract.allowed_models` comes from `tiers.pools.<confidence>.models`, which pydantic's `TierConfig.ensure_default_pools()` silently auto-fills with the package's wrong defaults if left unset - no error, `council_health_check` still reports `ready:true` because it checks a completely different code path. A real query would have silently run the wrong 4 models (including `deepseek-v4-pro`) despite `council_health_check` looking correct. Fixed by populating `tiers.pools.high/quick/balanced/reasoning.models` explicitly (see comment block in `llm_council.yaml`). Verified via direct execution of `create_tier_contract('high')` from the project directory - `allowed_models` now matches our 4 configured models. | Direct execution tracing `run_council_with_fallback` -> `create_tier_contract` -> `_get_allowed_models` -> `_get_tier_model_pools`, 2026-08-09 | **Bug 2 also fixed upstream in v0.42.0**, folded into the health-check-honesty fix the maintainer flagged as the same design flaw as a separately-filed issue (#596: `council_health_check` reported `ready: true` throughout a chairman outage). v0.42.0 adds `council_health_check(tier=...)` (reports the tier-resolved models a real run would actually use, not `_get_council_models()`) and `council_health_check(deep=True)` (probes the configured chairman directly instead of a cheap lite-model ping). Both #591 and #596 closed 2026-08-20. This repo's own workaround (explicit `tiers.pools.*` in `llm_council.yaml`) is no longer strictly required to avoid the silent-disagreement failure mode, but was left in place — no reason to remove a correct, working, explicit config for a marginal simplification. [amiable-dev/llm-council#591](https://github.com/amiable-dev/llm-council/issues/591) (closed)** |
 | `TierContract.aggregator_model` | Looked like a second, unconfigured chairman-selection path (hardcoded `TIER_AGGREGATORS["high"] = "openai/gpt-5.4"`) | **Verified harmless / dead code** for our purposes: grepped every call site and the actual Stage 3 synthesis LLM call in `council_stages.py` uses `_get_chairman_model()` exclusively (reads `council.chairman`, correctly configured). `aggregator_model` is set on the `TierContract` dataclass but never read by the synthesis path - vestigial. No fix needed, but worth knowing it's there and wrong-looking if anyone greps for "gpt-5.4" in this codebase later. | Grepped all `aggregator_model` and `_get_chairman_model()` call sites in `council.py`/`council_stages.py`, 2026-08-09 | **No action needed - confirmed unused** |
 
 ## Security status (not an upstream delta — tracked here per Pillar 6)
@@ -1592,6 +1595,29 @@ produced) — condensed here for the ledger:
     expectation for Contract 5 (materially higher than AC 10 states) should
     be read alongside the contract before relying on its documented
     ceiling for a real budget decision.
+- 2026-08-21 — Checked replies on all 3 filed upstream issues (#591, #592,
+  #593) via `gh issue view --json` (live API, not WebFetch's lossy scrape).
+  All closed with substantive fixes/decisions. Diffed the installed 0.40.1
+  package against a scratch-venv 0.42.0 install file-by-file for every
+  module this repo's wrapper code imports from, confirmed no signature
+  drift on any call site, loaded this repo's real `llm_council.yaml`
+  through 0.42.0's `get_config()` before committing to the bump, then
+  upgraded `pyproject.toml`'s floor and resynced `.venv`/`uv.lock`; full
+  suite re-run before/after, identical 871/871. Also diffed the remaining
+  changed files (`bias_persistence.py`, `bias_audit.py`,
+  `bias_amplification.py`, `bias_aggregation.py`, `mcp_server.py`) against
+  the cached 0.40.1 wheel for anything else worth adopting, per the
+  standing instruction to treat "check upstream diffs for merit, not just
+  breakage" as routine practice going forward, not a one-off: found
+  `council_health_check`'s new `tier`/`deep` parameters materially change
+  what a no-args call reports for this repo's non-default `tiers.default:
+  reasoning` config (setup doc updated accordingly), and confirmed the
+  bias-module changes are relevant only to the not-yet-built bias-audit
+  follow-up feature (no current call sites, no local action needed beyond
+  building it against >=0.42.0 whenever it happens). See the full
+  2026-08-21 entry above for all details, and the still-open Stage 1.5
+  timeout finding (this session's "5th seat always times out" report,
+  root-caused but not yet fixed — needs its own spec before code).
 
 ## Model-provider operational finding (not an `llm-council-core` delta — tracked here per Pillar 1)
 
@@ -1783,3 +1809,224 @@ twice in this ledger (`load_config()`'s two bugs, the dead
 `agent-model-reasoning-config.md`'s live roster table — that table still
 correctly describes the current, unswapped config; this entry is the
 grounding the swap will consume once applied.
+
+## 2026-08-21: upstream replies to #591/#592/#593, package upgraded 0.40.1 -> 0.42.0, and the Stage 1.5 timeout root cause
+
+**Trigger:** this repo filed three issues upstream over 2026-08-11 through
+2026-08-16 (#591, #592, and #593 — the last one drafted in a *different*
+project's session, `docs/specs/upstream-issue-draft-gateway-layer-dead-code-2026-08-16.md`,
+consumed into this ledger now per that draft's own note). All three got
+substantive maintainer replies and are now closed. Verified via `gh issue
+view <n> -R amiable-dev/llm-council --json ...` (live GitHub API, not
+WebFetch's lossy HTML scrape, which truncated/omitted comments on a first
+pass), 2026-08-21.
+
+**#591 (config-load bugs) — both halves fixed, see the two corrected table
+rows above.** Bug 1 landed in PR #605 (commit `27c7089`); Bug 2 landed
+alongside #596's chairman-outage health-check fix. Both ship in v0.42.0.
+
+**#592 (rubric-dimension order) / #602 (response-order, split off from
+#592) — genuinely different outcomes, both closed:**
+- **Rubric-dimension order: fixed**, PR #606. New opt-in flag
+  `evaluation.rubric.randomize_dimension_order` (env `RUBRIC_RANDOMIZE_DIMENSION_ORDER`),
+  default `false`, proven byte-identical to the pre-fix prompt when off.
+  Randomizes *per council call*, not per reviewer (stage 2 builds one
+  prompt shared by every reviewer). **Does not apply to this repo's real
+  pipeline runs as shipped** — `scripts/council_adapter.py`'s
+  `_build_stage2_real_ranking_prompt` is this repo's own local
+  reimplementation of Stage 2 prompt-building (the same "wrap the real
+  function" pattern the 2026-08-12 timeout-fix architecture uses
+  elsewhere), not a call into the package's `stage2_collect_rankings` —
+  so flipping the yaml flag alone would have zero effect on a real run.
+  Porting `council_stages.py`'s new `_rubric_dimension_order`/
+  `_render_rubric_criteria`/`_render_rubric_score_keys` helpers (or
+  equivalent logic) into our local function is a real, separate follow-up
+  if this repo wants the benefit — not yet done, not yet spec'd.
+- **Response-order (per-reviewer) randomization: declined, not deferred**,
+  per ADR-017 Amendment 1 (#612), closing #602 as superseded. This
+  directly answers this repo's own standing open question (Second Expert
+  Panel round, 2026-08-12: *"fixing upstream issue #592 ... is a
+  correctness prerequisite for trusting whether CSS-gating or
+  agreement-routing measurements mean anything at all"*) — not by fixing
+  it, but by upstream concluding, with real evidence, that per-reviewer
+  randomization would not help at this repo's exact scale (4-5 reviewers)
+  and could actively hurt: *"At N=4-5 reviewers this decorrelates
+  position bias into noise rather than cancelling it."* This repo's
+  council runs exactly 4 core reviewers per round — the same regime the
+  ADR's own math addresses. Treat the standing open question as resolved
+  by upstream's analysis (their scale argument applies to us directly),
+  not as still blocked pending an upstream fix that isn't coming. Three
+  checkable reopen conditions on file if this changes: a tier pool
+  reaching >=10 reviewers, persistent positive `position_alignment` in
+  post-#611 data, or using council output for published benchmarking —
+  none apply to this repo today.
+- **Real bug found chasing #602, #611 (now merged, ships in v0.42.0):**
+  `BiasMetricRecord.position` held the reviewer's *ranking* index, not
+  the display position, inverting `position_alignment` (`+0.993`/
+  `amplification_suspect: True` before the fix vs. `-0.993`/`False`
+  after, on the maintainer's own repro session). Bias record schema
+  bumped `1.1.0` -> `1.2.0`; pre-1.2.0 records are skipped in
+  position/amplification analyses. **No local action needed** — this
+  repo's own "bias-audit follow-up" feature (Second Expert Panel round,
+  2026-08-12, "pure read of already-computed Stage 2 data") was flagged
+  as a candidate but never built, so there's no shipped local code
+  carrying the inverted-signal bug forward. Just means: if/when that
+  follow-up spec gets written, build it against >=0.42.0 (now the
+  installed floor, see below), never against the pre-#611 semantics.
+
+**#593 (gateway dead code) — closed as duplicate of #524 (broader,
+still open upstream).** `_use_gateway_layer()` really is permanently
+`False` for every config, confirmed independently by the maintainer. Two
+findings from their reply change the picture from the original draft:
+(1) #524 additionally covers a second, competing model-name resolver on
+the direct path and a misleading "COMPLETE" ADR-023 status; (2) **the
+originally suggested fix (`enabled: bool = True` default) would have been
+actively harmful** — the gateway return path currently drops
+`usage.cost` (breaks cost accounting), `cached_tokens`/`cache_write_tokens`/
+`route`/`session_id` (breaks cache telemetry/attribution), and hardcodes
+`reasoning_details: None`; default-enabling the layer would silently
+regress three subsystems this repo depends on (Contract 5 prompt-cache
+session affinity, cost tracking). **Zero action needed on this repo's
+side**: this repo's own architecture is OpenRouter-only by design
+([[project-openrouter-gateway-architecture]] in memory — no direct
+provider keys configured), so `USE_GATEWAY_LAYER` being permanently
+`False` matches this repo's actual usage exactly, not a gap. The inert
+`gateways.fallback.enabled: true` block already in `llm_council.yaml`
+stays inert either way; leaving it as-is (it does no harm and documents
+intent for if/when #524 ever ships) rather than removing it. Watch #524
+in future Pillar-5 checks in case it ships gateway parity fixes.
+
+**Package upgraded 0.40.1 -> 0.42.0** (`pyproject.toml`'s floor raised
+`>=0.39.0` -> `>=0.42.0`; `uv.lock`/`.venv` resynced). Also pulls `mcp`
+1.26.0 -> 1.29.0, satisfying v0.41.1's raised MCP dependency floor
+(`>=1.28.1,<2`, three GHSA advisories in the MCP Python SDK — this repo's
+stdio transport was unaffected by the specific advisories, but `[mcp]`
+previously could still resolve a vulnerable version). **Verified before
+committing to the bump, not assumed:**
+1. Diffed the installed 0.40.1 package against a scratch-venv install of
+   0.42.0 (`uv venv` in the scratchpad dir, never touching the live
+   `.venv` until verified) for every file `scripts/council_adapter.py`
+   imports from (`council_stages.py`, `openrouter.py`,
+   `unified_config.py`, `gateway_adapter` chain). No signature changes on
+   any function this repo's wrapper calls
+   (`stage1_5_normalize_styles`, `stage3_synthesize_final`, `query_model`,
+   `query_model_with_status`, `_get_council_models`, `_get_chairman_model`,
+   `_get_style_normalization`, `_get_normalizer_model`, `CacheContext`,
+   `set_cache_context`) — the 2026-08-12 Second Expert Panel's "unanimous
+   requirement" (pin the wrapper to exact package source, add a drift
+   check before ever upgrading) is satisfied for this bump.
+2. Loaded this repo's real `llm_council.yaml` through 0.42.0's
+   `get_config()` from the repo root (matching real runtime resolution,
+   not a synthetic path) — correct 4-model roster, chairman, `tiers`,
+   `gateways`, `evaluation.rubric` all present and correct. One new,
+   benign, non-fatal `logger.warning` fires: "Unknown top-level
+   configuration key(s) ignored: debate_resilience" — expected and
+   harmless. `debate_resilience` is this repo's own deliberately
+   package-invisible custom section (see the comment block above it in
+   `llm_council.yaml` — read only by `scripts/resilient_query.py`'s own
+   `yaml.safe_load`, never meant to be seen by `load_config()`); v0.42.0
+   just started logging what v0.40.1 silently ignored. Confirmed
+   `logger.warning`, not `print()` — does not touch stdout, so it cannot
+   corrupt the stdio MCP transport's JSON-RPC framing.
+3. Full test suite, before and after, same command, same machine: **871
+   passed on 0.40.1 (baseline) -> 871 passed on 0.42.0 (post-upgrade),
+   identical count, zero new failures, zero new warnings beyond the
+   pre-existing `datetime.utcnow()` deprecation noise already on file.**
+4. Cleaned up the scratch venv after verification (Clean Lifecycle
+   Invariant — no orphaned artifacts).
+
+**Not committed to git yet** — `pyproject.toml`, `uv.lock`, and this
+ledger sit in the working tree per this repo's "only commit when
+explicitly asked" norm.
+
+**Real, previously-undocumented bug found while investigating a separate
+"5th seat always times out" report (this session) — the actual root
+cause, confirmed by direct source read, NOT fixed by the version bump
+above:** `stage1_5_normalize_styles` (`council_stages.py`) — the Stage
+1.5 style-normalization pass, a real LLM call distinct from the 4 core
+council seats (it queries `normalizer_model`,
+`google/gemini-3.7-flash`, once per Stage-1 response) — calls
+`query_model(_get_normalizer_model(), messages, timeout=60.0)` with a
+**hardcoded 60-second timeout**, sequentially, once per response, inside
+a plain `for` loop (not `asyncio.gather`'d, not parallel). This function
+is unchanged between 0.40.1 and 0.42.0 (confirmed by diff — not touched
+by any of the fixes above). Three compounding problems, all confirmed by
+direct source read + signature introspection against the installed
+package:
+1. **60s is the exact value already proven too tight** for this
+   pipeline's real workloads — it's the same ceiling the 2026-08-12
+   "Timeout architecture fix" entry (above) found insufficient for
+   `balanced`/`high` tier queries against these same 4 frontier models,
+   which is why `tiers.default` was moved to `reasoning` (300s/model) and
+   why `run_council_with_timeouts` exposes configurable
+   `stage1_timeout`/`stage2_timeout`/`stage3_timeout` (default 300s each)
+   for the 4 core-seat calls. The Stage 1.5 normalizer call has no such
+   override — it's hardcoded in the installed package, not exposed as a
+   parameter, and **not threaded through** by
+   `run_council_with_timeouts`'s call at `council_adapter.py:854`
+   (`await stage1_5_normalize_styles(stage1_results)`, no timeout kwarg
+   to pass even if one existed).
+2. **On timeout, `query_model` returns `None`, not an exception**
+   (confirmed: `query_model` catches everything inside
+   `query_model_with_status` and returns `{"status": ..., "error": ...}`;
+   `query_model` itself returns `None` unless `status == "ok"`). Stage
+   1.5's loop treats `None` as "normalization failed for this one
+   response" and silently falls back to the original, un-normalized
+   text — no exception propagates, no warning surfaces anywhere in this
+   repo's `debug_log`/output. This is a real, previously-undetected
+   silent-degradation gap in this repo's own no-silent-failure posture
+   (the same pattern already fixed once for `has_grounding_annotations()`
+   and the Stage 2/3 shortfall warnings) — Stage 1.5 exists specifically
+   to scrub stylistic fingerprinting ahead of Stage 3's chairman
+   anonymization (see the comment block in `council_adapter.py` around
+   line 827), so a silent per-response fallback to un-normalized,
+   fingerprinted text is a real, unflagged anonymization-quality
+   regression on every run that hits it, not just a performance
+   inconvenience.
+3. **Sequential, not parallel**: 4 Stage-1 responses each get their own
+   up-to-60s `query_model` call, one after another, inside one `for`
+   loop. Worst case (all 4 time out) is up to ~240s serialized just for
+   Stage 1.5, on top of Stage 1/2/3's own budgets — a real contributor to
+   "the whole run feels like it always times out" even though no single
+   piece raises.
+
+Root cause matches the user's "the 5th seat always times out" report:
+Stage 1.5's normalizer call is a real, distinct LLM call slot in every
+multi-model run — separate from the 4 core council seats (`council stays
+at exactly 4 core seats`, unanimous, `agent-model-reasoning-config.md`
+§1) — that has never been covered by any of this repo's prior
+timeout-architecture work, and silently degrades rather than crashing,
+which is exactly why it reads as "always" happening with no visible
+error. **Fixed same session, via Pillar-2 spec + `blind-tdv` workflow**:
+`docs/specs/stage1-5-normalizer-timeout-contract.md` (spec) →
+`_normalize_responses_with_timeout` (new local wrapper in
+`council_adapter.py`, mirroring the existing `_stage1_query_fn`/timeout-fix
+pattern) → isolated `ws-verifier` authored 22 tests from the contract alone
+→ isolated `ws-builder` implemented blind in a worktree → verified RED
+(19 failed with genuine `AttributeError`/`TypeError` — feature-missing, not
+typos — via `git stash push` reverting the implementation) → GREEN
+(`git stash pop`, `git status` matched pre-stash tree exactly) → scoped
+mutation gate on the 7 touched functions: 1641 raw mutants, 74 raw
+survivors, mapped back to absolute source lines and intersected against
+the actual diff hunks — 56 sat on pre-existing unchanged lines (excluded),
+**18/18 real survivors on the changed lines killed, 0 remaining**. Not
+trusted at face value per this project's own repeated-incident history
+(Wave 2 non-delivery, mutation-count reuse, etc.) — independently
+re-verified: read the full `git diff` for `council_adapter.py`/
+`debate.py`/`pipeline_runner.py` by hand (matches the contract exactly,
+byte-identical rewrite prompt, correct config-gate-before-list-access
+ordering, correct fallback/failure-list semantics), confirmed the 4
+pre-existing test files' edits are legitimate re-specifications (mock
+renamed to match the new function name, new `timeout`/`failed_models`
+values asserted) not weakened tests, and re-ran the full suite myself:
+**893 passed** (871 baseline + 22 new), zero failures. Both call sites
+(Stage 1→1.5 drafts, Stage 2→3 reviewer-commentary normalization) now take
+a configurable `stage1_5_timeout` (default 300.0, same as the other three
+`_timeout` knobs — not the vendored 60s), run their per-response calls
+concurrently via `asyncio.gather` instead of sequentially, and surface
+`metadata["normalization_failures"]` (consumed as a `debug_log` WARNING in
+`pipeline_runner.py`, same "only present when non-empty" convention as
+`shortfall_warning`/`ungrounded_models`) instead of silently falling back.
+`debate.py` gained a matching `--stage1-5-timeout` CLI flag. Not yet
+committed to git (working-tree norm, same as the rest of this session's
+changes).

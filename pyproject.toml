@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
-    "llm-council-core[mcp,secure]>=0.39.0",
+    "llm-council-core[mcp,secure]>=0.42.0",
 ]
 
 [project.scripts]

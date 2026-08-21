@@ -237,8 +237,8 @@ def _install_happy_path_fakes(
         # not the dataclass's own field names guessed differently.
         return SimpleNamespace(passed=True, reason=None, flagged_patterns=[])
 
-    async def fake_stage1_5_normalize_styles(stage1_results):
-        return stage1_results, {}
+    async def fake_normalize_responses_with_timeout(entries, timeout=300.0):
+        return entries, {}, []
 
     async def fake_stage2_collect_rankings(
         user_query, responses_for_review, timeout=120.0, models=None,
@@ -292,7 +292,7 @@ def _install_happy_path_fakes(
     fakes = {
         "query_models_resilient": _as_resilient(query_models_parallel_fn or default_query_models_parallel),
         "check_response_safety": fake_check_response_safety,
-        "stage1_5_normalize_styles": fake_stage1_5_normalize_styles,
+        "_normalize_responses_with_timeout": fake_normalize_responses_with_timeout,
         "stage2_collect_rankings": fake_stage2_collect_rankings,
         "calculate_aggregate_rankings": fake_calculate_aggregate_rankings,
         "stage3_synthesize_final": fake_stage3_synthesize_final,
@@ -554,8 +554,8 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
         calls["check_response_safety"].append(response)
         return SimpleNamespace(passed=False, reason="flagged-reason", flagged_patterns=["p1", "p2"])
 
-    async def fake_stage1_5_normalize_styles(stage1_results):
-        return stage1_results, {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "cost_usd": 0.0}
+    async def fake_normalize_responses_with_timeout(entries, timeout=300.0):
+        return entries, {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "cost_usd": 0.0}, []
 
     def fake_calculate_aggregate_rankings(
         stage2_results, label_to_model, voting_authorities=None, return_shadow_votes=False
@@ -590,7 +590,7 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     fakes = {
         "query_models_resilient": _as_resilient(fake_query_models_parallel),
         "check_response_safety": fake_check_response_safety,
-        "stage1_5_normalize_styles": fake_stage1_5_normalize_styles,
+        "_normalize_responses_with_timeout": fake_normalize_responses_with_timeout,
         "calculate_aggregate_rankings": fake_calculate_aggregate_rankings,
         "stage3_synthesize_final": fake_stage3_synthesize_final,
         "emit_usage_metrics": fake_emit_usage_metrics,
@@ -651,8 +651,8 @@ def test_ac_comprehensive_normal_path_exact_field_values(monkeypatch):
     }
     # --- stage2_normalize (docs/upstream-deltas.md, "Known residual
     # limitation" entry, 2026-08-14 fix): _normalize_stage2_for_stage3
-    # reuses the SAME faked stage1_5_normalize_styles, so it returns the
-    # same canned usage a second time - straight assignment, same as
+    # reuses the SAME faked _normalize_responses_with_timeout, so it returns
+    # the same canned usage a second time - straight assignment, same as
     # stage1_5's own bucket above, not real accumulation. ---
     assert metadata["usage"]["by_stage"]["stage2_normalize"] == {
         "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "cost_usd": 0.0,
@@ -786,7 +786,7 @@ def test_single_model_branch_degraded_mode_and_untouched_stage1_5_stage2_usage(m
     _patch(monkeypatch, "stage3_synthesize_final", fake_stage3_synthesize_final)
     _patch(monkeypatch, "get_config", lambda: _make_config(safety_enabled=False, models=models))
     _patch(monkeypatch, "should_include_quality_metrics", lambda: False)
-    _patch(monkeypatch, "stage1_5_normalize_styles", fail_if_called)
+    _patch(monkeypatch, "_normalize_responses_with_timeout", fail_if_called)
     _patch(monkeypatch, "stage2_collect_rankings", fail_if_called)
     _patch(monkeypatch, "calculate_aggregate_rankings", fail_agg)
 

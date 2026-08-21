@@ -157,8 +157,8 @@ def _install_normal_flow_fakes(monkeypatch, models, resilience_config=None):
     # weakening what's actually being tested.
     monkeypatch.setattr(ca.random, "shuffle", lambda seq: None, raising=False)
 
-    async def fake_stage1_5_normalize_styles(stage1_results):
-        return stage1_results, {}
+    async def fake_normalize_responses_with_timeout(entries, timeout=300.0):
+        return entries, {}, []
 
     async def fake_stage2_collect_rankings(user_query, responses_for_review, timeout=120.0, **kw):
         label_to_model = {
@@ -182,7 +182,7 @@ def _install_normal_flow_fakes(monkeypatch, models, resilience_config=None):
     async def fake_stage3_synthesize_final(user_query, stage1_results, stage2_results, **kw):
         return {"model": stage1_results[0]["model"], "response": "final synthesis"}, {}, None
 
-    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_normalize_styles)
+    _patch(monkeypatch, [_council_module], "_normalize_responses_with_timeout", fake_normalize_responses_with_timeout)
     _patch(monkeypatch, [_council_module], "stage2_collect_rankings", fake_stage2_collect_rankings)
     _patch(monkeypatch, [_council_module], "calculate_aggregate_rankings", fake_calculate_aggregate_rankings)
     _patch(monkeypatch, [_council_module], "stage3_synthesize_final", fake_stage3_synthesize_final)
@@ -828,18 +828,18 @@ def test_stage3_receives_style_normalized_stage1_text_not_raw_draft(monkeypatch)
     _patch(monkeypatch, [__import__("scripts.resilient_query", fromlist=["x"])], "query_models_resilient", fake_query_models_resilient)
 
     # Overrides _install_normal_flow_fakes' identity-passthrough fake for
-    # stage1_5_normalize_styles - an identity passthrough can't distinguish
-    # "chairman received the raw draft" from "chairman received the
-    # normalized draft" since they're equal either way. This fake actually
-    # rewrites the text so the two cases are observably different.
-    async def fake_stage1_5_actually_rewrites(stage1_results):
+    # _normalize_responses_with_timeout - an identity passthrough can't
+    # distinguish "chairman received the raw draft" from "chairman received
+    # the normalized draft" since they're equal either way. This fake
+    # actually rewrites the text so the two cases are observably different.
+    async def fake_normalize_actually_rewrites(entries, timeout=300.0):
         normalized = [
             {"model": r["model"], "response": f"NORMALIZED::{r['response']}"}
-            for r in stage1_results
+            for r in entries
         ]
-        return normalized, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return normalized, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, []
 
-    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_actually_rewrites)
+    _patch(monkeypatch, [_council_module], "_normalize_responses_with_timeout", fake_normalize_actually_rewrites)
 
     captured = {}
 
@@ -880,14 +880,14 @@ def test_stage3_receives_style_normalized_stage2_ranking_text_not_raw_critique(m
     # rewrites whatever "response" text it receives, regardless of which
     # stage's content is routed through it via the ranking<->response
     # mapping in _normalize_stage2_for_stage3.
-    async def fake_stage1_5_actually_rewrites(stage1_results):
+    async def fake_normalize_actually_rewrites(entries, timeout=300.0):
         normalized = [
             {"model": r["model"], "response": f"NORMALIZED::{r['response']}"}
-            for r in stage1_results
+            for r in entries
         ]
-        return normalized, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return normalized, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, []
 
-    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_actually_rewrites)
+    _patch(monkeypatch, [_council_module], "_normalize_responses_with_timeout", fake_normalize_actually_rewrites)
 
     captured = {}
 
@@ -914,9 +914,10 @@ def test_normalize_stage2_for_stage3_empty_input_returns_zeroed_usage_no_config_
     `stage2_results = []` (single-model degraded mode) - a wrong key name
     or a nonzero value here would silently corrupt
     `metadata["usage"]["total"]` for every single-model run, undetected."""
-    result, usage = _run(ca._normalize_stage2_for_stage3([]))
+    result, usage, failed = _run(ca._normalize_stage2_for_stage3([], timeout=300.0))
     assert result == []
     assert usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    assert failed == []
 
 
 def test_normalize_stage2_for_stage3_rewrites_ranking_preserves_other_keys(monkeypatch):
@@ -924,27 +925,28 @@ def test_normalize_stage2_for_stage3_rewrites_ranking_preserves_other_keys(monke
     normalizer's output, every other key ("model", "parsed_ranking", ...)
     passes through unchanged, and the real `stage2_results` argument is
     never mutated."""
-    async def fake_stage1_5_actually_rewrites(stage1_results):
+    async def fake_normalize_actually_rewrites(entries, timeout=300.0):
         normalized = [
             {"model": r["model"], "response": f"NORMALIZED::{r['response']}"}
-            for r in stage1_results
+            for r in entries
         ]
-        return normalized, {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+        return normalized, {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}, []
 
-    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_actually_rewrites)
+    _patch(monkeypatch, [_council_module], "_normalize_responses_with_timeout", fake_normalize_actually_rewrites)
 
     stage2_results = [
         {"model": "model-a", "ranking": "raw critique a", "parsed_ranking": {"scores": {"Response A": 8}}},
         {"model": "model-b", "ranking": "raw critique b", "parsed_ranking": {"scores": {"Response A": 6}}},
     ]
 
-    result, usage = _run(ca._normalize_stage2_for_stage3(stage2_results))
+    result, usage, failed = _run(ca._normalize_stage2_for_stage3(stage2_results, timeout=300.0))
 
     assert result == [
         {"model": "model-a", "ranking": "NORMALIZED::raw critique a", "parsed_ranking": {"scores": {"Response A": 8}}},
         {"model": "model-b", "ranking": "NORMALIZED::raw critique b", "parsed_ranking": {"scores": {"Response A": 6}}},
     ]
     assert usage == {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+    assert failed == []
     # the real argument is untouched
     assert stage2_results[0]["ranking"] == "raw critique a"
     assert stage2_results[1]["ranking"] == "raw critique b"

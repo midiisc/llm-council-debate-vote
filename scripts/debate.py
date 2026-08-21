@@ -40,6 +40,11 @@ def _build_arg_parser():
     parser.add_argument("--stage1-timeout", type=float, default=300.0)
     parser.add_argument("--stage2-timeout", type=float, default=300.0)
     parser.add_argument("--stage3-timeout", type=float, default=300.0)
+    # docs/specs/stage1-5-normalizer-timeout-contract.md: replaces the
+    # vendored 60s-hardcoded style-normalization timeout (Stage 1 drafts +
+    # Stage 2 reviewer commentary) with a configurable budget, same default
+    # as the other three `--stageN-timeout` flags.
+    parser.add_argument("--stage1-5-timeout", type=float, default=300.0)
     # Parity with pipeline_runner.py's PipelineConfig.max_wall_clock_seconds
     # (docs/architecture-stress-test-2026-08-13.md, High: debate.py had no
     # overall ceiling at all) - same 1200.0 default, always-on backstop.
@@ -74,6 +79,7 @@ def main() -> None:
                     stage1_timeout=args.stage1_timeout,
                     stage2_timeout=args.stage2_timeout,
                     stage3_timeout=args.stage3_timeout,
+                    stage1_5_timeout=args.stage1_5_timeout,
                     overall_wall_clock_seconds=args.max_wall_clock_seconds,
                 ),
                 timeout=args.max_wall_clock_seconds,

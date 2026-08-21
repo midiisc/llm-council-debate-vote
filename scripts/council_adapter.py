@@ -58,11 +58,14 @@ from llm_council.cache_context import CacheContext, clear_cache_context, set_cac
 from llm_council.council import _get_chairman_model, _get_council_models
 from llm_council.council_rankings import calculate_aggregate_rankings, parse_ranking_from_text
 from llm_council.council_stages import (
-    stage1_5_normalize_styles,
+    _get_normalizer_model,
+    _get_style_normalization,
+    should_normalize_styles,
     stage3_synthesize_final,
 )
 from llm_council.council_usage import _add_cost_to_usage, _build_usage_summary
 from llm_council.gateway_adapter import query_model_with_status
+from llm_council.openrouter import STATUS_OK
 from llm_council.observability.usage_metrics import emit_usage_metrics
 from llm_council.quality.integration import calculate_quality_metrics, should_include_quality_metrics
 from llm_council.safety_gate import check_response_safety
@@ -532,9 +535,128 @@ def _resolve_response_labels(text: str, model_to_label: Dict[str, str]) -> str:
     return resolved
 
 
+def _build_style_normalize_prompt(text: str) -> str:
+    """Exact copy of `stage1_5_normalize_styles`'s rewrite prompt template
+    (`llm_council.council_stages`) - byte-for-byte, no wording changes, per
+    docs/specs/stage1-5-normalizer-timeout-contract.md's non-goals. Factored
+    out so `_normalize_responses_with_timeout` doesn't duplicate the prompt
+    text inline.
+    """
+    return f"""Rewrite the following text to have a neutral, consistent style while preserving ALL content and meaning exactly.
+
+Rules:
+- Remove any AI-assistant preambles like "As an AI..." or "I'd be happy to help..."
+- Use consistent markdown formatting (headers, lists, code blocks)
+- Maintain a professional, neutral tone
+- Do NOT add or remove any substantive content
+- Do NOT add opinions or caveats not in the original
+- Keep the same structure and organization
+
+Original text:
+{text}
+
+Rewritten text:"""
+
+
+async def _normalize_responses_with_timeout(
+    entries: List[Dict[str, Any]],
+    timeout: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str]]:
+    """Local wrapper around the same style-normalization operation
+    `llm_council.council_stages.stage1_5_normalize_styles` performs, fixing
+    three gaps documented in docs/specs/stage1-5-normalizer-timeout-
+    contract.md: a hardcoded, non-overridable 60s per-call timeout, a
+    sequential (not parallel) per-response loop, and a silent fallback to
+    un-normalized text with no failure signal.
+
+    Mirrors this module's existing "wrap the real function, don't patch
+    installed vendor code" pattern (`_stage1_query_fn`, `_stage3_query_fn`) -
+    the rewrite prompt, the `style_normalization` config gate semantics, and
+    the normalizer model selection are all byte-for-byte faithful to the
+    vendored behavior; only the timeout, concurrency, and failure-visibility
+    are new.
+
+    Returns `(normalized_entries, usage, failed_models)` - see contract doc
+    for the full behavior spec of each element.
+    """
+    total_usage: Dict[str, int] = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    def _passthrough() -> List[Dict[str, Any]]:
+        # Uniform return shape regardless of path taken (gate-off/auto-
+        # skipped/normalized) - docs/specs/stage1-5-normalizer-timeout-
+        # contract.md AC1/AC5: every returned entry carries "model",
+        # "response", and "original_response" (== "response" when no
+        # normalization call was made), matching the shape a real
+        # normalization pass produces so callers never need to branch on
+        # which path was taken.
+        return [
+            {"model": e["model"], "response": e["response"], "original_response": e["response"]}
+            for e in entries
+        ]
+
+    # Config gate read BEFORE touching `entries` at all - preserves the
+    # exact "gate short-circuits before any list access" behavior both
+    # existing call sites already depend on (docs/specs/stage1-5-normalizer-
+    # timeout-contract.md, step 1).
+    style_normalization = _get_style_normalization()
+    if style_normalization == "auto":
+        responses = [e["response"] for e in entries]
+        if not should_normalize_styles(responses):
+            return _passthrough(), total_usage, []
+        # else: auto-triggered, proceed to normalize below.
+    elif not style_normalization:
+        return _passthrough(), total_usage, []
+    # else: style_normalization is True - always normalize.
+
+    normalizer_model = _get_normalizer_model()
+    results = await asyncio.gather(
+        *(
+            query_model_with_status(
+                normalizer_model,
+                [{"role": "user", "content": _build_style_normalize_prompt(entry["response"])}],
+                timeout,
+            )
+            for entry in entries
+        )
+    )
+
+    normalized_entries: List[Dict[str, Any]] = []
+    failed_models: List[str] = []
+    for entry, result in zip(entries, results):
+        if result.get("status") == STATUS_OK:
+            normalized_entries.append(
+                {
+                    "model": entry["model"],
+                    "response": result.get("content", entry["response"]),
+                    "original_response": entry["response"],
+                }
+            )
+            result_usage = result.get("usage", {})
+            total_usage["prompt_tokens"] += result_usage.get("prompt_tokens", 0)
+            total_usage["completion_tokens"] += result_usage.get("completion_tokens", 0)
+            total_usage["total_tokens"] += result_usage.get("total_tokens", 0)
+            _add_cost_to_usage(total_usage, result_usage, model=entry["model"])
+        else:
+            normalized_entries.append(
+                {
+                    "model": entry["model"],
+                    "response": entry["response"],
+                    "original_response": entry["response"],
+                }
+            )
+            failed_models.append(entry["model"])
+
+    return normalized_entries, total_usage, failed_models
+
+
 async def _normalize_stage2_for_stage3(
     stage2_results: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    timeout: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str]]:
     """Extends Stage 1.5's own style-normalization call to Stage 2
     reviewers' free-text ranking/critique commentary, closing the residual
     stylistic-fingerprint channel documented in docs/upstream-deltas.md
@@ -544,12 +666,15 @@ async def _normalize_stage2_for_stage3(
     signal for the chairman - the same channel Stage 1.5 exists to close
     for drafts, just never extended to reviewer commentary.
 
-    Reuses the exact same `stage1_5_normalize_styles` call (same config
-    gate - `style_normalization`, same `normalizer_model`) rather than
-    inventing a second mechanism - it only requires each entry to carry
-    `"model"`/`"response"` keys, so `"ranking"` is mapped to `"response"`
-    and back; a reviewer's real ranking/critique text is never inspected
-    or parsed here, only round-tripped through the rewrite call.
+    Reuses `_normalize_responses_with_timeout` (same config gate -
+    `style_normalization`, same `normalizer_model`, same rewrite prompt as
+    `stage1_5_normalize_styles`) rather than inventing a second mechanism -
+    it only requires each entry to carry `"model"`/`"response"` keys, so
+    `"ranking"` is mapped to `"response"` and back; a reviewer's real
+    ranking/critique text is never inspected or parsed here, only
+    round-tripped through the rewrite call. `timeout` is threaded straight
+    through (docs/specs/stage1-5-normalizer-timeout-contract.md) rather than
+    hardcoded.
 
     Only ever applied to the copy built for Stage 3's chairman prompt -
     never mutates or replaces the real `stage2_results` already used for
@@ -563,7 +688,7 @@ async def _normalize_stage2_for_stage3(
     model call, and returns `([], {zeroed usage})`.
     """
     # Explicit early return, not just an empty-list no-op fall-through:
-    # `stage1_5_normalize_styles` reads `_get_style_normalization()`
+    # `_normalize_responses_with_timeout` reads `_get_style_normalization()`
     # (config) BEFORE it ever looks at its input list, so calling it with
     # an empty list still touches config - a real crash in single-model
     # degraded mode, where Stage 1.5 has never run before and some test
@@ -575,12 +700,14 @@ async def _normalize_stage2_for_stage3(
     # AttributeError. Fixed here so single-model mode never touches this
     # config key, matching its pre-existing behavior exactly.
     if not stage2_results:
-        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, []
 
     as_pseudo_stage1 = [
         {"model": r["model"], "response": r["ranking"]} for r in stage2_results
     ]
-    normalized, usage = await stage1_5_normalize_styles(as_pseudo_stage1)
+    normalized, usage, failed_models = await _normalize_responses_with_timeout(
+        as_pseudo_stage1, timeout
+    )
     normalized_ranking_by_model = {r["model"]: r["response"] for r in normalized}
     # Mutation-testing note (2026-08-14): the `.get(r["model"], r["ranking"])`
     # fallback default is a true equivalent mutant (unreachable in
@@ -598,7 +725,7 @@ async def _normalize_stage2_for_stage3(
         {**r, "ranking": normalized_ranking_by_model.get(r["model"], r["ranking"])}
         for r in stage2_results
     ]
-    return result, usage
+    return result, usage, failed_models
 
 
 DEFAULT_STAGE1_DEADLINE_FRACTION = 0.5
@@ -686,6 +813,7 @@ async def run_council_with_timeouts(
     stage1_timeout: float = 300.0,
     stage2_timeout: float = 300.0,
     stage3_timeout: float = 300.0,
+    stage1_5_timeout: float = 300.0,
     overall_wall_clock_seconds: Optional[float] = None,
     stage1_deadline_fraction: float = DEFAULT_STAGE1_DEADLINE_FRACTION,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
@@ -706,6 +834,13 @@ async def run_council_with_timeouts(
     alone exhaust the entire ceiling (architecture-stress-test-2026-08-13.md,
     Critical #3). None (default) means no deadline is computed - Stage 1
     retries/substitutes exactly as before this contract landed.
+
+    `stage1_5_timeout` (docs/specs/stage1-5-normalizer-timeout-contract.md,
+    default 300.0 - same default as the other three `_timeout` knobs)
+    replaces the vendored 60s-hardcoded per-call timeout on both style-
+    normalization call sites (Stage 1 drafts and Stage 2 reviewer
+    commentary) with a single configurable budget for both, since they're
+    the same underlying operation applied to two different text sources.
     """
     # docs/specs/prompt-cache-session-affinity-contract.md ACs 1-3: a
     # session_id-only CacheContext (no segments) activates OpenRouter
@@ -823,6 +958,10 @@ async def run_council_with_timeouts(
         stage2_results: List[Dict[str, Any]]
         stage2_substitutions: List[SubstitutionEvent] = []
         stage2_shortfall_warning: Optional[str] = None
+        # Single-model mode never runs Stage 1.5 at all (see comment below),
+        # so this starts empty and is only ever populated in the `else`
+        # branch (num_responses >= 2).
+        stage1_5_failed: List[str] = []
         # Stage 3 chairman anonymization (docs/specs/stage3-chairman-
         # anonymization-contract.md) must anonymize the SAME text Stage 2
         # reviewers see, not stage1_results' raw draft text - Stage 1.5's
@@ -851,7 +990,9 @@ async def run_council_with_timeouts(
         else:
             if num_responses == 2:
                 degraded_mode = "two_models"
-            responses_for_review, stage1_5_usage = await stage1_5_normalize_styles(stage1_results)
+            responses_for_review, stage1_5_usage, stage1_5_failed = await _normalize_responses_with_timeout(
+                stage1_results, stage1_5_timeout
+            )
             stage1_for_stage3 = responses_for_review
             total_usage["stage1_5"] = stage1_5_usage
 
@@ -957,8 +1098,8 @@ async def run_council_with_timeouts(
         # extra cost (folds into total_usage["stage2_normalize"], summed into
         # metadata["usage"]["total"]["cost_usd"] like every other bucket) -
         # zero when stage2_results is empty (single-model degraded mode).
-        stage2_for_stage3, stage2_normalize_usage = await _normalize_stage2_for_stage3(
-            stage2_results
+        stage2_for_stage3, stage2_normalize_usage, stage2_normalize_failed = await _normalize_stage2_for_stage3(
+            stage2_results, stage1_5_timeout
         )
         total_usage["stage2_normalize"] = stage2_normalize_usage
         stage3_anon_stage1, stage3_anon_stage2, stage3_anon_rankings = _anonymize_for_stage3(
@@ -1082,6 +1223,16 @@ async def run_council_with_timeouts(
         ]
         if shortfall_warnings:
             metadata["shortfall_warning"] = " | ".join(shortfall_warnings)
+        # docs/specs/stage1-5-normalizer-timeout-contract.md: surfaces every
+        # model whose Stage 1.5 (draft) or Stage 2-commentary normalization
+        # call fell back to un-normalized text, instead of the previous
+        # silent-fallback behavior. Same "only present when non-empty"
+        # convention as shortfall_warning/ungrounded_models above -
+        # deduplication not required, a model can appear once per stage it
+        # failed in.
+        normalization_failures = list(stage1_5_failed) + list(stage2_normalize_failed)
+        if normalization_failures:
+            metadata["normalization_failures"] = normalization_failures
 
         # Mutation-testing note (2026-08-13): `len(stage1_results) > 0` vs
         # `>= 0` is a true equivalent mutant here - the `if num_responses == 0:

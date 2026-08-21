@@ -232,8 +232,8 @@ def _install_normal_flow_fakes(monkeypatch, models, captured_stage3=None):
     # ordering, matching the same allowance already documented above.
     monkeypatch.setattr(ca.random, "shuffle", lambda seq: None, raising=False)
 
-    async def fake_stage1_5_normalize_styles(stage1_results):
-        return stage1_results, {}
+    async def fake_normalize_responses_with_timeout(entries, timeout=300.0):
+        return entries, {}, []
 
     async def fake_stage2_collect_rankings(user_query, responses_for_review, timeout=120.0, **kw):
         label_to_model = {
@@ -259,7 +259,7 @@ def _install_normal_flow_fakes(monkeypatch, models, captured_stage3=None):
             captured_stage3["query"] = query_arg
         return {"model": stage1_results[0]["model"], "response": "final synthesis"}, {}, None
 
-    _patch(monkeypatch, [_council_module], "stage1_5_normalize_styles", fake_stage1_5_normalize_styles)
+    _patch(monkeypatch, [_council_module], "_normalize_responses_with_timeout", fake_normalize_responses_with_timeout)
     _patch(monkeypatch, [_council_module], "stage2_collect_rankings", fake_stage2_collect_rankings)
     _patch(monkeypatch, [_council_module], "calculate_aggregate_rankings", fake_calculate_aggregate_rankings)
     _patch(monkeypatch, [_council_module], "stage3_synthesize_final", fake_stage3_synthesize_final)

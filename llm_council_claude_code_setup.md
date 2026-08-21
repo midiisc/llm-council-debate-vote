@@ -233,8 +233,15 @@ LLM_COUNCIL_DEADLOCK_THRESHOLD=0.15
 ```bash
 llm-council serve &
 ```
-Then run `council_health_check` and confirm `ready: true`, `council_size: 3`,
-`key_source` shows the keychain (not a plaintext env fallback).
+Then run `council_health_check(tier="reasoning", deep=true)` — pass this
+project's actual `tiers.default` explicitly, since v0.42.0 changed the
+function's own default to `tier="high"` (see `docs/upstream-deltas.md`,
+2026-08-21 entry); calling it with no args now reports on the wrong tier for
+this repo. `deep=true` also probes the chairman directly, not just a cheap
+connectivity ping (#596) — worth the one real chairman call before a real run.
+Confirm `ready: true`, `council_size: 4`, `key_source` shows the keychain (not
+a plaintext env fallback), and no `config_warnings` key present (its presence
+means `council.models` and the resolved tier pool disagree).
 
 ### 6. Register with Claude Code
 ```bash

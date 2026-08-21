@@ -434,6 +434,16 @@ async def run_pipeline(
                 "despite being instructed to tag every substantive claim"
             )
 
+        # docs/specs/stage1-5-normalizer-timeout-contract.md AC9: surfaces
+        # style-normalization fallbacks (Stage 1.5 draft or Stage 2 reviewer
+        # commentary) that were previously silent.
+        for model in metadata.get("normalization_failures") or []:
+            debug_log.append(
+                f"WARNING: {model}'s response could not be style-normalized in "
+                "time (Stage 1.5) - Stage 3 may see un-normalized, potentially "
+                "fingerprinted text for this model"
+            )
+
         css = metadata["quality_metrics"]["core"]["consensus_strength"]
         aggregate_rankings = metadata["aggregate_rankings"]
         label_to_model = metadata["label_to_model"]

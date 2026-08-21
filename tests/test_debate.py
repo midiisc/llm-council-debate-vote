@@ -25,6 +25,7 @@ def _patch_run_council(monkeypatch, result):
         stage1_timeout=300.0,
         stage2_timeout=300.0,
         stage3_timeout=300.0,
+        stage1_5_timeout=300.0,
         overall_wall_clock_seconds=None,
     ):
         calls.append(
@@ -33,6 +34,7 @@ def _patch_run_council(monkeypatch, result):
                 "stage1_timeout": stage1_timeout,
                 "stage2_timeout": stage2_timeout,
                 "stage3_timeout": stage3_timeout,
+                "stage1_5_timeout": stage1_5_timeout,
                 "overall_wall_clock_seconds": overall_wall_clock_seconds,
             }
         )
@@ -141,6 +143,7 @@ def test_main_prints_synthesis_and_exits_zero_on_success(monkeypatch, capsys, tm
             "stage1_timeout": 300.0,
             "stage2_timeout": 300.0,
             "stage3_timeout": 300.0,
+            "stage1_5_timeout": 300.0,
             "overall_wall_clock_seconds": 1200.0,
         }
     ]
@@ -176,6 +179,7 @@ def test_main_threads_explicit_stage_timeouts_to_run_council_with_timeouts(monke
             "stage1_timeout": 11.0,
             "stage2_timeout": 22.0,
             "stage3_timeout": 33.0,
+            "stage1_5_timeout": 300.0,
             "overall_wall_clock_seconds": 1200.0,
         }
     ]
