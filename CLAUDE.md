@@ -109,29 +109,58 @@ site). The self-update routine below is the first candidate.
 
 ## Pillar 5 — Self-Heal / Self-Augment / Self-Update
 
-A scheduled check (every 2-3 days) watches `amiable-dev/llm-council`'s GitHub
-releases, changelog, and commit history since the last recorded check. Loop:
+**Automated, scheduled (2026-08-21):** a weekly cloud routine (`llm-council-core
+weekly upstream sync + audit`, Claude Code scheduled routine
+`trig_01XgmRtEWjx5W4dUcZZH3kHx`, Mondays 09:30 IST / 04:00 UTC —
+`https://claude.ai/code/routines/trig_01XgmRtEWjx5W4dUcZZH3kHx`) watches
+`amiable-dev/llm-council`'s PyPI releases, GitHub releases, and any
+previously-filed issue's activity since the last recorded check in
+`docs/upstream-deltas.md`. Weekly, not the earlier "every 2-3 days" ad hoc
+cadence — this package changes infrequently and in bursts (see the
+2026-08-21 ledger entry: 3 releases landed in one day after a 5-week gap),
+and this project's own real-decision cadence is 2-4 runs/month, so a
+tighter check would mostly find nothing. An ad hoc check (session work,
+user request) can still run anytime and does not need to wait for the
+scheduled fire. Loop:
 
-1. **Detect** — diff current upstream state against the last-known state
-   recorded in `docs/upstream-deltas.md`.
-2. **Verify** — per Pillar 1, confirm any detected change against the live
-   source directly (README/ADR/code at the new commit), not just changelog
-   prose.
+1. **Detect** — diff current upstream state (PyPI, GitHub releases, filed
+   issues) against the last-known state recorded in `docs/upstream-deltas.md`.
+   Nothing new → stop, no repo changes, just a run-log entry.
+2. **Verify** — per Pillar 1, AND per the standing diff-sync practice
+   (2026-08-21 session): diff the actual installed package files against
+   the candidate version in an isolated scratch venv, check every function
+   this repo's `scripts/*.py` imports from `llm_council` for signature
+   drift, load this repo's real `llm_council.yaml` through the new
+   version's `get_config()`, and run the full test suite before/after —
+   never assume a changelog description is sufficient, confirm by direct
+   execution. Check files with no current call site too, for merit, not
+   just the ones already imported.
 3. **Report** — what changed, why it matters to this repo's config/scripts,
    and its blast radius (security advisory > breaking config/CLI change >
    new optional feature > cosmetic).
-4. **Ask** — surface the proposed patch and STOP. Never auto-apply a change
-   to a checked-in file without explicit approval, even though detection
-   itself runs unattended on schedule. This mirrors the global
-   self-improvement doctrine: discovery is free, mutation is gated.
-5. **Heal** (only after approval) — apply, then verify by actually running
-   the affected command/test, not just re-reading docs.
-6. **Record** — append the resolved delta to `docs/upstream-deltas.md` with
-   date and source, so the next check has an accurate baseline.
+4. **Ask, via a pull request, never a direct push to `main`** — the
+   routine drafts its findings and any safe, verified change (version
+   bump, a spec-driven port of a genuine upstream improvement into this
+   repo's own local reimplementations) on a new branch, opens a PR against
+   `main` with the full verification evidence in the PR body, and stops.
+   It never merges its own PR. This mirrors the global self-improvement
+   doctrine (discovery is free, mutation is gated) made concrete: drafting
+   is unattended and automatic, landing on `main` is always a human
+   decision.
+5. **Heal (merge)** — only the user merges the PR, after review. If a
+   proposed change needs rework instead, say so in this repo directly
+   rather than merging.
+6. **Record** — the merged (or, if declined, explicitly rejected) delta
+   gets appended to `docs/upstream-deltas.md` with date and source, so the
+   next check has an accurate baseline. A declined PR should still leave a
+   short note here (what was proposed, why it wasn't taken) so the next
+   run doesn't re-propose the same thing without new information.
 
-Security advisories are the one exception to "wait for the 2-3 day cycle" —
-if a check (scheduled or ad hoc) surfaces a new advisory, report it
-immediately rather than batching it into the next cycle.
+Security advisories are the one exception to "wait for the weekly cycle" —
+if a check (scheduled or ad hoc) surfaces a new advisory, its PR/report
+says so as the first line, immediately, rather than batching it into the
+next cycle — though even a security fix still lands via PR + human merge,
+never an unattended direct push to `main`.
 
 ## Pillar 6 — Additional grounded, enforced context
 
