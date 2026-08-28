@@ -2030,3 +2030,40 @@ concurrently via `asyncio.gather` instead of sequentially, and surface
 `debate.py` gained a matching `--stage1-5-timeout` CLI flag. Not yet
 committed to git (working-tree norm, same as the rest of this session's
 changes).
+
+## 2026-08-28: two new upstream issues filed — self-preference recusal architecture gap, length-control gap in style normalization
+
+Found while a different project's session (Claude Code, `high-stakes-research-pipeline` skill)
+cross-checked this repo's already-documented bias mitigations (anonymization, shuffle,
+style-normalization — all confirmed present via direct source read) against recent LLM-judge-bias
+literature, specifically looking for what Panickssery et al. (arXiv:2404.13076, verified) and a
+2026 bias-mitigation replication (already on file above) say is NOT fully cured by anonymization
+alone: self-recognition-driven self-preference, and verbosity bias. Filed with explicit user
+go-ahead, same precedent as #591-#596.
+
+**[amiable-dev/llm-council#674](https://github.com/amiable-dev/llm-council/issues/674)** —
+self-preference recusal (excluding a model from judging a batch containing its own response) is
+not currently possible: `stage2_collect_rankings` sends the FULL anonymized batch to every
+reviewer in one call, so there's no per-response reviewer exclusion, only a per-round reviewer
+list. Given every core model drafts on every query, "exclude M from the round if M drafted" would
+zero out all reviewers. Real architectural gap, not a config oversight — see
+`docs/specs/upstream-issue-draft-self-preference-recusal-2026-08-28.md` for the full grounding
+and suggested fixes (a `recuse_self` option running N partial-reviewer-pool rankings and
+reconciling them, or a held-out non-drafting judge model). **Not implemented locally** — this
+repo's own established practice is to use `run_full_council`/the stage functions as-is rather
+than reimplementing them (see the 2026-08-11 Stage-2-ordering entry above for the same
+reasoning), and a local monkeypatch duplicating Stage 2's ranking logic would fork exactly the
+code this repo deliberately doesn't fork.
+
+**[amiable-dev/llm-council#675](https://github.com/amiable-dev/llm-council/issues/675)** —
+`stage1_5_normalize_styles`'s rewrite prompt targets tone/formatting only ("Do NOT add or remove
+any substantive content" explicitly preserves length); no length-equalization exists anywhere in
+the pipeline. Verbosity bias is heterogeneous by judge-model family and survives tone
+normalization specifically because normalization doesn't touch length (Dubois et al.,
+arXiv:2404.04475, verified, Length-Controlled AlpacaEval). See
+`docs/specs/upstream-issue-draft-length-control-2026-08-28.md`.
+
+Both are documentation/issue-filing only in this pass — no code changed in this repo, no test
+suite run needed since nothing here executes. Not a real-money action; the 2026-08-11/12
+key-rotation hold (still unresolved as of this entry — no rotation-confirmed entry found anywhere
+in this file) was not triggered and does not need to be for this kind of pass.
