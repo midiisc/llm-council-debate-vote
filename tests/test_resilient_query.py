@@ -1223,3 +1223,90 @@ def test_deadline_lets_some_slots_succeed_before_it_passes_and_returns_partial_r
     assert result.responses == {"model-a": {"status": "ok", "text": "resp-a"}}
     assert "model-b" in result.unreachable_models
     assert result.shortfall_warning is not None
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-28 addition -- honor a server-supplied retry_after over the fixed
+# backoff schedule, capped at max_retry_after_seconds. Found via a separate
+# project's live canary run + panel-debate that traced this repo's own
+# openrouter.py already parses Retry-After but the retry loop never
+# consulted it.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_retry_wait_seconds_honors_retry_after_when_present():
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    response = {"status": "rate_limited", "retry_after": 12}
+
+    assert rq.resolve_retry_wait_seconds(response, attempt_number=1, retry_policy=policy) == 12.0
+
+
+def test_resolve_retry_wait_seconds_caps_retry_after_at_max_retry_after_seconds():
+    policy = rq.RetryPolicy(
+        max_attempts=3, backoff_seconds=(5.0, 15.0), max_retry_after_seconds=30.0
+    )
+    response = {"status": "rate_limited", "retry_after": 2282}  # real abuse-case magnitude
+
+    assert rq.resolve_retry_wait_seconds(response, attempt_number=1, retry_policy=policy) == 30.0
+
+
+def test_resolve_retry_wait_seconds_falls_back_to_backoff_schedule_without_retry_after():
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    response = {"status": "rate_limited"}  # no retry_after key at all
+
+    assert rq.resolve_retry_wait_seconds(response, attempt_number=1, retry_policy=policy) == 5.0
+    assert rq.resolve_retry_wait_seconds(response, attempt_number=2, retry_policy=policy) == 15.0
+
+
+def test_resolve_retry_wait_seconds_ignores_retry_after_on_non_rate_limited_status():
+    # query_model_with_status never sets retry_after on "timeout"/"error", but
+    # the resolver must not trust a stray value even if one somehow appeared -
+    # only a genuine server 429 signal should override the configured schedule.
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    response = {"status": "timeout", "retry_after": 99}
+
+    assert rq.resolve_retry_wait_seconds(response, attempt_number=1, retry_policy=policy) == 5.0
+
+
+def test_resolve_retry_wait_seconds_ignores_non_numeric_or_non_positive_retry_after():
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+    assert rq.resolve_retry_wait_seconds(
+        {"status": "rate_limited", "retry_after": 0}, attempt_number=1, retry_policy=policy
+    ) == 5.0
+    assert rq.resolve_retry_wait_seconds(
+        {"status": "rate_limited", "retry_after": -5}, attempt_number=1, retry_policy=policy
+    ) == 5.0
+    assert rq.resolve_retry_wait_seconds(
+        {"status": "rate_limited", "retry_after": "60"}, attempt_number=1, retry_policy=policy
+    ) == 5.0  # a string (shouldn't happen given openrouter.py's own int() cast, but don't trust it blindly)
+
+
+def test_attempt_with_retries_end_to_end_sleeps_retry_after_not_fixed_backoff():
+    """Integration-level: the full retry loop, not just the resolver function,
+    actually uses retry_after when a real scripted rate_limited response
+    carries one."""
+
+    async def query_fn(model, messages, timeout):
+        if not hasattr(query_fn, "calls"):
+            query_fn.calls = 0
+        query_fn.calls += 1
+        if query_fn.calls == 1:
+            return {"status": "rate_limited", "retry_after": 7}
+        return {"status": "ok", "text": "resp"}
+
+    sleep_fn, sleep_log = _make_sleep_fn()
+    policy = rq.RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0))
+
+    attempts, response = _run(
+        rq._attempt_with_retries(
+            candidate="model-a",
+            messages=DEFAULT_MESSAGES,
+            timeout=DEFAULT_TIMEOUT,
+            query_fn=query_fn,
+            retry_policy=policy,
+            sleep_fn=sleep_fn,
+        )
+    )
+
+    assert response == {"status": "ok", "text": "resp"}
+    assert sleep_log == [7.0]  # NOT [5.0] -- the fixed backoff would be wrong here

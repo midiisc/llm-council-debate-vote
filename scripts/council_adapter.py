@@ -74,7 +74,12 @@ from llm_council.verdict import VerdictType
 
 from scripts.grounding_pass import TaggedClaim
 from scripts.live_adapters import query_model_with_status_and_effort
-from scripts.resilient_query import RetryPolicy, SubstitutionEvent, query_models_resilient
+from scripts.resilient_query import (
+    RetryPolicy,
+    SubstitutionEvent,
+    query_models_resilient,
+    resolve_retry_wait_seconds,
+)
 from scripts.revision_round import _build_facts_section
 
 
@@ -276,7 +281,7 @@ async def _synthesize_resilient(
             raise ChairmanUnreachableError(chairman_model, attempt_number, status)
 
         if attempt_number < retry_policy.max_attempts:
-            await sleep_fn(retry_policy.backoff_seconds[attempt_number - 1])
+            await sleep_fn(resolve_retry_wait_seconds(response, attempt_number, retry_policy))
 
     raise ChairmanUnreachableError(chairman_model, retry_policy.max_attempts, last_status)
 

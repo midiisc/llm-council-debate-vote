@@ -462,3 +462,40 @@ def test_property_attempt_sleep_and_model_invariant_across_any_status_sequence(s
     # Backoff ordering invariant: sleeps happen only between consumed
     # attempts, using backoff_seconds[0..attempts_made-2] in order.
     assert sleep_calls == list(backoff[: max(attempts_made - 1, 0)])
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-28 addition -- _synthesize_resilient must honor a server-supplied
+# retry_after over the fixed backoff schedule too, same as
+# _attempt_with_retries (see test_resilient_query.py). Both wrap the same
+# query_model_with_status-shaped response and must not drift independently.
+# ---------------------------------------------------------------------------
+
+
+def test_synthesize_resilient_honors_retry_after_not_fixed_backoff():
+    _require_impl()
+    rate_limited = {"status": "rate_limited", "retry_after": 9}
+    ok = _ok_response("after-retry-after")
+    query_fn, calls = _make_query_fn([rate_limited, ok])
+    sleep_fn, sleep_calls = _make_sleep_fn()
+    policy = RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0), retryable_statuses=RETRYABLE)
+
+    response, usage, degraded = _run(
+        _synthesize_resilient(STAGE3_QUERY, CHAIRMAN, TIMEOUT, policy, query_fn, sleep_fn)
+    )
+
+    assert response == ok
+    assert degraded is False
+    assert len(calls) == 2
+    assert sleep_calls == [9.0]  # NOT [5.0] -- must use the server's own signal
+
+
+def test_synthesize_resilient_falls_back_to_backoff_without_retry_after():
+    _require_impl()
+    query_fn, calls = _make_query_fn([_fail_response("timeout"), _ok_response("after-backoff")])
+    sleep_fn, sleep_calls = _make_sleep_fn()
+    policy = RetryPolicy(max_attempts=3, backoff_seconds=(5.0, 15.0), retryable_statuses=RETRYABLE)
+
+    _run(_synthesize_resilient(STAGE3_QUERY, CHAIRMAN, TIMEOUT, policy, query_fn, sleep_fn))
+
+    assert sleep_calls == [5.0]  # unchanged behavior when no retry_after is present

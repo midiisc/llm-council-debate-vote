@@ -170,3 +170,28 @@ existing usage-aggregation in `council_adapter.py` handles that from
 `responses`' own `usage` sub-dicts, unchanged), no change to
 `query_model_with_status`'s own retry/timeout semantics — `timeout` here is
 the same per-attempt value already threaded through `council_adapter.py`.
+
+## Amendment 2026-08-28 — honor `retry_after` over the fixed backoff schedule
+
+Found via a separate project's live end-to-end canary run + panel-debate that traced this
+repo's own `openrouter.py`: `query_model_with_status` already parses a `rate_limited` response's
+`Retry-After` header into `response["retry_after"]`, but `_attempt_with_retries` (this module)
+and `_synthesize_resilient` (`council_adapter.py`, Stage 3's chairman-only retry) both ignored it
+completely, always sleeping the fixed `backoff_seconds[attempt_number - 1]` regardless of what
+the server actually signaled.
+
+Fixed by adding `RetryPolicy.max_retry_after_seconds` (default 30.0 — the same ceiling
+`external-llm-research/scripts/dispatch-telegram.sh` in a different project uses for the same
+reason: a real `retry_after`/`Retry-After` value has been observed in the thousands of seconds
+during abuse, and a fixed ceiling protects this module's own bounded-retry design goal) and a
+new shared `resolve_retry_wait_seconds(response, attempt_number, retry_policy)` function, used by
+both `_attempt_with_retries` and `_synthesize_resilient` instead of reading
+`backoff_seconds[attempt_number - 1]` directly — one implementation, not two independently-
+drifting copies of the same "should this be server-signaled or fixed?" decision.
+
+Only honored when `response.get("status") == "rate_limited"` — a stray `retry_after` key on any
+other status is never trusted, since `query_model_with_status` only ever sets it on that one
+status. Verified by 8 new tests (`test_resilient_query.py`, `test_council_adapter_synthesize_
+resilient_stage3.py`) plus a full re-run of the existing suite: 901 passed (893 baseline + 8 new),
+zero regressions. Not a real-money change — no live API call was made to verify this, only the
+existing hermetic dependency-injected test harness (`query_fn`/`sleep_fn` fakes, no network).

@@ -37,6 +37,19 @@ class RetryPolicy:
     )
     # Any status NOT in retryable_statuses (e.g. "auth_error") is terminal:
     # stop retrying that model immediately, no separate "terminal" list needed.
+    max_retry_after_seconds: float = 30.0
+    # Ceiling on how long a server-signaled "rate_limited" retry_after (from
+    # openrouter.py's parsed Retry-After header) is honored for. Found and
+    # fixed 2026-08-28: query_model_with_status already parses and returns
+    # this value, but _attempt_with_retries previously ignored it entirely
+    # and always slept the fixed backoff_seconds schedule instead - a real
+    # server-supplied wait signal was captured one layer down and silently
+    # discarded here. Same cap value as external-llm-research's
+    # dispatch-telegram.sh (a different project, same reasoning: a real
+    # 429 retry_after has been observed in the thousands of seconds during
+    # abuse, and a fixed ceiling protects a bounded-total-wait design goal
+    # without pretending the ceiling is somehow more correct than the
+    # server's own value up to that point).
 
     def __post_init__(self) -> None:
         # A misconfigured llm_council.yaml (e.g. max_attempts raised without
@@ -112,9 +125,38 @@ async def _attempt_with_retries(
             break  # terminal status: stop retrying this candidate immediately
 
         if attempt_number < retry_policy.max_attempts:
-            await sleep_fn(retry_policy.backoff_seconds[attempt_number - 1])
+            await sleep_fn(resolve_retry_wait_seconds(response, attempt_number, retry_policy))
 
     return attempts, None
+
+
+def resolve_retry_wait_seconds(
+    response: dict, attempt_number: int, retry_policy: RetryPolicy
+) -> float:
+    """How long to sleep before the next retry attempt.
+
+    Shared by `_attempt_with_retries` (this module, Stage 1/2 multi-model
+    retries) and `council_adapter._synthesize_resilient` (Stage 3
+    chairman-only retries) - both wrap the same
+    `query_model_with_status`-shaped response and must honor its
+    `retry_after` field the same way, not two independently-drifting copies.
+
+    Honors a genuine server-supplied `retry_after` (capped at
+    `max_retry_after_seconds`) when the response actually carries one -
+    `query_model_with_status` only ever sets this on a `rate_limited`
+    status. Every other retryable status (`timeout`, `error`, or a future
+    addition) falls back to the configured fixed `backoff_seconds`
+    schedule, unchanged from before this function existed.
+    """
+    retry_after = response.get("retry_after")
+    if (
+        response.get("status") == "rate_limited"
+        and isinstance(retry_after, (int, float))
+        and not isinstance(retry_after, bool)
+        and retry_after > 0
+    ):
+        return min(float(retry_after), retry_policy.max_retry_after_seconds)
+    return retry_policy.backoff_seconds[attempt_number - 1]
 
 
 async def _resolve_slot(
