@@ -2138,3 +2138,38 @@ Separately unreconciled: a historical entry earlier in this file ("Timeout archi
 failure pattern just observed (`quick` failing outright, `balanced` succeeding on escalation). Not
 investigated in this pass; worth checking whether `MCP_TOOL_TIMEOUT` or the client wrapper has
 changed since that entry was written.
+
+## 2026-08-28 (verification pass): quick-tier fix was silently inert — found and fixed the real cause
+
+Attempted to live-verify the `quick`-tier fix above after a session restart. `council_health_check`
+still reported the stale 5-model roster (`z-ai/glm-5.2` included) instead of this file's 4 models —
+immediate proof the fix hadn't taken, on either restart.
+
+**Root cause: the running MCP server was never reading this file.** `unified_config.py`'s
+`_find_config_file()` resolves, in order: `LLM_COUNCIL_CONFIG` env var → `./llm_council.yaml`
+(server process's cwd) → `~/.config/llm-council/llm_council.yaml` → hardcoded package defaults.
+The MCP server is spawned by Claude Code with cwd `$HOME`, not this repo, so it has always fallen
+through to `~/.config/llm-council/llm_council.yaml` — a separate, un-version-controlled "global
+safety-net" file (its own header, dated 2026-08-16: exists so any *other* project's stray MCP
+session with no config of its own doesn't silently hit hardcoded dead model slugs). That file's own
+comments state it should mirror this repo's roster, but nothing enforced that — it was last
+manually synced 2026-08-16 and had already silently missed the 2026-08-17 GLM-5.2→Kimi-K3 core-seat
+swap, on top of missing today's `quick`-tier fix and `length_control` addition.
+
+**This means every "fix" landed in this file today (`quick`-tier swap, `length_control`) had zero
+live effect until now** — `consult_council`/`council_health_check` have been running against the
+stale safety-net copy the whole session. Not a regression introduced today; a pre-existing
+manual-sync gap that happened to surface because today's fix needed live verification, which the
+earlier debate-outcome findings didn't.
+
+**Fixed with explicit user sign-off** (2 real tradeoffs presented: symlink = zero future drift but
+widens this repo's blast radius to any other project relying on the safety net; manual re-sync =
+preserves isolation but the same silent-drift failure can recur): backed up the stale file (no
+unique content — pure copy, safely discarded) and replaced `~/.config/llm-council/llm_council.yaml`
+with a symlink to this repo's `llm_council.yaml`. Single source of truth from now on; whatever ships
+here is what the safety-net path serves too.
+
+**Still not live-verified** — the config is loaded into a module-level singleton once per process
+(`_global_config` in `unified_config.py`), so the already-running MCP server from this session's
+restart still holds the pre-symlink stale config in memory. Needs one more session restart before
+`council_health_check`/`consult_council` will reflect any of today's changes.
