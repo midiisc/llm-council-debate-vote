@@ -102,6 +102,7 @@ from scripts.resilient_query import (
     SubstitutionEvent,
     query_models_resilient as real_query_models_resilient,
 )
+from scripts.length_control import LengthControlConfig
 
 
 def _patch(monkeypatch, host_modules, name, fake):
@@ -192,6 +193,15 @@ def _install_normal_flow_fakes(monkeypatch, models, resilience_config=None):
 
     resolved_resilience_config = resilience_config or _default_resilience_config()
     monkeypatch.setattr(ca, "_load_debate_resilience_config", lambda *a, **k: resolved_resilience_config, raising=False)
+    # amiable-dev/llm-council#675: this fixture's job is Stage 1/2/3
+    # resilience flow, not length control - neutralize it here (disabled)
+    # the same way _load_debate_resilience_config is pinned above, so these
+    # tests aren't coupled to the real llm_council.yaml's length_control
+    # block (which is enabled for real usage) and don't need updating every
+    # time that block's default changes.
+    monkeypatch.setattr(
+        ca, "_load_length_control_config", lambda *a, **k: LengthControlConfig(enabled=False), raising=False
+    )
 
 
 def _ok_response(model: str) -> dict:

@@ -241,3 +241,25 @@ debate_resilience:
     # retrying an identical request against a bad/inaccessible key can't
     # succeed. See upstream-deltas.md's STATUS_* taxonomy table.
     retryable_statuses: [timeout, rate_limited, error]
+
+length_control:
+  # amiable-dev/llm-council#675, 2026-08-28: stage1_5_normalize_styles
+  # preserves length by design ("Do NOT add or remove any substantive
+  # content") - it targets tone/format fingerprinting, not verbosity bias.
+  # Verbosity bias is heterogeneous by judge-model family (Dubois et al.,
+  # arXiv:2404.04475) and survives style normalization untouched.
+  #
+  # scripts/length_control.py discounts/boosts each response's
+  # average_score by sensitivity * log(length / batch_mean_length) before
+  # re-ranking - see that module's docstring for the full method and its
+  # disclosed scope limitation (a per-call heuristic, NOT a real AlpacaEval-LC
+  # regression fit - a single council call has far too few data points, 4-5,
+  # to fit a GLM with any confidence). Does not adjust borda_score.
+  enabled: true
+  sensitivity: 0.15  # UNCALIBRATED - a starting point, not a measured value.
+                       # No real usage data exists yet on this operator's
+                       # actual query mix. Revisit once the divergence log
+                       # (high-stakes-research-pipeline's Stage 7 pattern)
+                       # accumulates enough real runs to judge whether 0.15
+                       # over- or under-corrects in practice.
+  min_length_chars: 1

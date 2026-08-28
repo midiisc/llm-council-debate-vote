@@ -80,6 +80,11 @@ from scripts.resilient_query import (
     query_models_resilient,
     resolve_retry_wait_seconds,
 )
+from scripts.length_control import (
+    LengthControlConfig,
+    apply_length_control,
+    response_lengths_from_texts,
+)
 from scripts.revision_round import _build_facts_section
 
 
@@ -222,6 +227,43 @@ def _load_debate_resilience_config(config_path: Optional[Path] = None) -> Debate
         retry_policy=retry_policy,
         minimum_council_size=block.get("minimum_council_size", 4),
     )
+
+
+def _load_length_control_config(config_path: Optional[Path] = None) -> LengthControlConfig:
+    """Read the `length_control:` block from `llm_council.yaml` (or an
+    explicit override path, for hermetic tests). Never raises - a project
+    that hasn't added this block yet (or has no config file at all) simply
+    gets `LengthControlConfig()`'s default, `enabled=False`. See
+    docs/specs/length-control-contract.md and amiable-dev/llm-council#675.
+
+    Same file-location and bypass-get_config() rationale as
+    `_load_debate_resilience_config` above - not repeated here.
+    """
+    defaults = LengthControlConfig()
+
+    path = config_path if config_path is not None else _find_config_file()
+    if path is None:
+        return defaults
+
+    try:
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f) or {}
+    except OSError:
+        return defaults
+
+    block = raw.get("length_control") if isinstance(raw, dict) else None
+    if not isinstance(block, dict):
+        return defaults
+
+    kwargs: Dict[str, Any] = {}
+    if "enabled" in block:
+        kwargs["enabled"] = bool(block["enabled"])
+    if "sensitivity" in block:
+        kwargs["sensitivity"] = float(block["sensitivity"])
+    if "min_length_chars" in block:
+        kwargs["min_length_chars"] = int(block["min_length_chars"])
+
+    return LengthControlConfig(**kwargs)
 
 
 class ChairmanUnreachableError(Exception):
@@ -879,6 +921,7 @@ async def run_council_with_timeouts(
         # reproducing query_models_parallel's aggregation on top of its result.
         messages = [{"role": "user", "content": build_stage1_prompt(user_query)}]
         resilience_config = _load_debate_resilience_config()
+        length_control_config = _load_length_control_config()
         stage1_deadline = (
             time.monotonic() + overall_wall_clock_seconds * stage1_deadline_fraction
             if overall_wall_clock_seconds is not None
@@ -1047,6 +1090,17 @@ async def run_council_with_timeouts(
             stage2_substitutions = stage2_resilient_result.substitutions
             stage2_shortfall_warning = stage2_resilient_result.shortfall_warning
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+            # amiable-dev/llm-council#675: verbosity bias survives style
+            # normalization (which explicitly preserves length). Lengths are
+            # computed from `responses_for_review` - the post-Stage-1.5 text
+            # reviewers actually saw, not the raw Stage 1 draft. A no-op
+            # unless length_control.enabled is set in llm_council.yaml
+            # (docs/specs/length-control-contract.md).
+            aggregate_rankings = apply_length_control(
+                aggregate_rankings,
+                response_lengths_from_texts(responses_for_review),
+                length_control_config,
+            )
             if degraded_mode == "two_models":
                 for r in aggregate_rankings:
                     r["note"] = "Two-model council - rankings based on single vote"
