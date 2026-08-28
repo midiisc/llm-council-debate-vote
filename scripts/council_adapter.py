@@ -588,6 +588,20 @@ def _build_style_normalize_prompt(text: str) -> str:
     docs/specs/stage1-5-normalizer-timeout-contract.md's non-goals. Factored
     out so `_normalize_responses_with_timeout` doesn't duplicate the prompt
     text inline.
+
+    2026-08-28: an anti-padding instruction here (strip restatement/filler
+    to counter verbosity bias, amiable-dev/llm-council#675) was considered
+    and explicitly REJECTED, not just left undone - see
+    docs/specs/length-control-contract.md, "Considered and rejected". A
+    rewriter model asked to trim redundancy cannot reliably distinguish
+    genuine restatement from step-by-step reasoning scaffolding ("given X,
+    we know Y, which means Z" reads as repetition on the surface); a
+    miscall silently compresses a response's shown work into a bare
+    conclusion, penalizing exactly the responses Stage 2/3 are supposed to
+    credit for inference quality - a correctness regression with no
+    verification step to catch it, worse than the verbosity bias it would
+    fix. `scripts/length_control.py`'s score-level adjustment stays the
+    only local mitigation - it never touches this text.
     """
     return f"""Rewrite the following text to have a neutral, consistent style while preserving ALL content and meaning exactly.
 

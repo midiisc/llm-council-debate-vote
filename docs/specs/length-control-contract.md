@@ -79,3 +79,34 @@ that needed its shared fixture updated to explicitly neutralize `_load_length_co
 that file's own concern is Stage 1/2/3 resilience, not length control, so it shouldn't be
 coupled to `llm_council.yaml`'s real (enabled) default. Not a real-money change — hermetic
 dependency-injected fakes only, no live API call made.
+
+## Considered and rejected — editing the Stage 1.5 rewrite prompt itself (2026-08-28)
+
+Two prompt-level alternatives to the score-level adjustment above were considered, both
+rejected before any code was written:
+
+**Target an expected/reference length directly.** Rejected: fundamentally conflicts with Stage
+1.5's own core guarantee, "preserving ALL content and meaning exactly." Forcing two responses of
+genuinely different substance toward the same length means either compressing real content out
+of the more thorough one or padding the shorter one with fabricated filler — both violate the
+"Do NOT add or remove any substantive content" rule this normalizer exists to uphold. It also
+conflates length-as-bias with length-as-legitimate-signal: sometimes a longer answer is longer
+because it's actually more complete, and that's real information Stage 2 should see, not noise
+to erase. This is why Dubois et al.'s actual AlpacaEval-LC method never rewrites text at all — it
+statistically corrects the *score*, leaving the response itself untouched.
+
+**Strip padding/filler (redundant restatement, unnecessary preamble) without targeting a
+length.** A narrower, more defensible version of the same idea — rejected anyway. A rewriter
+model asked to trim "restatement that adds no new information" cannot reliably tell genuine
+repetition apart from step-by-step reasoning scaffolding ("given X, we know Y, which means Z"
+looks like restatement on the surface but is load-bearing derivation). A miscall silently
+compresses a response's shown work into a bare conclusion — penalizing exactly the responses
+Stage 2/3 are supposed to credit for inference quality, with no verification step to catch that
+it happened. This is the same failure shape as the Deliberative Illusion risk this project
+already guards against elsewhere (silent information loss during an LLM-mediated rewrite/
+consensus pass), just relocated to Stage 1.5. The marginal bias reduction wasn't judged worth a
+hard-to-detect correctness regression on the one thing this normalizer explicitly promises never
+to lose.
+
+**Decision:** leave `_build_style_normalize_prompt` untouched. The score-level adjustment above
+remains the only local mitigation for #675 — it never touches the text reviewers actually judge.
