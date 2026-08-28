@@ -2067,3 +2067,74 @@ Both are documentation/issue-filing only in this pass — no code changed in thi
 suite run needed since nothing here executes. Not a real-money action; the 2026-08-11/12
 key-rotation hold (still unresolved as of this entry — no rotation-confirmed entry found anywhere
 in this file) was not triggered and does not need to be for this kind of pass.
+
+## 2026-08-28 (later same day): retry_after honored, length_control shipped, quick-tier model/budget mismatch found + fixed
+
+Continuation of the same cross-check pass above, moving from documentation-only findings to real
+local code changes plus a genuine live-observed bug.
+
+**`retry_after` fix (`scripts/resilient_query.py`, `scripts/council_adapter.py`).** A rate-limited
+response already carried a `retry_after` field but `_attempt_with_retries` never read it — it
+always slept `RetryPolicy.backoff_seconds[attempt_number - 1]` regardless of what the provider
+asked for. Added `resolve_retry_wait_seconds()`: honors `retry_after` only when
+`status == "rate_limited"` and the value is a positive non-bool number, capped at a new
+`RetryPolicy.max_retry_after_seconds` (default 30s) so a misbehaving provider can't stall a whole
+council round; falls back to the existing fixed backoff otherwise. Caught a real bug in my own
+first draft (honored `retry_after` unconditionally) via a test I wrote before the fix
+(`test_resolve_retry_wait_seconds_ignores_retry_after_on_non_rate_limited_status`) — RED, then
+GREEN. 8 new/updated tests, 0 regressions (901 baseline unaffected).
+
+**Length control (`scripts/length_control.py`, new).** Local downstream mitigation for #675 above,
+built with explicit user sign-off after weighing (and rejecting) editing
+`stage1_5_normalize_styles`'s rewrite prompt directly — risk of silently trimming genuine
+reasoning-chain content that looks like "padding" to a prompt-level instruction but isn't. Instead:
+a pure post-hoc score adjustment, `apply_length_control()`, discounting `average_score` (never
+`borda_score`) by `sensitivity * log(length / mean_length)` per response, gated behind
+`length_control.enabled` in `llm_council.yaml` (default on, `sensitivity: 0.15`, explicitly
+disclosed as an uncalibrated heuristic, not a real AlpacaEval-LC regression). Documented as a
+stopgap in a comment on #675 — the real fix (making Stage 1.5 length-aware, or a proper
+length-controlled aggregation) is upstream's call. 15 new tests (10 for the function, 5 for config
+loading), 916 total passing, 0 regressions.
+
+**`quick` tier model/budget structural mismatch — found live, fixed.** While running an unrelated
+external canary (a different project's `high-stakes-research-pipeline`), `consult_council` at
+`confidence: "quick"` failed outright 4 times in one session — "0 of 2 models responded, both
+timed out" — on ordinary fact-check prompts, not adversarial ones. Root-caused by cross-referencing
+this file's own tier budget table (above, "Timeout architecture fix") against
+`llm_council.yaml`'s actual `tiers.pools.quick.models`:
+
+- `quick`'s contract: `deadline_ms=30000`, `per_model_timeout_ms=20000`, `max_attempts=1` — the
+  tightest, least-forgiving budget of any tier (no internal retry at all).
+- `quick`'s model pool: `[anthropic/claude-opus-4.8, openai/gpt-5.5]` — confirmed via
+  `git log -p --follow -- llm_council.yaml` to be unchanged since this file's very first commit,
+  with no dedicated commit message ever explaining the choice. These are the two heaviest
+  flagship reasoning models in the entire 4-model roster.
+
+Every other tier pairs its budget with a matching model weight (`balanced`/`high`/`reasoning` all
+carry 45-300s per-model timeouts and 2-3 attempts). `quick` was the one tier with a "fast" name, a
+fast budget, and slow models — a structural mismatch, not transient provider flakiness, and not
+something the existing timeout-architecture fix (which addresses client/server timeout alignment,
+not model-selection-per-tier) was designed to catch. Fixed: swapped `quick`'s pool to
+`[google/gemini-3.7-flash]` — already vetted and in-roster (used in `balanced`/`high`/`reasoning`),
+the only flash-class (genuinely fast) model configured anywhere in this file, so no new
+vendor/model introduced. Single-model rather than re-adding a second heavy model for redundancy:
+`quick`'s actual job is a cheap sanity gate, not a cross-model judgment call — that's what
+`high`/`reasoning`'s full 4-model roster is for.
+
+**Not yet live-verified.** This MCP server's model roster is resolved once at connection/session
+start (same pattern already documented elsewhere in this project for stale-MCP-handshake cases) —
+confirming the fix takes effect requires a fresh `consult_council(confidence="quick")` call after a
+session restart, not available within the session that made the change.
+
+**Open question, not yet investigated.** A live `council_health_check` call during the same session
+reported `council_size: 5` with a model list including `gemini-3.6-flash` and `glm-5.2` — models
+NOT present in this file's checked-out `llm_council.yaml` (which has 4 models, `gemini-3.7-flash`,
+no `glm-5.2`). Possible stale live-server config vs. on-disk file drift; flagged here for a future
+session, not chased down in this pass since it's orthogonal to the `quick`-tier fix.
+
+Separately unreconciled: a historical entry earlier in this file ("Timeout architecture fix",
+2026-08-12) describes `balanced`/`high` tiers failing due to exceeding a 60s client-side
+`MCP_TOOL_TIMEOUT`, with `quick` being the tier that reliably succeeded — the opposite of the
+failure pattern just observed (`quick` failing outright, `balanced` succeeding on escalation). Not
+investigated in this pass; worth checking whether `MCP_TOOL_TIMEOUT` or the client wrapper has
+changed since that entry was written.

@@ -144,9 +144,28 @@ council:
           - google/gemini-3.7-flash
           - moonshotai/kimi-k3
       quick:
+        # 2026-08-28: was [claude-opus-4.8, gpt-5.5] since this file's first
+        # commit - never changed, never dedicated-commented. Root-caused live:
+        # quick's own contract (deadline_ms=30000, per_model_timeout_ms=20000,
+        # max_attempts=1 - see docs/upstream-deltas.md) is a tight, single-
+        # attempt budget suited to genuinely fast/cheap models, but was
+        # applied to the two heaviest flagship reasoning models in the whole
+        # roster. Observed live, twice, in one session: both models timing
+        # out, 0 of 2 responding, on ordinary (non-trivial) fact-check
+        # prompts - not transient bad luck, a structural mismatch between the
+        # tier's budget and its own model assignment. gemini-3.7-flash is
+        # already vetted/in-roster (used in balanced/high/reasoning) and is
+        # the only genuinely flash-class (fast) model configured anywhere in
+        # this file - no new vendor/model introduced. Single-model for now
+        # (matches "quick" tier's actual job: a cheap sanity gate, not a
+        # cross-model judgment - that's what high/reasoning's full roster is
+        # for) rather than reintroducing a second heavy model for redundancy.
+        # NOT yet live-verified against a real call - this MCP server
+        # connection is established once at session start (same pattern as
+        # every other stale-MCP-handshake case already documented in this
+        # project); requires a session restart before this takes effect.
         models:
-          - anthropic/claude-opus-4.8
-          - openai/gpt-5.5
+          - google/gemini-3.7-flash
       balanced:
         models:
           - anthropic/claude-opus-4.8
