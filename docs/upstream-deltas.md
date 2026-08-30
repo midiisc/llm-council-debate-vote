@@ -2173,3 +2173,92 @@ here is what the safety-net path serves too.
 (`_global_config` in `unified_config.py`), so the already-running MCP server from this session's
 restart still holds the pre-symlink stale config in memory. Needs one more session restart before
 `council_health_check`/`consult_council` will reflect any of today's changes.
+
+## 2026-08-30: `reasoning`/`high` tier timeouts raised (root cause of live Kimi K3 / GPT-5.5
+timeouts) — and a real architectural gap found: `debate_resilience` never protects the MCP tool
+
+**User report:** `mcp__llm-council__consult_council` repeatedly timing out on `moonshotai/kimi-k3`
+and occasionally `openai/gpt-5.5`, wanting the pipeline to "proceed only after responses from all
+seats come."
+
+**Root cause, confirmed by direct source read of the exact package this project's MCP server
+registration actually runs** (`claude mcp get llm-council` →
+`/home/midhun-sreekumar-menon/.local/share/uv/tools/llm-council-core/bin/python -m
+llm_council.mcp_server`, `LLM_COUNCIL_CONFIG=/data/llm-council-debate-vote/llm_council.yaml` —
+confirmed this project's own `llm_council.yaml` is what's read, via the env var, not cwd or the
+`~/.config/llm-council/` symlink fallback documented above): `tier_contract.py`'s
+`create_tier_contract()` resolves `deadline_ms`/`per_model_timeout_ms` from
+`unified_config.py`'s `TimeoutsConfig` (a **real top-level `UnifiedConfig` field**, `timeouts:`,
+confirmed at line ~978 — same true-top-level placement class as `gateways:`/`tiers:`/
+`evaluation:`, sibling of the outer `council:` wrapper, not nested under it) — this repo's
+`llm_council.yaml` had never set this block, so every tier ran on the installed package's
+hardcoded defaults: `reasoning` (default tier, all 4 core seats) `per_model_timeout_ms=300000`
+(5min)/`deadline_ms=600000` (10min)/`max_attempts=2` (hardcoded in `create_tier_contract`'s
+`tier_configs` dict, **not** YAML-configurable — only `total`/`per_model` are); `high`
+`per_model_timeout_ms=90000` (1m30s)/`deadline_ms=180000` (3min)/`max_attempts=3`. Kimi K3 is a
+documented, provider-side capacity-constrained seat at Moonshot (see "Model-provider operational
+finding", 2026-08-17 above — intermittent slow responses/429s under real concurrent load, not a
+config bug on this repo's side, live-confirmed clean at 5.6s latency in a low-load single call but
+never load-tested at the time). A 300s/90s per-attempt budget leaves little room for a seat that's
+genuinely just slow that moment, not dead.
+
+**Fix:** added a `timeouts:` block to `llm_council.yaml` (same true-top-level placement as
+`gateways:`/`tiers:`/`evaluation:`), raising `reasoning` to `total=800000`/`per_model=380000` and
+`high` to `total=420000`/`per_model=140000`. Deliberately bounded, not maxed: this project's
+client-side `MCP_TOOL_TIMEOUT` is `900000`ms (`.claude/settings.local.json`) — `reasoning`'s new
+`total` leaves a 100s margin under that cap so this fix cannot reproduce the exact transport-layer
+failure mode already documented in "Timeout architecture fix" (2026-08-12, above): a server-side
+budget exceeding the client's cap dies at the transport layer before the package's own
+retry/timeout logic ever runs. **Verified by direct execution**, not just visual YAML review:
+loaded this file through `load_config()` + `create_tier_contract()` from the exact installed
+package above — `reasoning`: `deadline_ms=800000`, `per_model_timeout_ms=380000`,
+`allowed_models` still the correct 4-model roster; `high`: `deadline_ms=420000`,
+`per_model_timeout_ms=140000`; `quick`/`balanced`/`council.models`/`chairman` all unchanged.
+`tests/test_config_integrity.py`: 9 passed, no regressions. **Not yet live-verified against a real
+`consult_council` call** — same module-level `_global_config` singleton staleness this ledger
+already documents twice above; needs a fresh MCP server connection (session restart or MCP
+reconnect) before this takes effect on a live call.
+
+**Real architectural gap found while investigating, not previously documented: this repo's own
+`debate_resilience` system (retry + backup-model substitution + `minimum_council_size` shortfall
+warning, `scripts/resilient_query.py`/`scripts/council_adapter.py`) never protects the
+`mcp__llm-council__consult_council` MCP tool call at all.** Confirmed by direct source read of
+`mcp_server.py::consult_council` — it calls `create_tier_contract(tier)` then
+`run_council_with_fallback(...)` directly, pure vendor code, no hook into this repo's resilience
+layer. That layer is wired **only** into `scripts/council_adapter.py::run_council_with_timeouts`,
+which only runs when this repo's own `python -m scripts.pipeline_runner` CLI is invoked directly —
+never when the MCP tool is called (as it is in every session, including this one, via
+`mcp__llm-council__consult_council`). This means the user's request — "proceed only after
+responses from all seats come" — is **not something the raw MCP tool can honor**: it has exactly
+`max_attempts` (tier-hardcoded, 2-3) tries per model, no backup substitution, no quorum
+enforcement, and (per the installed package's own code, not further chased down this pass) most
+likely just synthesizes from whatever subset of models actually responded rather than blocking.
+The `timeouts:` fix above reduces how often a slow-but-alive model gets cut off, which addresses
+the *proximate* cause (budgets too tight for a capacity-constrained seat), but does not add
+retry-with-backup or a hard "all seats must respond" guarantee to the MCP path — no such mechanism
+exists there in the installed package, and building one would mean either patching vendor code
+(rejected class of fix, per this repo's own established policy of never editing installed package
+files) or wrapping the MCP tool call itself in this repo's own resilience layer (a real feature,
+not yet scoped or spec'd). **For a genuine, tested, all-seats-guaranteed run today, use
+`python -m scripts.pipeline_runner` directly** — it already has the retry/backup/quorum stack
+(mutation-tested, 760+/781 clean) `consult_council` does not. Recorded here as an open gap, not
+silently worked around.
+
+**User decision (2026-08-30): standardize on the CLI path.** Presented three options directly
+(timeout fix alone / standardize on `pipeline_runner` for anything needing the guarantee / wire
+the MCP tool itself into the resilience layer as a new feature) — user chose the second. The MCP
+tool is not being retired or deprecated; it stays the right choice for quick, low-stakes checks
+where a partial response is acceptable, and the `timeouts:` fix above still applies to it
+directly. Wiring `consult_council` itself into `debate_resilience` remains a real option if this
+recurs after standardizing on the CLI path, but is explicitly not being built now — no spec
+opened, no code touched beyond this decision record. See `docs/pipeline-architecture-spec.md`
+§7b for the standing guidance this decision produced.
+
+**Deliberately not built: a true infinite/unbounded "wait until all seats respond, no matter
+what" mode.** Even the CLI path's `debate_resilience` design is explicit about this
+(`minimum_council_size: 4  # below this, proceed degraded but never silently`) — a real Moonshot
+outage on Kimi K3 would hang either path forever with zero feedback if timeouts were removed
+entirely, which is worse than a bounded, generous timeout with a visible degraded-mode warning.
+Flagged for the user, not decided unilaterally: if genuinely-infinite blocking is wanted despite
+that risk, that's a explicit product decision this ledger should record before any code change,
+not an inferred default.

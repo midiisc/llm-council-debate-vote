@@ -338,6 +338,32 @@ correctly when invoked from any directory, for any decision.
   test directory, unrelated to any real project, showing the resulting local
   folder structure. Not yet done — blocks task completion, not spec approval.
 
+## 7b. Standing decision (2026-08-30): use `pipeline_runner`, not raw MCP `consult_council`,
+whenever a full 4-seat guarantee matters
+
+User-confirmed after a live Kimi K3/GPT-5.5 timeout investigation
+(`docs/upstream-deltas.md`, 2026-08-30 entry — full grounding there, not
+repeated here). The raw `mcp__llm-council__consult_council` MCP tool
+(`mcp_server.py::consult_council` → `create_tier_contract()` →
+`run_council_with_fallback()`, confirmed by direct source read of the
+installed package) has **no retry-with-backup and no quorum enforcement** —
+just 2-3 bare per-model attempts on whatever budget the tier's
+`timeouts:`/hardcoded `max_attempts` give it, then proceeds on whatever
+subset responded. `scripts/pipeline_runner.py` (Stage 1 onward calls
+`scripts/council_adapter.py::run_council_with_timeouts`) already has the
+resilience stack this project built for exactly this problem — retry +
+backup-model substitution + `minimum_council_size` shortfall warning
+(`debate_resilience:` in `llm_council.yaml`) — mutation-tested clean. This
+is a real architectural gap, not a preference: the MCP tool structurally
+cannot offer the same guarantee without either patching vendor code
+(rejected class of fix here) or a new spec to wrap it (not yet scoped).
+**Decision:** default to `python -m scripts.pipeline_runner` for any real
+decision where a timed-out/dropped seat matters; the MCP tool stays fine
+for quick, low-stakes checks where a partial response is an acceptable
+outcome. This does not retire the MCP tool — `llm_council.yaml`'s
+`timeouts:` block (2026-08-30) still governs it directly and was raised
+specifically to make its own timeouts rarer.
+
 ## 8. Independent external review (GPT-5.5 + Gemini-3.6-flash, via direct OpenRouter — 2026-08-09)
 
 Sanity-checked this spec against two of the council's own future members,

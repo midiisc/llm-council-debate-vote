@@ -192,6 +192,59 @@ council:
                       # a free local scan on Stage-1 responses is reasonable
                       # defense-in-depth. See upstream-deltas.md, Second Expert
                       # Panel round.
+  timeouts:
+    # 2026-08-30: real UnifiedConfig top-level field (unified_config.py line
+    # 978, confirmed by direct read of the installed v0.42.0 package at
+    # /home/midhun-sreekumar-menon/.local/share/uv/tools/llm-council-core -
+    # the exact venv this project's MCP server registration
+    # (LLM_COUNCIL_CONFIG=/data/llm-council-debate-vote/llm_council.yaml)
+    # actually runs. Same true-top-level placement rule as gateways:/tiers:/
+    # evaluation: above (load_config() does UnifiedConfig(**council_dict), so
+    # this must sit as a sibling of those, one level under the outer
+    # council: wrapper - NOT nested under council.council).
+    #
+    # Root cause of the "Kimi K3 / sometimes GPT-5.5 timing out" report: the
+    # reasoning tier (default, all 4 core seats) previously carried only
+    # per_model=300000ms/total=600000ms with max_attempts=2 (hardcoded in
+    # the installed tier_contract.py's create_tier_contract, not
+    # YAML-configurable - only total/per_model are). Kimi K3 is a
+    # documented, provider-side capacity-constrained seat at Moonshot
+    # (see "Model-provider operational finding", 2026-08-17 below) -
+    # intermittent slow responses under real concurrent 4-model load, not a
+    # config bug on this repo's side. Doubled reasoning's budget and raised
+    # high's proportionally, so a slow-but-eventually-responsive attempt
+    # actually finishes instead of being cut off mid-response. Bounded
+    # deliberately, not maxed out: the client-side MCP_TOOL_TIMEOUT is
+    # 900000ms (.claude/settings.local.json) - reasoning's new total
+    # (800000ms) leaves a 100s margin below that cap, so the fix can't
+    # reproduce the exact transport-layer failure mode already documented
+    # in "Timeout architecture fix" (2026-08-12, above): a server-side
+    # budget that exceeds the client's cap dies at the transport layer
+    # before this generosity ever has a chance to help.
+    #
+    # NOTE (see docs/upstream-deltas.md, 2026-08-30 entry, for the full
+    # finding): this timeouts: block, like every other tier-contract knob,
+    # only takes effect for the raw mcp__llm-council__consult_council MCP
+    # tool call (mcp_server.py -> create_tier_contract() ->
+    # run_council_with_fallback(), confirmed by direct source read). It does
+    # NOT reach scripts/pipeline_runner.py's own resilience layer
+    # (debate_resilience: below - retry + backup-model substitution +
+    # minimum_council_size shortfall warning), which is a fully separate,
+    # more resilient execution path with its own independent timeouts.
+    # Longer timeouts here reduce how often a slow-but-alive model gets cut
+    # off; they do not add retry-with-backup to the MCP tool path, because
+    # no such mechanism exists there in the installed package.
+    reasoning:
+      total: 800000       # was 600000 (10min) -> 800000 (13m20s)
+      per_model: 380000   # was 300000 (5min) -> 380000 (6m20s); 2 attempts
+                            # (tier-hardcoded max_attempts) comfortably fit
+                            # inside the new total even back-to-back.
+    high:
+      total: 420000        # was 180000 (3min) -> 420000 (7min)
+      per_model: 140000    # was 90000 (1m30s) -> 140000 (2m20s); high's
+                             # 3 hardcoded attempts now have real room instead
+                             # of racing a tier budget sized for its OLD
+                             # heavier-but-fewer-attempts profile.
 
 # CUSTOM section, added 2026-08-12 - deliberately a TRUE top-level key,
 # a SIBLING of the outer "council:" wrapper above, never nested inside it.
